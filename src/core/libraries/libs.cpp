@@ -56,6 +56,7 @@
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/playgo/playgo.h"
 #include "core/libraries/playgo/playgo_dialog.h"
+#include "core/libraries/json/json.h"
 #include "core/libraries/random/random.h"
 #include "core/libraries/razor_cpu/razor_cpu.h"
 #include "core/libraries/remote_play/remoteplay.h"
@@ -187,6 +188,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceVideoRecording.sprx", Libraries::VideoRecording::RegisterLib},
             {"libSceInvitationDialog.sprx", Libraries::InvitationDialog::RegisterLib},
             {"libSceNpUtility.sprx", Libraries::Np::NpUtility::RegisterLib},
+            {"libSceJson2.sprx", Libraries::Json::RegisterLib},
 #ifdef ARCH_X86_64
             {"libSceFiber.sprx", Libraries::Fiber::RegisterLib},
 #endif

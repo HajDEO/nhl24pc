@@ -272,8 +272,10 @@ s32 PS4_SYSV_ABI sceAudio3dBedWrite2(const OrbisAudio3dPortId port_id, const u32
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 
-    if (num_channels != 2 && num_channels != 6 && num_channels != 8) {
-        LOG_ERROR(Lib_Audio3d, "num_channels must be 2, 6, or 8");
+    // nhlport: NHL 24 writes beds with a channel count outside {2, 6, 8}; the mixer below
+    // handles any interleaved layout, so only reject counts it cannot index.
+    if (num_channels < 1 || num_channels > 16) {
+        LOG_ERROR(Lib_Audio3d, "unsupported num_channels {}", num_channels);
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 

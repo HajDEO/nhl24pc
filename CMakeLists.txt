@@ -586,6 +586,10 @@ set(RANDOM_LIB src/core/libraries/random/random.cpp
                src/core/libraries/random/random_error.h
 )
 
+set(JSON_LIB src/core/libraries/json/json.cpp
+             src/core/libraries/json/json.h
+)
+
 set(USBD_LIB src/core/libraries/usbd/usbd.cpp
              src/core/libraries/usbd/usbd.h
              src/core/libraries/usbd/usb_backend.h
@@ -960,6 +964,7 @@ set(CORE src/core/aerolib/stubs.cpp
          ${JPEG_LIB}
          ${PLAYGO_LIB}
          ${RANDOM_LIB}
+         ${JSON_LIB}
          ${USBD_LIB}
          ${ZLIB_LIB}
          ${MISC_LIBS}

@@ -133,6 +133,8 @@ std::string_view NameOf(Class log_class) {
         return "Lib.PlayGoDialog";
     case Class::Lib_Random:
         return "Lib.Random";
+    case Class::Lib_Json:
+        return "Lib.Json";
     case Class::Lib_Usbd:
         return "Lib.Usbd";
     case Class::Lib_Ajm:

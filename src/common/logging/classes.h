@@ -75,6 +75,7 @@ enum class Class {
     Lib_PlayGo,              ///< The LibScePlayGo implementation.
     Lib_PlayGoDialog,        ///< The LibScePlayGoDialog implementation.
     Lib_Random,              ///< The LibSceRandom implementation.
+    Lib_Json,                ///< The LibSceJson2 implementation.
     Lib_Usbd,                ///< The LibSceUsbd implementation.
     Lib_Ajm,                 ///< The LibSceAjm implementation.
     Lib_ErrorDialog,         ///< The LibSceErrorDialog implementation.
