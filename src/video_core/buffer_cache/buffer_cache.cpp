@@ -360,6 +360,14 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
             return true;
+        } else if (*type == TextureCache::MetaType::CMask) {
+            // nhlport: NHL 24 (Frostbite) reads colour-buffer CMASK surfaces from compute
+            // shaders. Render targets are never fast-cleared or compressed here, so present the
+            // metadata as "fully expanded" (every 4-bit tile entry 0xF), the counterpart of the
+            // HTile case above.
+            static constexpr u32 CmaskExpanded = 0xffffffffu;
+            runtime.FillBuffer(arena, arena->Offset(device_addr), size, CmaskExpanded);
+            return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
         }
