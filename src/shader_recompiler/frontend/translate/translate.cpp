@@ -507,6 +507,17 @@ T Translator::GetSrc16(const InstOperand& operand) {
 
     const auto op_sel = operand.op_sel.op_sel;
 
+    // nhlport: 16-bit reads of the special scalar registers (VCC, M0, SCC, EXEC) select a half of
+    // the 32-bit register value like a scalar GPR does.
+    const auto from_u32 = [&](const IR::U32& u) -> T {
+        if constexpr (is_float) {
+            return IR::F32{ir.CompositeExtract(ir.Unpack2x16(number_format, u), op_sel ? 1 : 0)};
+        } else {
+            return cast(
+                IR::F32{ir.CompositeExtract(ir.Unpack2x16(number_format, u), op_sel ? 1 : 0)});
+        }
+    };
+
     T value{};
     switch (operand.field) {
     case OperandField::ScalarGPR: {
@@ -569,13 +580,24 @@ T Translator::GetSrc16(const InstOperand& operand) {
         value = get_imm(0U);
         break;
     case OperandField::VccLo:
-        if constexpr (is_float) {
-            value = IR::F32{
-                ir.CompositeExtract(ir.Unpack2x16(number_format, ir.GetVccLo()), op_sel ? 1 : 0)};
-        } else {
-            value = cast(IR::F32{ir.CompositeExtract(
-                ir.Unpack2x16(number_format, bitcast_to_u(ir.GetVccLo())), op_sel ? 1 : 0)});
-        }
+        value = from_u32(ir.GetVccLo());
+        break;
+    case OperandField::VccHi:
+        value = from_u32(ir.GetVccHi());
+        break;
+    case OperandField::M0:
+        value = from_u32(ir.GetM0());
+        break;
+    case OperandField::Scc:
+        value = from_u32(IR::U32{ir.Select(ir.GetScc(), ir.Imm32(1u), ir.Imm32(0u))});
+        break;
+    case OperandField::ExecLo:
+        value = from_u32(
+            IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(ir.GetExec())), 0)});
+        break;
+    case OperandField::ExecHi:
+        value = from_u32(
+            IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(ir.GetExec())), 1)});
         break;
     default:
         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));

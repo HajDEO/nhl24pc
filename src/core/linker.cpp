@@ -439,6 +439,37 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         }
     }
 
+    // nhlport: libSceLibcInternal and the libc.prx shipped with a game share one implementation
+    // and export the same NIDs. Without a firmware libSceLibcInternal.sprx, imports that the HLE
+    // library does not cover (NHL 24's Fios2/Face/Hand/NpToolkit2/S3DConversion modules need 36
+    // of them) are served by the game's own libc.prx instead of a stub that returns zero.
+    if (library->name == "libSceLibcInternal") {
+        for (const auto& mod : m_modules) {
+            if (mod->export_sym.GetSize() == 0) {
+                continue;
+            }
+            for (const auto& lib : mod->GetExportLibs()) {
+                if (lib.name != "libc") {
+                    continue;
+                }
+                for (const auto& exp_mod : mod->GetExportModules()) {
+                    Loader::SymbolResolver alt = sr;
+                    alt.library = lib.name;
+                    alt.library_version = lib.version;
+                    alt.module = exp_mod.name;
+                    record = mod->export_sym.FindSymbol(alt);
+                    if (record) {
+                        LOG_INFO(Core_Linker,
+                                 "Linker: libSceLibcInternal import {} ({}) served by libc.prx {}",
+                                 sr.name, record->symbol.nidName, mod->file.filename().string());
+                        *return_info = *record;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     const auto aeronid = AeroLib::FindByNid(sr.name.c_str());
     if (sym_type == Loader::SymbolType::Object) {
         return_info->symbol.nidName = aeronid ? aeronid->name : "Unknown object";
