@@ -22,6 +22,17 @@
 
 namespace Vulkan {
 
+static std::atomic<u64> g_pipelines_compiled{0};
+static std::atomic<u64> g_shaders_compiled{0};
+
+u64 NumPipelinesCompiled() {
+    return g_pipelines_compiled.load(std::memory_order_relaxed);
+}
+
+u64 NumShadersCompiled() {
+    return g_shaders_compiled.load(std::memory_order_relaxed);
+}
+
 using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
@@ -346,6 +357,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        g_pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -375,6 +387,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        g_pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -623,6 +636,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    g_shaders_compiled.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");

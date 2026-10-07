@@ -8,9 +8,11 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -234,6 +236,44 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    // nhlport perf statistics: frame interval distribution of presented flips, every 5 s.
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point last_flip{};
+        static Clock::time_point window_start{};
+        static u32 frames = 0, slow33 = 0, slow100 = 0;
+        static double max_ms = 0.0;
+        static u64 pipelines_at_start = 0, shaders_at_start = 0;
+        const auto now = Clock::now();
+        if (last_flip != Clock::time_point{}) {
+            const double ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
+            ++frames;
+            max_ms = std::max(max_ms, ms);
+            slow33 += ms > 33.0;
+            slow100 += ms > 100.0;
+        } else {
+            window_start = now;
+            pipelines_at_start = Vulkan::NumPipelinesCompiled();
+            shaders_at_start = Vulkan::NumShadersCompiled();
+        }
+        last_flip = now;
+        const double window_s = std::chrono::duration<double>(now - window_start).count();
+        if (window_s >= 5.0 && frames > 0) {
+            const u64 pipelines = Vulkan::NumPipelinesCompiled();
+            const u64 shaders = Vulkan::NumShadersCompiled();
+            LOG_INFO(Lib_VideoOut,
+                     "frame stats: {:.1f} fps avg {:.1f} ms max {:.1f} ms, >33ms {} >100ms {} of {} frames, "
+                     "compiled {} pipelines / {} shaders in this window",
+                     frames / window_s, 1000.0 * window_s / frames, max_ms, slow33, slow100, frames,
+                     pipelines - pipelines_at_start, shaders - shaders_at_start);
+            window_start = now;
+            frames = slow33 = slow100 = 0;
+            max_ms = 0.0;
+            pipelines_at_start = pipelines;
+            shaders_at_start = shaders;
+        }
+    }
+
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
@@ -360,8 +400,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    u32 trigger_poll = 0;
     while (!token.stop_requested()) {
         timer.Start();
+
+        // nhlport: file-based RenderDoc capture trigger, checked twice a second.
+        if (++trigger_poll % 30 == 0) {
+            VideoCore::PollCaptureTrigger();
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

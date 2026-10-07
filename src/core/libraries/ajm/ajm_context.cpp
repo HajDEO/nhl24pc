@@ -86,7 +86,14 @@ void AjmContext::ProcessBatch(u32 id, std::span<AjmJob> jobs) {
             {
                 std::shared_lock lock(instances_mutex);
                 auto* p_instance = instances.Get(job.instance_id & INSTANCE_ID_MASK);
-                ASSERT_MSG(p_instance != nullptr, "Attempting to execute job on null instance");
+                if (p_instance == nullptr) {
+                    // nhlport: NHL 24 destroys MP3 decoder instances while a batch that references
+                    // them is still queued; real hardware just fails that job. Skip it instead of
+                    // taking the whole emulator down.
+                    LOG_WARNING(Lib_Ajm, "Batch {} references destroyed instance {}, job skipped",
+                                id, job.instance_id);
+                    continue;
+                }
                 instance = *p_instance;
             }
 

@@ -34,6 +34,10 @@ struct Info;
 
 namespace Vulkan {
 
+// nhlport perf statistics: pipelines/shaders compiled so far (read by the flip statistics log).
+u64 NumPipelinesCompiled();
+u64 NumShadersCompiled();
+
 class Instance;
 class Scheduler;
 class ShaderCache;

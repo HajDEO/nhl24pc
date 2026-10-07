@@ -16,6 +16,8 @@
 #endif
 
 #include <filesystem>
+#include "common/logging/log.h"
+#include "common/path_util.h"
 
 namespace VideoCore {
 
@@ -116,8 +118,26 @@ void EndCapture() {
 }
 
 void TriggerCapture() {
-    if (capture_state == CaptureState::Idle) {
-        capture_state = CaptureState::Triggered;
+    // nhlport: use RenderDoc's own present-to-present capture instead of the manual
+    // StartFrameCapture/EndFrameCapture pair around GPU submits. With NHL 24 the manual end
+    // arrived seconds later and RenderDoc had no frame capturer left ("Couldn't find matching
+    // frame capturer ... from 0 device frame capturers"), so no capture was ever written.
+    if (rdoc_api) {
+        LOG_WARNING(Common, "RenderDoc: capturing the next presented frame");
+        rdoc_api->TriggerCapture();
+    }
+}
+
+void PollCaptureTrigger() {
+    if (!rdoc_api) {
+        return;
+    }
+    static const std::filesystem::path trigger =
+        Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "trigger";
+    std::error_code ec;
+    if (std::filesystem::exists(trigger, ec)) {
+        std::filesystem::remove(trigger, ec);
+        TriggerCapture();
     }
 }
 

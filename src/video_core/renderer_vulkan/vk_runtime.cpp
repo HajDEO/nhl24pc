@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
+#include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -325,36 +327,42 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    // nhlport: NHL 24 (Frostbite) copies between images whose layer or mip counts differ
-    // (a slice of an array / the top level of a mip chain). Copy the common part (mip 0,
-    // the shared layers) instead of asserting; the copy below never exceeded this size.
-    if (src->info.resources.layers != dst->info.resources.layers || num_mips != 1) {
+    // nhlport: NHL 24 (Frostbite) aliases a depth buffer with a colour image that carries a full
+    // mip chain (and sometimes a different layer count). Copy every common mip level through the
+    // staging buffer instead of only level 0: the lower levels feed depth-of-field / blur chains in
+    // the pre-game cutscenes and were left uninitialised (noise) before.
+    if (src->info.resources.layers != dst->info.resources.layers) {
         LOG_WARNING(Render_Vulkan,
-                    "Partial image copy through buffer: src {}x{}x{} layers {} mips {} -> dst "
-                    "{}x{}x{} layers {} mips {}",
-                    src->info.size.width, src->info.size.height, src->info.size.depth,
-                    src->info.resources.layers, src->info.resources.levels, dst->info.size.width,
-                    dst->info.size.height, dst->info.size.depth, dst->info.resources.layers,
-                    dst->info.resources.levels);
+                    "Image copy through buffer with different layer counts: src {} dst {}, copying {}",
+                    src->info.resources.layers, dst->info.resources.layers, num_layers);
     }
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
-    vk::BufferImageCopy buffer_copy = {
-        .bufferOffset = offset,
-        .bufferRowLength = 0,
-        .bufferImageHeight = 0,
-        .imageSubresource{
-            .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-            .mipLevel = 0u,
-            .baseArrayLayer = 0,
-            .layerCount = num_layers,
-        },
-        .imageOffset = {0, 0, 0},
-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
-    };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+    boost::container::small_vector<vk::BufferImageCopy, 16> copies;
+    u64 running_offset = offset;
+    for (u32 mip = 0; mip < num_mips; ++mip) {
+        vk::BufferImageCopy buffer_copy = {
+            .bufferOffset = running_offset,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = num_layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {std::max(src->info.size.width >> mip, 1u),
+                            std::max(src->info.size.height >> mip, 1u),
+                            std::max(src->info.size.depth >> mip, 1u)},
+        };
+        const auto level_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+        running_offset = Common::AlignUp(running_offset + level_size, 16);
+        copies.push_back(buffer_copy);
+    }
+    const u64 copy_size = running_offset - offset;
 
     scheduler.EndRendering();
 
@@ -370,7 +378,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 
     auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                             buffer->Handle(), buffer_copy);
+                             buffer->Handle(), copies);
 
     const vk::MemoryBarrier2 post_copy_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
@@ -384,9 +392,11 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         .pMemoryBarriers = &post_copy_barrier,
     });
 
-    buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    for (auto& copy : copies) {
+        copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    }
     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
-                             vk::ImageLayout::eTransferDstOptimal, buffer_copy);
+                             vk::ImageLayout::eTransferDstOptimal, copies);
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
