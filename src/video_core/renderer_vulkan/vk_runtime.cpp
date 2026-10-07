@@ -325,7 +325,18 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    // nhlport: NHL 24 (Frostbite) copies between images whose layer or mip counts differ
+    // (a slice of an array / the top level of a mip chain). Copy the common part (mip 0,
+    // the shared layers) instead of asserting; the copy below never exceeded this size.
+    if (src->info.resources.layers != dst->info.resources.layers || num_mips != 1) {
+        LOG_WARNING(Render_Vulkan,
+                    "Partial image copy through buffer: src {}x{}x{} layers {} mips {} -> dst "
+                    "{}x{}x{} layers {} mips {}",
+                    src->info.size.width, src->info.size.height, src->info.size.depth,
+                    src->info.resources.layers, src->info.resources.levels, dst->info.size.width,
+                    dst->info.size.height, dst->info.size.depth, dst->info.resources.layers,
+                    dst->info.resources.levels);
+    }
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);

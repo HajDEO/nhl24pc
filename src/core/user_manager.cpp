@@ -297,7 +297,26 @@ Users UserManager::CreateDefaultUsers() {
             std::filesystem::create_directory(user_dir / "trophy");
             std::filesystem::create_directory(user_dir / "inputs");
             if (u.user_id == 1000) {
-                TransferOption user_choice = AskMigrationOption();
+                // nhlport: only interrupt the start with the migration dialog when there is
+                // something to migrate; a fresh portable user directory has nothing.
+                const auto old_save_dir =
+                    Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "savedata" / "1";
+                const auto old_trophy_dir =
+                    Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "game_data";
+                const bool old_saves = fs::exists(old_save_dir) && !fs::is_empty(old_save_dir);
+                bool old_trophies = false;
+                if (fs::exists(old_trophy_dir)) {
+                    for (auto const& entry : fs::directory_iterator(old_trophy_dir)) {
+                        if (entry.is_directory() && fs::exists(entry.path() / "TrophyFiles")) {
+                            old_trophies = true;
+                            break;
+                        }
+                    }
+                }
+                TransferOption user_choice = TransferOption::Nothing;
+                if (old_saves || old_trophies) {
+                    user_choice = AskMigrationOption();
+                }
                 CheckAndMigrateSaves(user_choice);
                 CheckAndMigrateTrophies(user_choice);
             }
