@@ -22,9 +22,13 @@ static bool IsDivergentCondition(const IR::U1& condition) {
                                       case IR::Opcode::LaneId:
                                           return true;
                                       case IR::Opcode::GetAttributeU32:
-                                          if (inst->Arg(0).Attribute() ==
-                                              IR::Attribute::LocalInvocationId) {
+                                          switch (inst->Arg(0).Attribute()) {
+                                          case IR::Attribute::LocalInvocationId:
+                                          case IR::Attribute::LocalInvocationIndex:
+                                          case IR::Attribute::GlobalInvocationId:
                                               return true;
+                                          default:
+                                              break;
                                           }
                                           break;
                                       default:
