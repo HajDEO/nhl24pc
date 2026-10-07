@@ -318,7 +318,9 @@ const char* PS4_SYSV_ABI String_c_str(const void* self) {
 
 s32 PS4_SYSV_ABI Parser_parse(void* root, const char* buffer, u64 size) {
     if (!buffer) {
-        LOG_ERROR(Lib_Json, "Parser::parse with null buffer");
+        // NHL 24 does this when a config file it tried to read is missing; the real library
+        // rejects the call as well and the game carries on.
+        LOG_WARNING(Lib_Json, "Parser::parse with null buffer (size {})", size);
         return ORBIS_JSON_ERROR_PARSE;
     }
     const std::string_view text{buffer, size != 0 ? size : std::strlen(buffer)};

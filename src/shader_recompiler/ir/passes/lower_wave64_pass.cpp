@@ -43,9 +43,46 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
         bool divergent;
     };
 
+    // nhlport: a loop whose every exit condition (Break / Repeat) is uniform runs the same
+    // number of iterations on all threads of the workgroup, so blocks inside it may still host
+    // the barriers the wave64 lowering inserts. Only loops with a divergent exit make their body
+    // non-uniform. NHL 24's HiZ reduction shader loops over a constant-buffer count and combines
+    // the two wave halves with ReadLane 32 inside that loop; without this the lowering was
+    // skipped and the depth pyramid (and with it GPU occlusion culling) was garbage.
+    std::vector<const IR::Block*> divergent_loops;
+    {
+        std::vector<const IR::Block*> loop_stack;
+        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+            switch (node.type) {
+            case Type::Loop:
+                loop_stack.push_back(node.data.loop.merge);
+                break;
+            case Type::Break:
+                if (!loop_stack.empty() && IsDivergentCondition(node.data.break_node.cond)) {
+                    divergent_loops.push_back(loop_stack.back());
+                }
+                break;
+            case Type::Repeat:
+                if (loop_stack.empty() || loop_stack.back() != node.data.repeat.merge) {
+                    return {};
+                }
+                if (IsDivergentCondition(node.data.repeat.cond)) {
+                    divergent_loops.push_back(loop_stack.back());
+                }
+                loop_stack.pop_back();
+                break;
+            default:
+                break;
+            }
+        }
+        if (!loop_stack.empty()) {
+            return {};
+        }
+    }
+
     std::vector<IR::Block*> blocks;
     std::vector<ConditionalScope> conditionals;
-    std::vector<const IR::Block*> loops;
+    std::vector<ConditionalScope> loops;
     u32 divergence_depth{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
@@ -60,17 +97,22 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
             divergence_depth -= static_cast<u32>(conditionals.back().divergent);
             conditionals.pop_back();
             break;
-        case Type::Loop:
-            loops.push_back(node.data.loop.merge);
+        case Type::Loop: {
+            const bool divergent =
+                std::ranges::contains(divergent_loops, node.data.loop.merge);
+            loops.push_back({node.data.loop.merge, divergent});
+            divergence_depth += static_cast<u32>(divergent);
             break;
+        }
         case Type::Repeat:
-            if (loops.empty() || loops.back() != node.data.repeat.merge) {
+            if (loops.empty() || loops.back().merge != node.data.repeat.merge) {
                 return {};
             }
+            divergence_depth -= static_cast<u32>(loops.back().divergent);
             loops.pop_back();
             break;
         case Type::Block:
-            if (divergence_depth == 0 && loops.empty()) {
+            if (divergence_depth == 0) {
                 blocks.push_back(node.data.block);
             }
             break;
