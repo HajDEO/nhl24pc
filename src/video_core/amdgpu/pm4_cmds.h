@@ -239,6 +239,7 @@ struct PM4CmdNop {
         SetSsharpInUdata = 0x68750006u,     ///< Indicates that S# will be set in the next packet
         DebugColorMarkerPush = 0x6875000eu, ///< Begin of GPU event scope with color
         PatchedFlip = 0x68750776u,          ///< Patched flip marker
+        PatchedFlipEop = 0x68750775u,       ///< nhlport: patched flip that also raises GfxEop
         PrepareFlip = 0x68750777u,          ///< Flip marker
         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt

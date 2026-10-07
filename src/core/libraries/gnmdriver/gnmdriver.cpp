@@ -24,6 +24,10 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
 std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -125,12 +129,12 @@ static inline bool IsValidEventType(Platform::InterruptId id) {
 }
 
 s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
-    LOG_TRACE(Lib_GnmDriver, "called");
-
     auto equeue = GetEqueue(eq);
     if (!equeue) {
         return ORBIS_KERNEL_ERROR_EBADF;
     }
+    LOG_INFO(Lib_GnmDriver, "sceGnmAddEqEvent: equeue = {} id = {:#x} udata = {}", equeue->GetName(), id,
+             udata);
 
     EqueueEvent kernel_event{};
     kernel_event.event.ident = id;
@@ -2087,6 +2091,38 @@ int PS4_SYSV_ABI sceGnmSqttWaitForEvent() {
     return ORBIS_GNM_ERROR_FAILURE;
 }
 
+// nhlport: emulate the flip latency of real hardware. The emulated GPU thread and the presenter
+// can run several frames behind the CPU; NHL 24 counts the flips it submitted and its RenderLoop
+// thread only resumes while at most 3 of them are still outstanding. With 4 or more it waits
+// forever: the 3D scene is never rendered (black ice, HUD only) and the game stops reacting to
+// input. Hold the submitting thread until the presenter is within kMaxFlipsInFlight flips of it.
+static std::atomic<u64> cpu_flip_submits{0};
+
+static void ThrottleFlipSubmit(u32 vo_handle) {
+    constexpr u64 kMaxFlipsInFlight = 2;
+    constexpr auto kMaxWait = std::chrono::milliseconds(200);
+    const auto t0 = std::chrono::steady_clock::now();
+    VideoOut::FlipStatus status{};
+    u32 polls = 0;
+    while (VideoOut::sceVideoOutGetFlipStatus(static_cast<s32>(vo_handle), &status) == ORBIS_OK &&
+           cpu_flip_submits.load() > status.count + kMaxFlipsInFlight) {
+        if (std::chrono::steady_clock::now() - t0 > kMaxWait) {
+            LOG_WARNING(Lib_GnmDriver, "flip throttle timed out: cpu_submits={} presented={}",
+                        cpu_flip_submits.load(), status.count);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+        ++polls;
+    }
+    static u32 reports = 0;
+    if (polls != 0 && reports < 5) {
+        ++reports;
+        LOG_INFO(Lib_GnmDriver, "flip throttle: waited {} polls (cpu_submits={} presented={})",
+                 polls, cpu_flip_submits.load(), status.count);
+    }
+    ++cpu_flip_submits;
+}
+
 static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
                                    s64 flip_arg, void* unk) {
     // check for `prepareFlip` packet
@@ -2128,11 +2164,11 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
 
     if (backup[1] == PM4CmdNop::PayloadType::PrepareFlip) {
         nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x39};
-        nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
+        nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlipEop;
     } else {
         if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel) {
             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x34};
-            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
+            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlipEop;
 
             // Write event to update label
             auto* write_label = reinterpret_cast<PM4CmdWriteData*>(cmdbuf + 0x3b);
@@ -2294,6 +2330,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
 
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
+
+    ThrottleFlipSubmit(vo_handle);
 
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();

@@ -17,6 +17,48 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include <chrono>
+
+namespace {
+// nhlport diagnostics: a queue fiber that spins on a wait for seconds means the game waits for
+// something the emulator never produces (a CPU label write, another queue, a flip). Report it.
+struct SpinDiag {
+    u64 spins = 0;
+    std::chrono::steady_clock::time_point start;
+    bool reported = false;
+
+    bool Tick() {
+        if (spins++ == 0) {
+            start = std::chrono::steady_clock::now();
+            return false;
+        }
+        if (reported || (spins & 1023) != 0) {
+            return false;
+        }
+        if (std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+            return false;
+        }
+        reported = true;
+        return true;
+    }
+
+    double Seconds() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+};
+
+void LogWaitRegMemSpin(const char* queue, const AmdGpu::PM4CmdWaitRegMem& w, bool is_vo_label,
+                       u32 num_submits, size_t gfx_submits, u32 num_mapped_queues) {
+    const bool mem = w.mem_space.Value() == AmdGpu::PM4CmdWaitRegMem::MemSpace::Memory;
+    const u32 value = mem ? *w.Address<const u32*>() : 0u;
+    LOG_WARNING(Render,
+                "{} WaitRegMem spinning > 2s: {} {:#x} func={} ref={:#x} mask={:#x} cur={:#x} "
+                "vo_label={} engine={} (num_submits={} gfx_submits={} mapped_queues={})",
+                queue, mem ? "addr" : "reg", mem ? w.Address<uintptr_t>() : uintptr_t(w.Reg()),
+                static_cast<u32>(w.function.Value()), w.ref, w.mask, value, is_vo_label,
+                static_cast<u32>(w.engine.Value()), num_submits, gfx_submits, num_mapped_queues);
+}
+} // namespace
 
 namespace AmdGpu {
 
@@ -268,6 +310,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    break;
+                }
+                case PM4CmdNop::PayloadType::PatchedFlipEop: {
+                    // nhlport: on real hardware the flip is driven by an end-of-pipe interrupt
+                    // that is also delivered to every equeue registered for kEqEventGfxEop.
+                    // NHL 24 (Frostbite) writes all of its GPU fences without interrupts and
+                    // relies on that per-flip EOP event to wake its GfxEopEventLoop thread,
+                    // which processes the fences; without it the ice, players and textures
+                    // never arrive and the game eventually deadlocks.
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -753,8 +806,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    SpinDiag diag{};
                     while (!mem_semaphore->Signaled()) {
+                        if (diag.Tick()) {
+                            LOG_WARNING(Render, "GFX MemSemaphore spinning > 2s: packet {:#x}",
+                                        reinterpret_cast<uintptr_t>(mem_semaphore));
+                        }
                         YIELD_GFX();
+                    }
+                    if (diag.reported) {
+                        LOG_WARNING(Render, "GFX MemSemaphore resolved after {:.1f}s",
+                                    diag.Seconds());
                     }
                     mem_semaphore->Decrement();
                 }
@@ -769,8 +831,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                SpinDiag diag{};
                 while (!rewind->Valid()) {
+                    if (diag.Tick()) {
+                        LOG_WARNING(Render, "GFX Rewind spinning > 2s: packet {:#x}",
+                                    reinterpret_cast<uintptr_t>(rewind));
+                    }
                     YIELD_GFX();
+                }
+                if (diag.reported) {
+                    LOG_WARNING(Render, "GFX Rewind resolved after {:.1f}s", diag.Seconds());
                 }
                 break;
             }
@@ -787,8 +857,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
+                SpinDiag diag{};
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    if (diag.Tick()) {
+                        LogWaitRegMemSpin("GFX", *wait_reg_mem, vo_port->IsVoLabel(wait_addr),
+                                          num_submits, mapped_queues[GfxQueueId].submits.size(),
+                                          num_mapped_queues);
+                    }
                     YIELD_GFX();
+                }
+                if (diag.reported) {
+                    LOG_WARNING(Render, "GFX WaitRegMem resolved after {:.1f}s", diag.Seconds());
                 }
                 break;
             }
@@ -1085,8 +1164,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                SpinDiag diag{};
                 while (!mem_semaphore->Signaled()) {
+                    if (diag.Tick()) {
+                        LOG_WARNING(Render, "ASC{} MemSemaphore spinning > 2s: packet {:#x}", vqid,
+                                    reinterpret_cast<uintptr_t>(mem_semaphore));
+                    }
                     YIELD_ASC(vqid);
+                }
+                if (diag.reported) {
+                    LOG_WARNING(Render, "ASC{} MemSemaphore resolved after {:.1f}s", vqid,
+                                diag.Seconds());
                 }
                 mem_semaphore->Decrement();
             }
@@ -1095,8 +1183,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            SpinDiag diag{};
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (diag.Tick()) {
+                    const std::string name = fmt::format("ASC{}", vqid);
+                    LogWaitRegMemSpin(name.c_str(), *wait_reg_mem,
+                                      vo_port->IsVoLabel(wait_reg_mem->Address<u64*>()),
+                                      num_submits, mapped_queues[GfxQueueId].submits.size(),
+                                      num_mapped_queues);
+                }
                 YIELD_ASC(vqid);
+            }
+            if (diag.reported) {
+                LOG_WARNING(Render, "ASC{} WaitRegMem resolved after {:.1f}s", vqid, diag.Seconds());
             }
             break;
         }

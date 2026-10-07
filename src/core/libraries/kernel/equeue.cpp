@@ -8,6 +8,7 @@
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "common/thread.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/kernel.h"
@@ -193,9 +194,20 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     };
 
     if (micros == 0) {
-        // Wait indefinitely for events
+        // Wait indefinitely for events. nhlport diagnostics: a wait that never ends is reported
+        // (NHL 24 deadlocks with its RenderLoop thread parked on the flip event queue).
         std::unique_lock lock{m_mutex};
-        m_cond.wait(lock, predicate);
+        u32 slices = 0;
+        while (!m_cond.wait_for(lock, std::chrono::seconds(5), predicate)) {
+            ++slices;
+            if (slices <= 2 || slices % 12 == 0) {
+                LOG_WARNING(Kernel_Event,
+                            "equeue '{}' waited {}s on thread '{}' ({} events registered, {} small "
+                            "timers)",
+                            m_name, slices * 5, Common::GetCurrentThreadName(), m_events.size(),
+                            m_small_timers.size());
+            }
+        }
     } else {
         // Wait up until the timeout value
         std::unique_lock lock{m_mutex};

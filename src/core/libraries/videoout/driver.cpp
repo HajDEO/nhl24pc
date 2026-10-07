@@ -254,6 +254,9 @@ void VideoOutDriver::Flip(const Request& req) {
             --flip_status.gc_queue_num;
         }
         --flip_status.flip_pending_num;
+        LOG_DEBUG(Lib_VideoOut, "flip presented: index={} arg={} eop={} count={} pending={}",
+                  req.index, req.flip_arg, req.eop, flip_status.count,
+                  flip_status.flip_pending_num);
     }
 
     // Trigger flip events for the port.
@@ -326,6 +329,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
+    LOG_DEBUG(Lib_VideoOut, "flip submitted: index={} arg={} eop={} pending={}", index, flip_arg,
+              is_eop, port->flip_status.flip_pending_num);
     std::scoped_lock lock{mutex};
     requests.push({
         .frame = frame,
