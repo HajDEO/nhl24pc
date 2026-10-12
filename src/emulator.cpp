@@ -12,7 +12,9 @@
 #include <fmt/xchar.h>
 #include <hwinfo/hwinfo.h>
 
+#include "common/diag_log.h"
 #include "common/debug.h"
+#include "common/port_version.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -90,6 +92,7 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    Diag::Shutdown("shutdown");
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();
@@ -520,6 +523,25 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     LOG_INFO(Config, "Total RAM: {} GB", std::round(ram.total_Bytes() / pow(1024, 3)));
     LOG_INFO(Config, "Operating System: {}", os.name());
+    for (const auto& cpu : cpus) {
+        Diag::SetSessionInfo("cpu", fmt::format("{} ({} cores / {} threads)", cpu.modelName(),
+                                                cpu.numPhysicalCores(), cpu.numLogicalCores()));
+    }
+    Diag::SetSessionInfo("os", fmt::format("{}, {} GB RAM", os.name(),
+                                           std::round(ram.total_Bytes() / pow(1024, 3))));
+    Diag::SetSessionInfo(
+        "config",
+        fmt::format("window {}x{} fullscreen {} ({}), present mode {}, internal screen {}x{}, fsr {} "
+                    "rcas {}, readbacks mode {}, vblank {} Hz, pipeline cache {}, dump shaders {}, "
+                    "copy gpu buffers {}, validation {}, log filter '{}'",
+                    EmulatorSettings.GetWindowWidth(), EmulatorSettings.GetWindowHeight(),
+                    EmulatorSettings.IsFullScreen(), EmulatorSettings.GetFullScreenMode(),
+                    EmulatorSettings.GetPresentMode(), EmulatorSettings.GetInternalScreenWidth(),
+                    EmulatorSettings.GetInternalScreenHeight(), EmulatorSettings.IsFsrEnabled(),
+                    EmulatorSettings.IsRcasEnabled(), EmulatorSettings.GetReadbacksMode(),
+                    EmulatorSettings.GetVblankFrequency(), EmulatorSettings.IsPipelineCacheEnabled(),
+                    EmulatorSettings.IsDumpShaders(), EmulatorSettings.IsCopyGpuBuffers(),
+                    EmulatorSettings.IsVkValidationEnabled(), EmulatorSettings.GetLogFilter()));
 
     if (param_sfo_exists) {
         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
@@ -576,7 +598,22 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         ExtractTrophies("/app0/sce_sys/npbind.dat", "/app0/sce_sys/trophy");
 
     std::string game_title = fmt::format("{} - {} <{}>", id, title, app_version);
-    std::string window_title = "";
+    // nhlport: the port has its own name; the emulator identity stays in the log.
+    LOG_INFO(Loader, "{} (shadPS4 v{} {} {}) running {}", NHLPORT_TITLE, Common::g_version,
+             Common::g_scm_branch, Common::g_scm_desc, game_title);
+    Diag::SetSessionInfo("game", game_title);
+    Diag::SetSessionInfo("port", fmt::format("{} (shadPS4 v{} {} {})", NHLPORT_TITLE,
+                                             Common::g_version, Common::g_scm_branch,
+                                             Common::g_scm_desc));
+    Diag::SetGuestMemProbe([] {
+        auto* memory = Core::Memory::Instance();
+        return std::tuple<u64, u64, u64>{memory->GetTotalDirectSize(),
+                                         memory->GetTotalFlexibleSize(),
+                                         memory->GetAvailableFlexibleSize()};
+    });
+    Diag::Init();
+    std::string window_title = NHLPORT_TITLE;
+    if (false) {
     std::string remote_url(Common::g_scm_remote_url);
     std::string remote_host = Common::GetRemoteNameFromLink();
     if (Common::g_is_release) {
@@ -594,6 +631,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
             window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
+    }
     }
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,

@@ -46,8 +46,14 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
+    /// nhlport: report completed ticks to the diagnostic log (draw queue only).
+    void SetDiagTracked(bool tracked) noexcept {
+        diag_tracked = tracked;
+    }
+
 protected:
     const Instance& instance;
+    bool diag_tracked = false;
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.
     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
     std::atomic<u64> current_tick{1}; ///< Current logical tick.

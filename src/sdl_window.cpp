@@ -10,6 +10,7 @@
 #include <cmrc/cmrc.hpp>
 #include <stb_image.h>
 
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -333,6 +334,10 @@ void WindowSDL::WaitEvent() {
         break;
     case SDL_EVENT_SCREENSHOT_WITH_OVERLAYS:
         VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
+        break;
+    case SDL_EVENT_DIAG_MARK:
+        // nhlport: the user saw something; mark the diagnostic log (a game screenshot follows).
+        Diag::Marker("hotkey");
         break;
     default:
         break;

@@ -14,6 +14,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
+#include <chrono>
+#include "common/path_util.h"
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>
@@ -26,6 +29,40 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+// nhlport: write a small minidump (all thread stacks, referenced memory) next to the log.
+static void WriteCrashDump(EXCEPTION_POINTERS* pExp) noexcept {
+    using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                              PMINIDUMP_EXCEPTION_INFORMATION,
+                                              PMINIDUMP_USER_STREAM_INFORMATION,
+                                              PMINIDUMP_CALLBACK_INFORMATION);
+    static const auto write_dump = reinterpret_cast<MiniDumpWriteDumpFn>(
+        GetProcAddress(LoadLibraryA("dbghelp.dll"), "MiniDumpWriteDump"));
+    if (!write_dump) {
+        return;
+    }
+    const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                      fmt::format("crash_{}.dmp", stamp);
+    const HANDLE file = CreateFileW(path.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION info{};
+    info.ThreadId = GetCurrentThreadId();
+    info.ExceptionPointers = pExp;
+    info.ClientPointers = FALSE;
+    const auto type = static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory |
+                                                 MiniDumpWithThreadInfo |
+                                                 MiniDumpWithHandleData);
+    const BOOL ok = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, type, &info,
+                               nullptr, nullptr);
+    CloseHandle(file);
+    LOG_CRITICAL(Debug, "crash dump {}: {}", ok ? "written" : "FAILED", path.string());
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -142,6 +179,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        WriteCrashDump(pExp);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

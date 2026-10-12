@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include "common/diag_log.h"
 #include <ranges>
 
 #include "common/hash.h"
@@ -19,6 +21,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+#include "video_core/perf_counters.h"
 
 namespace Vulkan {
 
@@ -360,9 +364,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         g_pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        const auto compile_start = std::chrono::steady_clock::now();
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        VideoCore::Perf::gpu_stall_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 compile_start)
+                .count(),
+            std::memory_order_relaxed);
+        Diag::NotePipelineCompile(false, pipeline_hash,
+                                  std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - compile_start)
+                                      .count());
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -390,9 +404,19 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         g_pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
 
         ComputePipeline::SerializationSupport sdata{};
+        const auto compile_start = std::chrono::steady_clock::now();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
+        VideoCore::Perf::gpu_stall_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 compile_start)
+                .count(),
+            std::memory_order_relaxed);
+        Diag::NotePipelineCompile(true, pipeline_hash,
+                                  std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - compile_start)
+                                      .count());
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -639,6 +663,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     g_shaders_compiled.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
+    const auto shader_compile_start = std::chrono::steady_clock::now();
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
@@ -655,6 +680,11 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     } else {
         module = CompileSPV(spv, instance.GetDevice());
     }
+    Diag::NoteShaderCompile(fmt::format("{}", info.hw_stage), info.pgm_hash,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - shader_compile_start)
+                                .count(),
+                            perm_idx != 0);
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
 

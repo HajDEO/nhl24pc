@@ -43,6 +43,7 @@
 #define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 13
 #define SDL_EVENT_SCREENSHOT_WITH_OVERLAYS SDL_EVENT_USER + 14
 #define SDL_EVENT_TOGGLE_FRIENDS SDL_EVENT_USER + 15
+#define SDL_EVENT_DIAG_MARK SDL_EVENT_USER + 16
 
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
@@ -67,6 +68,7 @@
 #define HOTKEY_SCREENSHOT_WITH_OVERLAYS 0xf000000e
 #define HOTKEY_OPEN_EMULATOR_SETTINGS 0xf000000f
 #define HOTKEY_TOGGLE_FRIENDS 0xf0000010
+#define HOTKEY_DIAG_MARK 0xf0000011
 
 #define SDL_UNMAPPED UINT32_MAX - 1
 
@@ -168,6 +170,7 @@ const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_toggle_mouse_to_touchpad", HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD},
     {"hotkey_capture_frame", HOTKEY_RENDERDOC},
     {"hotkey_screenshot_with_overlays", HOTKEY_SCREENSHOT_WITH_OVERLAYS},
+    {"hotkey_diag_mark", HOTKEY_DIAG_MARK},
     {"hotkey_renderdoc_capture", HOTKEY_RENDERDOC},
     {"hotkey_add_virtual_user", HOTKEY_ADD_VIRTUAL_USER},
     {"hotkey_remove_virtual_user", HOTKEY_REMOVE_VIRTUAL_USER},

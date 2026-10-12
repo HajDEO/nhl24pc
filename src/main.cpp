@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -16,6 +17,7 @@
 #include "common/key_manager.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
+#include "common/port_version.h"
 #include "common/path_util.h"
 #include "core/debugger.h"
 #include "core/emulator_settings.h"
@@ -111,15 +113,42 @@ int main(int argc, char* argv[]) {
     // ---- Capture args after `--` verbatim ----
     app.allow_extras();
 
-    // ---- No-args behavior ----
+    // ---- No-args behavior: nhlport launches NHL 24 directly ----
+    // The game is looked up next to the executable (game/eboot.bin, ../GAME_FILE/uroot/eboot.bin,
+    // ../../GAME_FILE/uroot/eboot.bin) or at the path stored in user/game_path.txt; the
+    // memory patch user/patches/nhl24.xml is applied when present.
+    std::string default_game_path;
+    std::string default_patch_file;
     if (argc == 1) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
-                                 "This is a CLI application. Please use the '-b' flag for Big "
-                                 "Picture mode, or QTLauncher for a standalone GUI:\n"
-                                 "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
-                                 nullptr);
-        std::cout << app.help();
-        return -1;
+        std::error_code ec;
+        const auto exe_dir = std::filesystem::current_path(ec);
+        std::vector<std::filesystem::path> candidates;
+        if (std::ifstream in{exe_dir / "user" / "game_path.txt"}; in) {
+            std::string line;
+            if (std::getline(in, line) && !line.empty()) {
+                candidates.emplace_back(line);
+            }
+        }
+        candidates.push_back(exe_dir / "game" / "eboot.bin");
+        candidates.push_back(exe_dir / ".." / "GAME_FILE" / "uroot" / "eboot.bin");
+        candidates.push_back(exe_dir / ".." / ".." / "GAME_FILE" / "uroot" / "eboot.bin");
+        for (const auto& candidate : candidates) {
+            if (std::filesystem::is_regular_file(candidate, ec)) {
+                default_game_path = std::filesystem::absolute(candidate, ec).string();
+                break;
+            }
+        }
+        if (default_game_path.empty()) {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, NHLPORT_TITLE,
+                                     "NHL 24 game files were not found.\n\nPut the game dump into "
+                                     "the 'game' folder next to this program (game\\eboot.bin) or "
+                                     "write the full path of eboot.bin into user\\game_path.txt.",
+                                     nullptr);
+            return -1;
+        }
+        if (std::filesystem::is_regular_file(exe_dir / "user" / "patches" / "nhl24.xml", ec)) {
+            default_patch_file = "nhl24.xml";
+        }
     }
 
     try {
@@ -182,6 +211,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (!gamePath && !default_game_path.empty()) {
+        gamePath = default_game_path;
+        LOG_INFO(Debug, "{}: launching {}", NHLPORT_TITLE, default_game_path);
+    }
+    if (!patchFile && !default_patch_file.empty()) {
+        patchFile = default_patch_file;
+    }
     if (!gamePath.has_value()) {
         if (!gameArgs.empty()) {
             gamePath = gameArgs.front();

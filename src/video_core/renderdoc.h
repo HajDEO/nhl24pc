@@ -45,6 +45,9 @@ struct ScreenshotRequests {
 /// Queues an in-emulator screenshot request to be consumed by the presenter.
 void RequestScreenshot(ScreenshotRequest request);
 
+/// nhlport: true while a game-only screenshot request is still waiting to be consumed.
+bool HasPendingGameOnlyScreenshot();
+
 /// Atomically consumes and returns pending "game only" screenshot request counter.
 u32 ConsumeGameOnlyScreenshotRequests();
 

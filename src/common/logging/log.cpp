@@ -29,6 +29,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/logging/log_file_sink.h"
+#include "common/diag_log.h"
 #include "common/path_util.h"
 #include "common/thread.h"
 #include "common/types.h"
@@ -64,6 +65,9 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     }
     fmt::memory_buffer msg;
     fmt::vformat_to(fmt::appender(msg), format, args);
+    // nhlport: the diagnostic log counts warnings / errors per call site.
+    Diag::NoteLog(NameOf(log_class), static_cast<int>(level), file, line, func,
+                  std::string_view(msg.data(), msg.size()));
     const std::string_view fn = std::string_view(func) == "operator()" ? "lambda" : func;
     logger->log(ToSpdlog(level), "[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
                 NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),

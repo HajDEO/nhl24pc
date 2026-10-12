@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diag_log.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -88,6 +89,7 @@ void* PS4_SYSV_ABI sceKernelGetProcParam() {
 s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, const void* argp,
                                           u32 flags, const void* pOpt, s32* pRes) {
     LOG_INFO(Lib_Kernel, "called filename = {}, args = {}", moduleFileName, args);
+    Diag::Eventf("guest", "sceKernelLoadStartModule {}", moduleFileName);
     ASSERT(flags == 0);
 
     auto* linker = Common::Singleton<Core::Linker>::Instance();

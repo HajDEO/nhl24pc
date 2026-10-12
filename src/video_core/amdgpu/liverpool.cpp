@@ -3,6 +3,7 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
@@ -15,6 +16,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/perf_counters.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include <chrono>
@@ -208,6 +210,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+            VideoCore::Perf::current_pm4 = static_cast<u32>(opcode);
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
@@ -298,6 +301,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            VideoCore::Perf::current_pm4 = static_cast<u32>(opcode);
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -309,6 +313,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
+                    VideoCore::Perf::gpu_frame.fetch_add(1, std::memory_order_relaxed);
+                    Diag::OnGpuFrameBoundary();
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     break;
                 }
@@ -319,6 +325,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // relies on that per-flip EOP event to wake its GfxEopEventLoop thread,
                     // which processes the fences; without it the ice, players and textures
                     // never arrive and the game eventually deadlocks.
+                    VideoCore::Perf::gpu_frame.fetch_add(1, std::memory_order_relaxed);
+                    Diag::OnGpuFrameBoundary();
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                     break;
@@ -784,8 +792,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!write_data->wr_one_addr.Value()) {
                     if (rasterizer) {
                         rasterizer->OnFence();
+                        rasterizer->InlineData(VAddr(address), write_data->data, data_size);
+                    } else {
+                        std::memcpy(address, write_data->data, data_size);
                     }
-                    std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
                 }
@@ -999,6 +1009,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+            VideoCore::Perf::current_pm4 = static_cast<u32>(opcode);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1152,8 +1163,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!write_data->wr_one_addr.Value()) {
                 if (rasterizer) {
                     rasterizer->OnFence();
+                    rasterizer->InlineData(write_data->Address<VAddr>(), write_data->data, data_size);
+                } else {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
                 }
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
             }
@@ -1205,6 +1218,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->OnFence();
             }
             release_mem->SignalFence(
+                [this](VAddr address, const void* value, u32 num_bytes) {
+                    if (rasterizer) {
+                        rasterizer->InlineData(address, value, num_bytes);
+                    } else {
+                        std::memcpy(std::bit_cast<void*>(address), value, num_bytes);
+                    }
+                },
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
                 },
@@ -1268,6 +1288,7 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    Diag::C::guest_gfx_submits.fetch_add(1, std::memory_order_relaxed);
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
@@ -1287,6 +1308,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     auto& queue = mapped_queues[gnm_vqid];
+    Diag::C::guest_asc_submits.fetch_add(1, std::memory_order_relaxed);
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);

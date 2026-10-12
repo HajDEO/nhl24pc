@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
+#include "common/diag_log.h"
 #include "common/alignment.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/perf_counters.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -54,7 +59,32 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
-      memory_semaphore{instance} {
+      transfer_semaphore{instance}, memory_semaphore{instance} {
+    // nhlport: readback copies on a second queue (NHLPORT_READBACK_DRAIN=1 restores Finish()).
+    {
+        const char* env = std::getenv("NHLPORT_READBACK_DRAIN");
+        transfer_readbacks = instance.HasTransferQueue() && !(env && env[0] == '1');
+        if (transfer_readbacks) {
+            const vk::CommandPoolCreateInfo pool_ci = {
+                .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                         vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+                .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+            };
+            auto [pool_result, pool] = instance.GetDevice().createCommandPoolUnique(pool_ci);
+            ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create transfer pool: {}",
+                       vk::to_string(pool_result));
+            transfer_pool = std::move(pool);
+            const vk::CommandBufferAllocateInfo alloc_info = {
+                .commandPool = *transfer_pool,
+                .level = vk::CommandBufferLevel::ePrimary,
+                .commandBufferCount = 1,
+            };
+            const auto alloc_result =
+                instance.GetDevice().allocateCommandBuffers(&alloc_info, &transfer_cmdbuf);
+            ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate transfer cmdbuf");
+            LOG_INFO(Render, "Readbacks use the transfer queue (per-range submission waits)");
+        }
+    }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -102,6 +132,18 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    // nhlport: which guest regions force GPU->CPU readbacks (first 40, then every 1000th)
+    {
+        static std::atomic<u64> count{0};
+        const u64 n = count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 40 || n % 1000 == 0) {
+            LOG_INFO(Render, "readback #{}: addr {:#x} size {:#x} {} thread {} pm4 {:#x}", n, device_addr,
+                     size, is_write ? "cpu-write" : "cpu-read", Common::GetCurrentThreadName(),
+                     VideoCore::Perf::current_pm4);
+        }
+    }
+    (is_write ? Diag::C::readback_cpu_write : Diag::C::readback_cpu_read)
+        .fetch_add(1, std::memory_order_relaxed);
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -127,6 +169,38 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+bool BufferCache::InlineData(VAddr address, const void* data, u32 num_bytes) {
+    if (address % 4 != 0 || num_bytes % 4 != 0 || num_bytes == 0 || num_bytes > 65536) {
+        return false;
+    }
+    // Labels outside the guest mappings (e.g. emulator-side addresses above the GPU range) keep
+    // the plain store; TryWriteBacking asserts on them.
+    if (!memory->IsValidGpuMapping(address, num_bytes) || !memory->IsValidMapping(address, num_bytes)) {
+        return false;
+    }
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(address), data, num_bytes)) {
+        return false;
+    }
+    if (!IsRegionGpuModified(address, num_bytes)) {
+        // No newer GPU copy of this range: the next GPU use re-uploads the page.
+        memory_tracker->MarkRegionAsCpuModified(address, num_bytes);
+        return true;
+    }
+    // The GPU copy is authoritative; patch it so shaders and later readbacks see the write.
+    const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
+    runtime.InlineData(buffer, offset, data, num_bytes);
+    return true;
+}
+
+void BufferCache::NoteGpuWrite(VAddr device_addr, u64 size) {
+    const u64 tick = scheduler.CurrentTick();
+    const u64 first = device_addr >> WRITE_TICK_WINDOW_BITS;
+    const u64 last = (device_addr + size - 1) >> WRITE_TICK_WINDOW_BITS;
+    for (u64 w = first; w <= last; ++w) {
+        gpu_write_ticks[w] = tick;
+    }
+}
+
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -148,6 +222,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
         gpu_modified_ranges.Subtract(address, size);
     });
+    // nhlport: the submission that has to be complete before the copy may read the data.
+    u64 max_tick = 0;
+    bool ticks_known = true;
+    for (const auto& copy : copies) {
+        const VAddr start = arena_base + copy.srcOffset;
+        const u64 first = start >> WRITE_TICK_WINDOW_BITS;
+        const u64 last = (start + copy.size - 1) >> WRITE_TICK_WINDOW_BITS;
+        for (u64 w = first; w <= last; ++w) {
+            const auto it = gpu_write_ticks.find(w);
+            if (it == gpu_write_ticks.end()) {
+                ticks_known = false;
+            } else {
+                max_tick = std::max(max_tick, it->second);
+            }
+        }
+    }
+    if (ticks_known) {
+        VideoCore::Perf::readback_tick_known.fetch_add(1, std::memory_order_relaxed);
+        if (max_tick < scheduler.CurrentTick()) {
+            VideoCore::Perf::readback_tick_old.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (total_size_bytes == 0) {
         return;
     }
@@ -155,8 +251,92 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
+    VideoCore::Perf::readback_calls.fetch_add(1, std::memory_order_relaxed);
+    VideoCore::Perf::readback_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+    // nhlport: which GPU-written ranges a readback actually downloads (first 40, then every 500th)
+    {
+        static std::atomic<u64> count{0};
+        const u64 n = count.fetch_add(1, std::memory_order_relaxed);
+        if (n < 40 || n % 500 == 0) {
+            std::string ranges;
+            for (size_t i = 0; i < copies.size() && i < 6; ++i) {
+                ranges += fmt::format(" [{:#x}+{:#x}]", arena_base + copies[i].srcOffset, copies[i].size);
+            }
+            LOG_INFO(Render, "readback ranges #{}: window {:#x}+{:#x} -> {} ranges, {} bytes:{}{}", n, device_addr,
+                     size, copies.size(), total_size_bytes, ranges, copies.size() > 6 ? " ..." : "");
+        }
+    }
+    if (transfer_readbacks) {
+        // Writes still sitting in the open command buffer must be submitted first; their
+        // submission signals CurrentTick(). Anything older is already in flight or done.
+        if (!ticks_known || max_tick >= scheduler.CurrentTick()) {
+            max_tick = scheduler.CurrentTick();
+            Vulkan::SubmitInfo info{};
+            scheduler.Flush(info);
+        }
+        const auto reset_result = transfer_cmdbuf.reset();
+        ASSERT(reset_result == vk::Result::eSuccess);
+        const vk::CommandBufferBeginInfo begin_info = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        const auto begin_result = transfer_cmdbuf.begin(begin_info);
+        ASSERT(begin_result == vk::Result::eSuccess);
+        transfer_cmdbuf.copyBuffer(arena->Handle(), download.buffer->Handle(), copies);
+        const auto end_result = transfer_cmdbuf.end();
+        ASSERT(end_result == vk::Result::eSuccess);
+
+        const u64 signal_value = transfer_semaphore.NextTick();
+        const vk::Semaphore wait_sem = scheduler.GetWorkSemaphore()->Handle();
+        const vk::Semaphore signal_sem = transfer_semaphore.Handle();
+        const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = 1,
+            .pWaitSemaphoreValues = &max_tick,
+            .signalSemaphoreValueCount = 1,
+            .pSignalSemaphoreValues = &signal_value,
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &wait_sem,
+            .pWaitDstStageMask = &wait_stage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &transfer_cmdbuf,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &signal_sem,
+        };
+        {
+            std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
+            const auto submit_result = instance.GetTransferQueue().submit(submit_info);
+            ASSERT_MSG(submit_result == vk::Result::eSuccess, "Readback submit failed: {}",
+                       vk::to_string(submit_result));
+        }
+        VideoCore::Perf::gpu_waits.fetch_add(1, std::memory_order_relaxed);
+        const auto wait_start = std::chrono::steady_clock::now();
+        transfer_semaphore.Wait(signal_value);
+        const auto waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - wait_start)
+                                   .count();
+        VideoCore::Perf::gpu_stall_ns.fetch_add(waited_ns, std::memory_order_relaxed);
+        Diag::C::readback_wait_ns.fetch_add(static_cast<u64>(waited_ns), std::memory_order_relaxed);
+        if (waited_ns > 1000000000LL) {
+            LOG_WARNING(Render, "readback waited {} ms: graphics tick {} (current {}, known {}), "
+                                "transfer value {} (known {}), {} ranges {} bytes, window {:#x}",
+                        waited_ns / 1000000, max_tick, scheduler.CurrentTick(),
+                        scheduler.GetWorkSemaphore()->KnownGpuTick(), signal_value,
+                        transfer_semaphore.KnownGpuTick(), copies.size(), total_size_bytes,
+                        device_addr);
+        }
+    } else {
+        runtime.CopyBuffer(arena, download.buffer, copies);
+        const auto finish_start = std::chrono::steady_clock::now();
+        scheduler.Finish();
+        Diag::C::readback_wait_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - finish_start)
+                                 .count()),
+            std::memory_order_relaxed);
+    }
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -183,6 +363,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        NoteGpuWrite(device_addr, size);
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -362,11 +543,20 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             return true;
         } else if (*type == TextureCache::MetaType::CMask) {
             // nhlport: NHL 24 (Frostbite) reads colour-buffer CMASK surfaces from compute
-            // shaders. Render targets are never fast-cleared or compressed here, so present the
-            // metadata as "fully expanded" (every 4-bit tile entry 0xF), the counterpart of the
-            // HTile case above.
-            static constexpr u32 CmaskExpanded = 0xffffffffu;
-            runtime.FillBuffer(arena, arena->Offset(device_addr), size, CmaskExpanded);
+            // shaders. The emulator applies fast clears to the image itself, so the metadata it
+            // hands out mirrors the tracked state: while the surface is fast-cleared every 4-bit
+            // tile entry reads 0x0 ("cleared"), otherwise 0xF ("fully expanded"), the counterpart
+            // of the HTile case above.
+            const bool cleared = texture_cache.IsMetaCleared(device_addr, 0);
+            const u32 cmask_fill = cleared ? 0u : 0xffffffffu;
+            runtime.FillBuffer(arena, arena->Offset(device_addr), size, cmask_fill);
+            // The game then treats every 4x4 block of the target as drawn (NHL 24 UI coverage
+            // mask); remembered for the diagnostic log.
+            if (!texture_cache.IsMetaShaderRead(device_addr)) {
+                texture_cache.MarkMetaShaderRead(device_addr);
+                LOG_INFO(Render_Vulkan, "CMASK {:#x} ({}) is read by a shader", device_addr,
+                         texture_cache.DescribeMeta(device_addr));
+            }
             return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));

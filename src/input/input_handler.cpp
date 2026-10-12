@@ -183,6 +183,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_volume_down", "kpminus"},
             {"hotkey_emulator_settings", "f3"},
             {"hotkey_toggle_friends", "f2"},
+            {"hotkey_diag_mark", "f1"},
         };
         std::string legacy_capture_binding;
         bool legacy_capture_binding_found = false;
@@ -785,6 +786,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case HOTKEY_SCREENSHOT_WITH_OVERLAYS:
             PushSDLEvent(SDL_EVENT_SCREENSHOT_WITH_OVERLAYS);
+            break;
+        case HOTKEY_DIAG_MARK:
+            PushSDLEvent(SDL_EVENT_DIAG_MARK);
             break;
         case HOTKEY_ADD_VIRTUAL_USER:
             PushSDLEvent(SDL_EVENT_ADD_VIRTUAL_USER);

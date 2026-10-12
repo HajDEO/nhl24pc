@@ -66,6 +66,24 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
     ctx.OpStore(ctx.output_position, vector);
 }
 
+// nhlport: see EmitContext::DefineVertexBlock (vertex kill emulation).
+static void EmitVertexKill(EmitContext& ctx) {
+    const Id type{ctx.F32[1]};
+    const Id bool_type{ctx.U1[1]};
+    const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
+    const Id x{ctx.OpCompositeExtract(type, position, 0u)};
+    const Id y{ctx.OpCompositeExtract(type, position, 1u)};
+    const Id z{ctx.OpCompositeExtract(type, position, 2u)};
+    const Id w{ctx.OpCompositeExtract(type, position, 3u)};
+    Id kill{ctx.OpIsNan(bool_type, x)};
+    kill = ctx.OpLogicalOr(bool_type, kill, ctx.OpIsNan(bool_type, y));
+    kill = ctx.OpLogicalOr(bool_type, kill, ctx.OpIsNan(bool_type, z));
+    kill = ctx.OpLogicalOr(bool_type, kill, ctx.OpIsNan(bool_type, w));
+    kill = ctx.OpLogicalOr(bool_type, kill, ctx.OpFOrdLessThanEqual(bool_type, w, ctx.ConstF32(0.f)));
+    const Id value{ctx.OpSelect(type, kill, ctx.ConstF32(-1.f), ctx.ConstF32(1.f))};
+    ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.vtx_kill_cull, ctx.ConstU32(0u)), value);
+}
+
 void EmitEpilogue(EmitContext& ctx) {
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {
@@ -73,6 +91,9 @@ void EmitEpilogue(EmitContext& ctx) {
     }
     if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.clip_disable) {
         ConvertPositionToClipSpace(ctx);
+    }
+    if (ctx.hw_stage == HwStage::Vertex && ctx.vtx_kill_cull.value != 0) {
+        EmitVertexKill(ctx);
     }
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -14,6 +15,8 @@
 #include <queue>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/thread.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
@@ -108,7 +111,12 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
-            sem.acquire();
+            u32 waited_s = 0;
+            while (!sem.try_acquire_for(std::chrono::seconds(5))) {
+                waited_s += 5;
+                LOG_WARNING(Render, "GPU command queue: thread {} waited {}s for the GPU thread",
+                            Common::GetCurrentThreadName(), waited_s);
+            }
         } else {
             std::scoped_lock lk{submit_mutex};
             command_queue.emplace(std::move(func));

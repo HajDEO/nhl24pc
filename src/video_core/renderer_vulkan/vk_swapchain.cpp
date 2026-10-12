@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -82,6 +83,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
 void Swapchain::Recreate(u32 width_, u32 height_) {
     LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width_, height_,
               needs_hdr);
+    Diag::C::swapchain_recreates.fetch_add(1, std::memory_order_relaxed);
+    Diag::Eventf("window", "swapchain recreated {}x{} hdr {}", width_, height_, needs_hdr);
     Create(width_, height_);
 }
 

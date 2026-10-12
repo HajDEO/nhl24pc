@@ -5,6 +5,9 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include <chrono>
+#include "common/diag_log.h"
+#include "video_core/perf_counters.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -115,6 +118,7 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    VideoCore::Perf::gpu_waits.fetch_add(1, std::memory_order_relaxed);
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
@@ -128,12 +132,24 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    const auto start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
+    VideoCore::Perf::gpu_stall_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+            .count(),
+        std::memory_order_relaxed);
 }
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
-    work_semaphore.Refresh();
+    if (pending_ops.empty()) {
+        return;
+    }
+    // nhlport: this runs before every draw; only query the timeline semaphore when the oldest
+    // pending operation is not already known to be free.
+    if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        work_semaphore.Refresh();
+    }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
@@ -183,6 +199,7 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    VideoCore::Perf::sched_submits.fetch_add(1, std::memory_order_relaxed);
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -239,6 +256,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (diag_timeline) {
+        Diag::OnGpuSubmit(signal_value);
+    }
 
     work_semaphore.Refresh();
     BeginSession();

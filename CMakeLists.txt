@@ -776,6 +776,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/logging/log.cpp
            src/common/logging/log.h
            src/common/logging/log_file_sink.h
+           src/common/diag_log.cpp
+           src/common/diag_log.h
            src/common/aes.h
            src/common/alignment.h
            src/common/arch.h
@@ -1324,6 +1326,8 @@ add_executable(shadps4
 
 create_target_directory_groups(shadps4)
 
+# nhlport: the binary is the game's PC build, not a generic emulator.
+set_target_properties(shadps4 PROPERTIES OUTPUT_NAME nhl24)
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis SDL3::SDL3 pugixml::pugixml)

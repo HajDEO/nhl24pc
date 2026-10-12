@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <utility>
+#include "common/diag_log.h"
 #include "common/debug.h"
+#include "common/thread.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -496,6 +499,16 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
     ImGui::InvitationPrompt::Register();
+
+    // nhlport: diagnostic log probes (GPU timeline of the draw queue, VRAM, window, texture cache).
+    draw_scheduler.EnableDiagTimeline();
+    Diag::SetVramProbe([this] { return instance.QueryMemoryUsage(); });
+    Diag::SetWindowProbe([this] {
+        return std::pair<u32, u32>{static_cast<u32>(window.GetWidth()),
+                                   static_cast<u32>(window.GetHeight())};
+    });
+    Diag::SetHostCacheProbe([this] { return texture_cache.GetDiagUsage(); });
+    Diag::SetGpuRefreshProbe([this] { draw_scheduler.GetWorkSemaphore()->Refresh(); });
 }
 
 Presenter::~Presenter() {
@@ -842,12 +855,17 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     // Free the frame for reuse
+    // nhlport: the frame that was just presented stays reserved (DrawLastFrame re-presents it
+    // while nothing new arrives); the previously presented frame is released to the GPU thread
+    // instead, so no frame is ever re-rendered or has its fence reset while it is being shown.
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
-            last_submit_frame = frame;
-            std::scoped_lock fl{free_mutex};
-            free_queue.push(frame);
-            free_cv.notify_one();
+            Frame* const previous = std::exchange(last_submit_frame, frame);
+            if (previous != nullptr && previous != frame) {
+                std::scoped_lock fl{free_mutex};
+                free_queue.push(previous);
+                free_cv.notify_one();
+            }
         }
     };
 
@@ -1092,7 +1110,12 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        u32 waited_s = 0;
+        while (!free_cv.wait_for(lock, std::chrono::seconds(5), [this] { return !free_queue.empty(); })) {
+            waited_s += 5;
+            LOG_WARNING(Render_Vulkan, "GetRenderFrame: waited {}s for a free frame (thread {})", waited_s,
+                        Common::GetCurrentThreadName());
+        }
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1103,8 +1126,14 @@ Frame* Presenter::GetRenderFrame() {
     const vk::Device device = instance.GetDevice();
     vk::Result result{};
 
+    u32 fence_waited_s = 0;
     const auto wait = [&]() {
-        result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
+        result = device.waitForFences(frame->present_done, false, 2000000000ULL);
+        if (result == vk::Result::eTimeout) {
+            fence_waited_s += 2;
+            LOG_WARNING(Render_Vulkan, "GetRenderFrame: waited {}s for the present fence (thread {})",
+                        fence_waited_s, Common::GetCurrentThreadName());
+        }
         return result;
     };
 

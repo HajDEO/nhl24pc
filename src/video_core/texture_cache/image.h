@@ -156,6 +156,14 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    /// nhlport: CPU write faults seen on this image; after a few the image is treated as a
+    /// CPU-streamed texture: never re-protected, uploaded once per frame instead.
+    u32 cpu_fault_count{};
+    u64 last_fault_frame{~u64{0}}; ///< gpu frame of the last CPU write fault
+    u32 fault_frames{};             ///< distinct gpu frames with CPU write faults
+    bool cp_written{};              ///< filled by WRITE_DATA inside the command stream
+    bool streamed{};
+    u64 streamed_refresh_frame{~u64{0}};
 
     struct {
         u32 texture : 1;
@@ -171,6 +179,16 @@ public:
         u32 needs_rebind : 1;
         u32 force_general : 1;
     } binding{};
+
+    /// nhlport: metadata surfaces this image holds a reference on in TextureCache::surface_metas
+    /// (see TextureCache::LinkMeta). Kept apart from info.meta_info: that is copied from the
+    /// colour / depth buffer registers when the image is created, before it is ever bound, so
+    /// comparing it with the requested address cannot tell a first link from a repeated one.
+    struct {
+        VAddr cmask = 0;
+        VAddr fmask = 0;
+        VAddr htile = 0;
+    } meta_links{};
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;

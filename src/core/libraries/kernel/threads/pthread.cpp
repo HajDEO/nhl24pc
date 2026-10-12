@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/thread.h"
 #ifdef _WIN32
@@ -338,6 +339,9 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
     } else {
         new_thread->name = fmt::format("Thread{}", new_thread->tid.load());
     }
+    Diag::C::guest_threads_created.fetch_add(1, std::memory_order_relaxed);
+    Diag::Eventf("guest", "thread created: {} (tid {}, stack {} KB)", new_thread->name,
+                 new_thread->tid.load(), new_thread->attr.stacksize_attr >> 10);
 
     ASSERT(new_thread->attr.suspend == 0);
     new_thread->state = PthreadState::Running;

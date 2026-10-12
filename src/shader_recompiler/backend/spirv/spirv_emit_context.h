@@ -265,6 +265,7 @@ public:
     Id sample_index{};
     Id clip_distances{};
     Id cull_distances{};
+    Id vtx_kill_cull{}; ///< nhlport: synthetic cull distance emulating GCN vertex kill
 
     Id patch_vertices{};
     Id output_tess_level_outer{};

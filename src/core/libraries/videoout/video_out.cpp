@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -140,6 +141,7 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
+    Diag::Eventf("videoout", "sceVideoOutSetFlipRate {} (0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz)", rate);
     driver->GetPort(handle)->flip_rate = rate;
     return ORBIS_OK;
 }
@@ -292,6 +294,9 @@ s32 PS4_SYSV_ABI sceVideoOutGetResolutionStatus(s32 handle, SceVideoOutResolutio
     }
 
     *status = port->resolution;
+    Diag::Eventf("videoout", "sceVideoOutGetResolutionStatus -> {}x{} (pane {}x{}, flags {:#x})",
+                 status->full_width, status->full_height, status->pane_width,
+                 status->pane_height, status->flags);
     return ORBIS_OK;
 }
 

@@ -167,6 +167,10 @@ void RequestScreenshot(const ScreenshotRequest request) {
     }
 }
 
+bool HasPendingGameOnlyScreenshot() {
+    return screenshot_game_only_count.load(std::memory_order_acquire) != 0;
+}
+
 u32 ConsumeGameOnlyScreenshotRequests() {
     return screenshot_game_only_count.exchange(0, std::memory_order_acq_rel);
 }

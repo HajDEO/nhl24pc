@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diag_log.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -276,6 +277,7 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
     area.memory_type = memory_type;
     area.dma_type = PhysicalMemoryType::Allocated;
     MergeAdjacent(dmem_map, dmem_area);
+    Diag::C::dmem_allocated.fetch_add(size, std::memory_order_relaxed);
 
     return mapping_start;
 }
@@ -320,6 +322,9 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 
         // Track remaining size to free
         remaining_size -= size_in_dma;
+    }
+    for (const auto& [free_addr, free_size] : free_list) {
+        Diag::C::dmem_allocated.fetch_sub(free_size, std::memory_order_relaxed);
     }
 
     // Release any dmem mappings that reference this physical block.

@@ -1730,7 +1730,19 @@ sceSystemServiceGetDisplaySafeAreaInfo(OrbisSystemServiceDisplaySafeAreaInfo* in
         LOG_ERROR(Lib_SystemService, "OrbisSystemServiceDisplaySafeAreaInfo is null");
         return ORBIS_SYSTEM_SERVICE_ERROR_PARAMETER;
     }
-    info->ratio = 1.0f;
+    // nhlport: NHLPORT_SAFE_AREA=<ratio> overrides the display area ratio (PS4 system setting
+    // "Display Area", 0.9 .. 1.0) for experiments with the UI layout; default 1.0 = full screen.
+    static const float ratio = [] {
+        if (const char* v = std::getenv("NHLPORT_SAFE_AREA")) {
+            const float r = static_cast<float>(std::atof(v));
+            if (r >= 0.5f && r <= 1.0f) {
+                return r;
+            }
+        }
+        return 1.0f;
+    }();
+    info->ratio = ratio;
+    LOG_INFO(Lib_SystemService, "display safe area ratio {}", ratio);
     return ORBIS_OK;
 }
 

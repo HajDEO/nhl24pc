@@ -6,6 +6,9 @@
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 #include "common/assert.h"
+#include "common/diag_log.h"
+#include "common/logging/log.h"
+#include "common/thread.h"
 
 namespace Vulkan {
 
@@ -42,6 +45,9 @@ void Semaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+    if (diag_tracked && counter > this_tick) {
+        Diag::OnGpuComplete(this_tick, counter);
+    }
 }
 
 void Semaphore::Wait(u64 tick) {
@@ -62,7 +68,21 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    // nhlport: wait in slices so a GPU-side stall is reported (tick numbers + thread) instead of
+    // freezing silently; a lost device is a hard error rather than an endless loop.
+    constexpr u64 SliceNs = 2000000000ULL;
+    u32 waited_s = 0;
+    while (true) {
+        const auto result = instance.GetDevice().waitSemaphores(&wait_info, SliceNs);
+        if (result == vk::Result::eSuccess) {
+            break;
+        }
+        ASSERT_MSG(result == vk::Result::eTimeout, "Timeline semaphore wait failed: {}",
+                   vk::to_string(result));
+        waited_s += 2;
+        Refresh();
+        LOG_WARNING(Render_Vulkan, "timeline wait {}s: tick {} known {} current {} thread {}",
+                    waited_s, tick, KnownGpuTick(), CurrentTick(), Common::GetCurrentThreadName());
     }
     Refresh();
 }

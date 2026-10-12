@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
@@ -376,10 +378,13 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // nhlport: ask for a second queue in the graphics family (readback copies).
+    static constexpr std::array queue_priorities = {1.0f, 0.5f};
+    const u32 num_queues =
+        std::min<u32>(family_properties[queue_family_index].queueCount, queue_priorities.size());
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = num_queues,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -417,6 +422,7 @@ bool Instance::CreateDevice() {
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
                 .shaderClipDistance = features.shaderClipDistance,
+                .shaderCullDistance = features.shaderCullDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
                 .shaderInt16 = features.shaderInt16,
@@ -589,6 +595,11 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    has_transfer_queue = num_queues >= 2;
+    transfer_queue = has_transfer_queue ? device->getQueue(queue_family_index, 1) : graphics_queue;
+    LOG_INFO(Render_Vulkan, "Graphics family {} queues: {} (readback transfer queue: {})",
+             queue_family_index, family_properties[queue_family_index].queueCount,
+             has_transfer_queue ? "yes" : "no");
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -669,6 +680,27 @@ void Instance::CollectDeviceParameters() {
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Extensions: {}", extensions);
+    Diag::SetSessionInfo("gpu", fmt::format("{} ({}), driver {}, Vulkan {}", model_name,
+                                            vendor_name, driver_name, api_version));
+}
+
+std::pair<u64, u64> Instance::QueryMemoryUsage() const {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = supports_memory_budget ? &budget : nullptr,
+    };
+    physical_device.getMemoryProperties2(&props);
+    u64 used = 0;
+    u64 total = 0;
+    for (const size_t heap : valid_heaps) {
+        if (supports_memory_budget) {
+            used += budget.heapUsage[heap];
+            total += budget.heapBudget[heap];
+        } else {
+            total += props.memoryProperties.memoryHeaps[heap].size;
+        }
+    }
+    return {used, total};
 }
 
 void Instance::CollectPhysicalMemoryInfo() {

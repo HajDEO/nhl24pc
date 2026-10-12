@@ -445,6 +445,12 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// nhlport: report submits and completions of this scheduler to the diagnostic log.
+    void EnableDiagTimeline() {
+        diag_timeline = true;
+        work_semaphore.SetDiagTracked(true);
+    }
+
     static std::mutex submit_mutex;
 
 private:
@@ -461,6 +467,7 @@ private:
     DynamicState dynamic_state;
     SessionFunc on_session{};
     SubmitFunc on_submit{};
+    bool diag_timeline = false;
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};

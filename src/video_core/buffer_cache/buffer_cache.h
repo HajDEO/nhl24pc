@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include <absl/container/flat_hash_map.h>
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -81,6 +82,10 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
+    /// nhlport: write guest memory from the GPU thread without touching page protection;
+    /// patches the GPU copy when the range is GPU-modified. Returns false if not backed.
+    bool InlineData(VAddr address, const void* data, u32 num_bytes);
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -138,6 +143,15 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// nhlport: scheduler tick of the newest GPU write per 512 KB window (the readback window
+    /// size), so a readback waits for exactly that submission on the transfer queue.
+    static constexpr u64 WRITE_TICK_WINDOW_BITS = 19;
+    absl::flat_hash_map<u64, u64> gpu_write_ticks;
+    void NoteGpuWrite(VAddr device_addr, u64 size);
+    Vulkan::Semaphore transfer_semaphore;
+    vk::UniqueCommandPool transfer_pool;
+    vk::CommandBuffer transfer_cmdbuf;
+    bool transfer_readbacks{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

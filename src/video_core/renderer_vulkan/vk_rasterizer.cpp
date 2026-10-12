@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diag_log.h"
 #include "common/debug.h"
+#include "common/path_util.h"
+#include "common/io_file.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -13,6 +16,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include <cstdlib>
+#include "video_core/perf_counters.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -173,7 +178,7 @@ void Rasterizer::EliminateFastClear() {
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
     }
     auto& image = texture_cache.GetImage(image_id);
-    const auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
+    const auto clear_value = ColorClearValue(col_buf);
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
@@ -181,11 +186,38 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+vk::ClearValue Rasterizer::ColorClearValue(const AmdGpu::ColorBuffer& col_buf) const {
+    auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
+    const VAddr cmask = col_buf.CmaskAddress();
+    if (texture_cache.IsMetaShaderRead(cmask)) {
+        // NHL 24 derives its UI coverage mask from the CMASK of the UI target (see
+        // TextureCache::MarkMetaShaderRead). Its fast clear is transparent black already, the
+        // black band under the HUD is drawn by the game itself (2026-10-12), so the clear value
+        // is left as the registers say. NHLPORT_CLEAR_DEBUG=1 paints such clears red so the
+        // never-drawn area of the target is visible in image dumps and screenshots.
+        static const bool clear_debug = [] {
+            const char* v = std::getenv("NHLPORT_CLEAR_DEBUG");
+            return v && v[0] == '1';
+        }();
+        if (clear_debug) {
+            clear_value.color.float32[0] = 1.0f;
+            clear_value.color.float32[3] = 0.0f;
+        }
+        if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+            VideoCore::Perf::DrawLog(fmt::format(
+                "meta-clear-shader-read f{} @ {:#x} target {:#x} clear {:#x}", VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                cmask, col_buf.Address(), col_buf.clear_word0));
+        }
+    }
+    return clear_value;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
 
+    VideoCore::Perf::draws.fetch_add(1, std::memory_order_relaxed);
     if (!FilterDraw()) {
         return;
     }
@@ -193,11 +225,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
+        VideoCore::Perf::draw_skip_pipeline.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
+        VideoCore::Perf::draw_skip_bind.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -231,6 +265,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        LogDrawTrace(is_indexed ? "drawi" : "draw", pipeline,
+                     &pipeline->GetStage(Shader::SwStage::Fragment));
+    }
     ResetBindings(false);
 }
 
@@ -241,6 +279,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     scheduler.PopPendingOperations();
 
+    VideoCore::Perf::draws.fetch_add(1, std::memory_order_relaxed);
     if (!FilterDraw()) {
         return;
     }
@@ -251,11 +290,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
+        VideoCore::Perf::draw_skip_pipeline.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
+        VideoCore::Perf::draw_skip_bind.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -312,10 +353,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        LogDrawTrace("drawind", pipeline, &pipeline->GetStage(Shader::SwStage::Fragment));
+    }
     ResetBindings(false);
 }
 
 void Rasterizer::DispatchDirect() {
+    VideoCore::Perf::dispatches.fetch_add(1, std::memory_order_relaxed);
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -323,14 +368,18 @@ void Rasterizer::DispatchDirect() {
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
+        VideoCore::Perf::draw_skip_pipeline.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        Diag::C::cs_hle.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
+    // A false result for a compute pipeline means an emulator fast path replaced the dispatch
+    // (counted per kind in BindResources), so it is not a bind failure.
     if (!BindResources(pipeline)) {
         return;
     }
@@ -347,10 +396,14 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
 
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        LogDrawTrace("disp", pipeline, &pipeline->GetStage(Shader::SwStage::Compute));
+    }
     ResetBindings(true);
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    VideoCore::Perf::dispatches.fetch_add(1, std::memory_order_relaxed);
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -358,6 +411,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
     if (!pipeline) {
+        VideoCore::Perf::draw_skip_pipeline.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
@@ -381,6 +435,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
 
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        LogDrawTrace("disp", pipeline, &pipeline->GetStage(Shader::SwStage::Compute));
+    }
     ResetBindings(true);
 }
 
@@ -407,9 +464,21 @@ void Rasterizer::OnFence() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
-        return false;
+    if (pipeline->IsCompute()) {
+        // nhlport: dispatches replaced by emulator fast paths are counted per kind for the
+        // diagnostic log; they are intentional, not failures.
+        if (IsComputeImageCopy(pipeline)) {
+            Diag::C::cs_image_copy.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (IsComputeMetaClear(pipeline)) {
+            Diag::C::cs_meta_clear.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (IsComputeImageClear(pipeline)) {
+            Diag::C::cs_image_clear.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
     }
 
     set_write_index = 0;
@@ -561,7 +630,289 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
 }
 
+// nhlport: one line per draw / dispatch while the frame trace's draw window is active: GPU frame
+// index, pipeline identity, colour/depth targets and every image bound to the shaders.
+// nhlport: write the GPU copy of the requested buffer ranges (captures/dumpbuffer) as raw files.
+void Rasterizer::DumpBuffers() {
+    std::vector<std::pair<u64, u32>> reqs;
+    {
+        std::scoped_lock lk{VideoCore::Perf::dump_mutex};
+        reqs.swap(VideoCore::Perf::dump_buffer_reqs);
+    }
+    VideoCore::Perf::dump_buffer_pending.store(0, std::memory_order_relaxed);
+    for (const auto& [addr, size] : reqs) {
+        if (addr == 0 || size == 0 || !memory->IsValidMapping(addr, size)) {
+            LOG_WARNING(Render, "buffer dump: {:#x}+{} is not mapped", addr, size);
+            continue;
+        }
+        const bool gpu_modified = buffer_cache.IsRegionGpuModified(addr, size);
+        const auto [buffer, offset] = buffer_cache.ObtainBuffer(addr, size, false);
+        auto& staging_pool = runtime.GetStagingPool();
+        const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostCached, 4);
+        const vk::BufferCopy copy = {
+            .srcOffset = offset,
+            .dstOffset = staging.offset,
+            .size = size,
+        };
+        const std::array copies{copy};
+        runtime.CopyBuffer(buffer, staging.buffer, copies);
+        scheduler.Finish();
+        staging.buffer->Invalidate(staging.offset, size);
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) /
+                          fmt::format("buf_{:#x}_{}_f{}.raw", addr, size,
+                                      VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed));
+        Common::FS::IOFile file{path, Common::FS::FileAccessMode::Create};
+        file.WriteSpan(std::span<const u8>{staging.mapped, size});
+        LOG_WARNING(Render, "buffer dump: {:#x}+{} gpu_modified {} -> {}", addr, size, gpu_modified,
+                    path.string());
+    }
+}
+
+// nhlport: write the bound images listed in captures/dumpimage as raw files (once each).
+void Rasterizer::DumpBoundImages() {
+    std::vector<u64> addrs;
+    std::vector<u32> draws;
+    {
+        std::scoped_lock lk{VideoCore::Perf::dump_mutex};
+        addrs = VideoCore::Perf::dump_image_addrs;
+        draws = VideoCore::Perf::dump_image_draws;
+    }
+    for (const auto image_id : bound_images) {
+        auto& image = texture_cache.GetImage(image_id);
+        const u64 address = image.info.guest_address;
+        const auto it = std::find(addrs.begin(), addrs.end(), address);
+        if (it == addrs.end()) {
+            continue;
+        }
+        const size_t index = size_t(it - addrs.begin());
+        const u32 wanted = index < draws.size() ? draws[index] : 0u;
+        if (wanted != 0) {
+            // count draws that render into the image; dump after the N-th one of a frame
+            if (!image.binding.is_target ||
+                VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed) <
+                    VideoCore::Perf::dump_start_frame.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            std::scoped_lock lk{VideoCore::Perf::dump_mutex};
+            if (index < VideoCore::Perf::dump_image_draws.size() &&
+                --VideoCore::Perf::dump_image_draws[index] != 0) {
+                continue;
+            }
+        }
+        texture_cache.DumpImage(image_id);
+        std::scoped_lock lk{VideoCore::Perf::dump_mutex};
+        const auto pos = std::find(VideoCore::Perf::dump_image_addrs.begin(),
+                                   VideoCore::Perf::dump_image_addrs.end(), address);
+        if (pos != VideoCore::Perf::dump_image_addrs.end()) {
+            const size_t i = size_t(pos - VideoCore::Perf::dump_image_addrs.begin());
+            VideoCore::Perf::dump_image_addrs.erase(pos);
+            if (i < VideoCore::Perf::dump_image_draws.size()) {
+                VideoCore::Perf::dump_image_draws.erase(VideoCore::Perf::dump_image_draws.begin() + i);
+            }
+        }
+        VideoCore::Perf::dump_pending.store(u32(VideoCore::Perf::dump_image_addrs.size()),
+                                            std::memory_order_relaxed);
+    }
+}
+
+void Rasterizer::LogDrawTrace(const char* kind, const void* pipeline, const Shader::Info* cs_info) {
+    std::string line = fmt::format("dl f{} {} p={:#x} clr={:#x}", VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                   kind, reinterpret_cast<uintptr_t>(pipeline), trace_clear_mask);
+    {
+        const auto& regs = liverpool->regs;
+        if (kind[0] == 'd' && kind[1] == 'i') { // disp
+            const auto& cs = liverpool->GetCsRegs();
+            line += fmt::format(" dim=[{} {} {}] tg=[{} {} {}] ud=[", cs.dim_x, cs.dim_y, cs.dim_z,
+                                +cs.num_thread_x.full, +cs.num_thread_y.full, +cs.num_thread_z.full);
+            for (u32 i = 0; i < 16; ++i) {
+                line += fmt::format("{}{:x}", i ? " " : "", cs.user_data[i]);
+            }
+            line += "]";
+            // constant / storage buffers of the compute shader with the first dwords of the small
+            // read-only ones (constant blocks: output sizes, scales, ...)
+            if (cs_info) {
+                line += fmt::format(" hash={:#x}", cs_info->pgm_hash);
+                for (const auto& desc : cs_info->buffers) {
+                    const auto sharp = desc.GetSharp(*cs_info);
+                    const VAddr addr = sharp.base_address;
+                    const u32 size = sharp.GetSize();
+                    line += fmt::format(" cb=[{:#x} {} {}", addr, size, desc.is_written ? "w" : "r");
+                    if (!desc.is_written && size <= 1024 && addr != 0 &&
+                        memory->IsValidMapping(addr, size)) {
+                        const u32 n = std::min<u32>(size / 4, 48);
+                        const u32* dw = std::bit_cast<const u32*>(addr);
+                        line += ":";
+                        for (u32 i = 0; i < n; ++i) {
+                            line += fmt::format(" {:x}", dw[i]);
+                        }
+                    }
+                    line += "]";
+                }
+            }
+        } else {
+            const auto& vp = regs.viewports[0];
+            const auto& vc = regs.viewport_control;
+            const float xs = vc.xscale_enable ? vp.xscale : 1.f;
+            const float ys = vc.yscale_enable ? vp.yscale : 1.f;
+            const float xo = vc.xoffset_enable ? vp.xoffset : 0.f;
+            const float yo = vc.yoffset_enable ? vp.yoffset : 0.f;
+            line += fmt::format(" vp=[{:.0f} {:.0f} {:.0f} {:.0f}] sc=[{} {} {} {}] n={} i={}", xo - xs, yo - ys,
+                                xs * 2.f, ys * 2.f, regs.screen_scissor.top_left_x,
+                                regs.screen_scissor.top_left_y, regs.screen_scissor.bottom_right_x,
+                                regs.screen_scissor.bottom_right_y, regs.num_indices,
+                                regs.num_instances.NumInstances());
+            const auto& vsc = regs.viewport_scissors[0];
+            const auto& gsc = regs.generic_scissor;
+            const auto& wsc = regs.window_scissor;
+            line += fmt::format(" vsc=[{} {} {} {}] gsc=[{} {} {} {}] wsc=[{} {} {} {}]", +vsc.top_left_x,
+                                +vsc.top_left_y, +vsc.bottom_right_x, +vsc.bottom_right_y, +gsc.top_left_x,
+                                +gsc.top_left_y, +gsc.bottom_right_x, +gsc.bottom_right_y, +wsc.top_left_x,
+                                +wsc.top_left_y, +wsc.bottom_right_x, +wsc.bottom_right_y);
+        }
+    }
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& [image_id, desc] = cb_descs[cb];
+        if (!image_id || !(trace_mrt_mask & (1u << cb))) {
+            continue;
+        }
+        const auto& i = texture_cache.GetImage(image_id).info;
+        const VAddr cmask = liverpool->regs.color_buffers[cb].CmaskAddress();
+        line += fmt::format(" rt{}=[id {} {:#x} {} {}x{} m{} l{} cm={:#x}:{}]", cb, image_id.index,
+                            desc.info.guest_address, vk::to_string(desc.info.pixel_format),
+                            desc.info.size.width, desc.info.size.height, i.resources.levels,
+                            i.resources.layers, cmask, texture_cache.IsMeta(cmask) ? "m" : "-");
+    }
+    if (db_desc.image_id) {
+        line += fmt::format(" db=[id {} {:#x} {} {}x{}]", db_desc.image_id.index, db_desc.desc.info.guest_address,
+                            vk::to_string(db_desc.desc.info.pixel_format), db_desc.desc.info.size.width,
+                            db_desc.desc.info.size.height);
+    }
+    if (kind[0] == 'd' && kind[1] == 'r') {
+        const auto* gp = static_cast<const GraphicsPipeline*>(pipeline);
+        line += fmt::format(" vs={:#x}", gp->GetStage(Shader::SwStage::Vertex).pgm_hash);
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+        VertexInputs<AmdGpu::Buffer> guest_buffers;
+        gp->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                            liverpool->regs.vgt_instance_step_rate_0,
+                            liverpool->regs.vgt_instance_step_rate_1);
+        for (const auto& a : attributes) {
+            line += fmt::format(" va=[l{} b{} {} +{}]", a.location, a.binding, vk::to_string(a.format),
+                                a.offset);
+        }
+        for (size_t i = 0; i < guest_buffers.size(); ++i) {
+            const auto& vb = guest_buffers[i];
+            const VAddr addr = vb.base_address;
+            const u32 size = vb.GetSize();
+            const u32 stride = i < bindings.size() ? bindings[i].stride : 0;
+            line += fmt::format(" vb=[{:#x} s{} {}", addr, stride, size);
+            if (addr != 0 && size != 0 && memory->IsValidMapping(addr, std::min<u32>(size, 256))) {
+                const u32 n = std::min<u32>(size / 4, 64);
+                const u32* dw = std::bit_cast<const u32*>(addr);
+                line += ":";
+                for (u32 k = 0; k < n; ++k) {
+                    line += fmt::format(" {:x}", dw[k]);
+                }
+            }
+            line += "]";
+        }
+        {
+            const auto& vs_info = gp->GetStage(Shader::SwStage::Vertex);
+            for (const auto& desc : vs_info.buffers) {
+                const auto sharp = desc.GetSharp(vs_info);
+                line += fmt::format(" vsb=[{:#x} st{} {} df{} nf{}{}", sharp.base_address,
+                                    sharp.GetStride(), sharp.GetSize(), u32(sharp.GetDataFmt()),
+                                    u32(sharp.GetNumberFmt()), desc.is_written ? " w" : "");
+                // first 128 bytes (the vertices of small UI quads start at index 0)
+                const VAddr vaddr = sharp.base_address;
+                const u32 vbytes = std::min<u32>(sharp.GetSize(), 128);
+                if (vaddr != 0 && vbytes >= 4 && memory->IsValidMapping(vaddr, vbytes)) {
+                    const u32* dw = std::bit_cast<const u32*>(vaddr);
+                    line += ":";
+                    for (u32 k = 0; k < vbytes / 4; ++k) {
+                        line += fmt::format(" {:x}", dw[k]);
+                    }
+                }
+                line += "]";
+            }
+            const auto& ir = liverpool->regs;
+            const VAddr ib = ir.index_base_address.Address<VAddr>();
+            const u32 ni = ir.num_indices;
+            line += fmt::format(" ib=[{:#x} n{} {}", ib, ni,
+                                ir.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? "u16" : "u32");
+            if (ib != 0 && ni != 0 && memory->IsValidMapping(ib, 64)) {
+                line += ":";
+                if (ir.index_buffer_type.index_type == AmdGpu::IndexType::Index16) {
+                    const u16* ix = std::bit_cast<const u16*>(ib);
+                    for (u32 k = 0; k < std::min<u32>(ni, 12); ++k) {
+                        line += fmt::format(" {}", ix[k]);
+                    }
+                } else {
+                    const u32* ix = std::bit_cast<const u32*>(ib);
+                    for (u32 k = 0; k < std::min<u32>(ni, 12); ++k) {
+                        line += fmt::format(" {}", ix[k]);
+                    }
+                }
+            }
+            line += "]";
+        }
+        const auto& r = liverpool->regs;
+        const auto& vp0 = r.viewports[0];
+        line += fmt::format(" vz=[{:.6g} {:.6g} {}{}] dc=[{}{} f{} cs{}]", vp0.zscale, vp0.zoffset,
+                            u32(r.viewport_control.zscale_enable),
+                            u32(r.viewport_control.zoffset_enable), u32(r.depth_control.depth_enable),
+                            u32(r.depth_control.depth_write_enable), u32(r.depth_control.depth_func),
+                            u32(r.clipper_control.clip_space));
+    }
+    if (kind[0] == 'd' && kind[1] == 'r' && cs_info) {
+        const auto& bc = liverpool->regs.blend_control[0];
+        line += fmt::format(" ps={:#x} bl=[{} s{} d{} f{} as{} ad{} af{} sep{}]", cs_info->pgm_hash,
+                            u32(bc.enable), u32(bc.color_src_factor), u32(bc.color_dst_factor),
+                            u32(bc.color_func), u32(bc.alpha_src_factor), u32(bc.alpha_dst_factor),
+                            u32(bc.alpha_func), u32(bc.separate_alpha_blend));
+        for (const auto& desc : cs_info->buffers) {
+            const auto sharp = desc.GetSharp(*cs_info);
+            const VAddr addr = sharp.base_address;
+            const u32 size = sharp.GetSize();
+            if (desc.is_written || size == 0 || size > 256 || addr == 0 ||
+                !memory->IsValidMapping(addr, size)) {
+                continue;
+            }
+            line += fmt::format(" cb=[{:#x} {} r:", addr, size);
+            const u32 n = std::min<u32>(size / 4, 32);
+            const u32* dw = std::bit_cast<const u32*>(addr);
+            for (u32 i = 0; i < n; ++i) {
+                line += fmt::format(" {:x}", dw[i]);
+            }
+            line += "]";
+        }
+    }
+    if (cs_info) {
+        for (const auto& desc : cs_info->images) {
+            const auto sharp = desc.GetSharp(*cs_info);
+            line += fmt::format(" t=[{:#x} {}x{} p{} f{}{}]", sharp.Address(), +sharp.width + 1,
+                                +sharp.height + 1, +sharp.pitch + 1, u32(sharp.GetDataFmt()),
+                                desc.is_written ? " w" : "");
+        }
+    }
+    for (const auto image_id : bound_images) {
+        const auto& i = texture_cache.GetImage(image_id).info;
+        line += fmt::format(" b=[id {} {:#x} {} {}x{} m{} l{} d{}]", image_id.index, i.guest_address,
+                            vk::to_string(i.pixel_format), i.size.width, i.size.height, i.resources.levels,
+                            i.resources.layers, u32(i.props.is_depth));
+    }
+    VideoCore::Perf::draw_index.fetch_add(1, std::memory_order_relaxed);
+    VideoCore::Perf::DrawLog(std::move(line));
+}
+
 void Rasterizer::ResetBindings(bool is_compute) {
+    if (VideoCore::Perf::dump_pending.load(std::memory_order_relaxed) != 0) {
+        DumpBoundImages();
+    }
+    if (VideoCore::Perf::dump_buffer_pending.load(std::memory_order_relaxed) != 0) {
+        DumpBuffers();
+    }
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -605,6 +956,22 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
             if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
+                if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+                    VideoCore::Perf::DrawLog(fmt::format("meta-cs-clear f{} @ {:#x} p={:#x}",
+                                                         VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                                         address, reinterpret_cast<uintptr_t>(pipeline)));
+                }
+                if (Diag::Enabled()) {
+                    const auto& cs_pgm = liverpool->GetCsRegs();
+                    Diag::NoteComputeShortcut(
+                        "meta-clear", info.pgm_hash, address,
+                        fmt::format("{} @ {:#x} marked cleared instead of running the shader; "
+                                    "dispatch [{}x{}x{}] threads [{}x{}x{}], {} buffers",
+                                    texture_cache.DescribeMeta(address), address, cs_pgm.dim_x,
+                                    cs_pgm.dim_y, cs_pgm.dim_z, cs_pgm.num_thread_x.full,
+                                    cs_pgm.num_thread_y.full, cs_pgm.num_thread_z.full,
+                                    info.buffers.size()));
+                }
                 return true;
             }
         }
@@ -665,6 +1032,16 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    if (Diag::Enabled()) {
+        Diag::NoteComputeShortcut(
+            "image-copy", info.pgm_hash, dst_image.info.guest_address,
+            fmt::format("{}x{} {} @ {:#x} -> {}x{} {} @ {:#x} ({} KB) done as a Vulkan image copy",
+                        src_image.info.size.width, src_image.info.size.height,
+                        vk::to_string(src_image.info.pixel_format), src_image.info.guest_address,
+                        dst_image.info.size.width, dst_image.info.size.height,
+                        vk::to_string(dst_image.info.pixel_format), dst_image.info.guest_address,
+                        src_image.info.guest_size >> 10));
+    }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }
@@ -727,6 +1104,16 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
+    if (Diag::Enabled()) {
+        Diag::NoteComputeShortcut(
+            "image-clear", info.pgm_hash, image1.info.guest_address,
+            fmt::format("{}x{} {} mips {} layers {} @ {:#x} cleared to ({:.3f}, {:.3f}, {:.3f}, "
+                        "{:.3f}) with vkCmdClearColorImage",
+                        image1.info.size.width, image1.info.size.height,
+                        vk::to_string(image1.info.pixel_format), image1.info.resources.levels,
+                        image1.info.resources.layers, image1.info.guest_address, values[0],
+                        values[1], values[2], values[3]));
+    }
     runtime.ClearImage(&image1, range, clear);
     return true;
 }
@@ -810,6 +1197,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
+                    VideoCore::Perf::inval_source = "shader-buffer";
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
@@ -997,6 +1385,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
+    trace_clear_mask = 0;
+    trace_mrt_mask = key.mrt_mask;
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -1047,13 +1437,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
-        const auto clear_value =
-            is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
+        const auto clear_value = is_clear ? ColorClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
+        trace_clear_mask |= u32(is_clear) << cb;
 
         image->usage.render_target = 1u;
     }
@@ -1104,6 +1494,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.clear_value = {};
         attachment.is_clear = 0;
 
+        trace_clear_mask |= (u32(is_depth_clear) << 8) | (u32(is_stencil_clear) << 9);
         if (regs.depth_buffer.DepthValid()) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
             attachment.has_depth = true;
@@ -1124,6 +1515,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    Diag::NoteRenderPass(state.width, state.height, static_cast<bool>(db_desc.image_id));
     return state;
 }
 
@@ -1174,7 +1566,12 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
-        texture_cache.ClearMeta(address);
+        const bool meta_hit = texture_cache.ClearMeta(address);
+        if (meta_hit && VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+            VideoCore::Perf::DrawLog(fmt::format("meta-fill f{} @ {:#x} size {:#x} value {:#x}",
+                                                 VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                                 address, num_bytes, value));
+        }
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
@@ -1190,6 +1587,26 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
+void Rasterizer::InlineData(VAddr address, const void* data, u32 num_bytes) {
+    // nhlport: WRITE_DATA (fences, counters) used to be a plain store through the protected
+    // guest view. NHL 24 keeps those labels in pages that also hold GPU-written buffers, so each
+    // store faulted and forced a full GPU drain to read the page back (1.7-3 per frame). Write
+    // through the backing view and keep the buffer cache coherent explicitly instead. Set
+    // NHLPORT_WRITEDATA_FAULT=1 to restore the old behaviour.
+    static const bool use_backing = [] {
+        const char* env = std::getenv("NHLPORT_WRITEDATA_FAULT");
+        return !(env && env[0] == '1');
+    }();
+    if (use_backing && buffer_cache.InlineData(address, data, num_bytes)) {
+        // The backing write never faults, so images covering the range would keep their old
+        // contents (NHL 24 fills its 256x256 R8 glyph pages with WRITE_DATA: garbled text).
+        // Mark them CPU-dirty exactly like the page-fault path does.
+        texture_cache.InvalidateMemory(address, num_bytes, true);
+        return;
+    }
+    std::memcpy(std::bit_cast<void*>(address), data, num_bytes);
+}
+
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
@@ -1199,6 +1616,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return;
         }
     }
+    VideoCore::Perf::inval_source = "copy-buffer";
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {

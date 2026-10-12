@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include <vector>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 
@@ -12,6 +13,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/texture_cache/blit_helper.h"
+#include "video_core/perf_counters.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/sampler.h"
@@ -105,7 +107,15 @@ public:
     }
 
     /// Invalidates any image in the logical page range.
-    void InvalidateMemory(VAddr addr, size_t size);
+    /// from_cp: the write comes from the command processor (WRITE_DATA executed by the GPU
+    /// thread between draws, e.g. glyph cache pages); such images are re-uploaded at their
+    /// next use like any CPU write, but are never promoted to the per-frame streamed upload.
+    void InvalidateMemory(VAddr addr, size_t size, bool from_cp = false);
+
+    /// nhlport: (host bytes held by images, live image count) for the diagnostic log.
+    std::pair<u64, u64> GetDiagUsage() const {
+        return {total_used_memory, VideoCore::Perf::tc_images.load(std::memory_order_relaxed)};
+    }
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
@@ -132,10 +142,24 @@ public:
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
+    /// nhlport: write mip 0 / layer 0 of a colour image to captures/img_<addr>_<w>x<h>_<fmt>_f<frame>.raw
+    void DumpImage(ImageId image_id);
+
     void UpdateImage(ImageId image_id) {
         Image& image = slot_images[image_id];
         TouchImage(image);
-        TrackImage(image_id);
+        if (image.streamed) {
+            // nhlport: CPU-streamed texture (e.g. a software-decoded 960x540 R8 plane written by
+            // several Job threads every frame): re-protecting it after every write fault cost
+            // ~40 page faults per frame. Upload it once per frame unconditionally instead.
+            const u64 frame = VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed);
+            if (image.streamed_refresh_frame != frame) {
+                image.streamed_refresh_frame = frame;
+                image.flags |= ImageFlagBits::CpuDirty;
+            }
+        } else {
+            TrackImage(image_id);
+        }
         RefreshImage(image);
     }
 
@@ -202,6 +226,36 @@ public:
             return it->second.type;
         }
         return std::nullopt;
+    }
+
+    /// nhlport: human-readable description of a metadata surface for the diagnostic log.
+    std::string DescribeMeta(VAddr address) const {
+        const auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return "unknown metadata";
+        }
+        const auto& m = it->second;
+        return fmt::format("{} of {} (refs {}, clear mask {:#x}, read by shaders {})",
+                           m.type == MetaType::CMask   ? "CMASK"
+                           : m.type == MetaType::HTile ? "HTILE"
+                                                       : "FMASK",
+                           m.owner.empty() ? "unknown image" : m.owner, m.refs,
+                           static_cast<u32>(m.clear_mask), m.shader_read);
+    }
+
+    /// nhlport: a shader read this metadata surface as a buffer (NHL 24 derives its UI coverage
+    /// mask from the CMASK of the UI target; the emulator hands out "fully expanded" instead of
+    /// the per-tile "written since the fast clear" state). Kept for the diagnostic log and
+    /// Rasterizer::ColorClearValue; the address is remembered outside the entry so it survives
+    /// the entry being erased with its last owner and recreated later.
+    void MarkMetaShaderRead(VAddr address) {
+        meta_shader_read.insert(address);
+        if (auto it = surface_metas.find(address); it != surface_metas.end()) {
+            it->second.shader_read = true;
+        }
+    }
+    bool IsMetaShaderRead(VAddr address) const {
+        return address != 0 && meta_shader_read.contains(address);
     }
 
     /// Returns true if a slice of the specified metadata surface has been cleared.
@@ -379,8 +433,42 @@ private:
     struct MetaDataInfo {
         MetaType type;
         s32 clear_mask = -1;
+        u32 refs = 0; ///< nhlport: images linked to this metadata surface
+        bool shader_read = false; ///< nhlport: a shader reads this surface (coverage masks)
+        std::string owner;        ///< nhlport: last image linked (diagnostics)
     };
+
+    /// nhlport: link an image to a metadata surface. The entry is created on first use (all
+    /// slices cleared, like upstream) and shared by every image that names the same address;
+    /// its clear state survives the deletion of any one of them. Every image counts once per
+    /// metadata type (image.meta_links), so refs == number of live images linked to the entry
+    /// and the entry goes away with the last of them (NHLPORT_META_ERASE=1: with the first).
+    void LinkMeta(Image& image, MetaType type, VAddr address, s32 initial_clear_mask = -1);
+    void UnlinkMeta(Image& image, MetaType type);
+    void UnlinkMeta(VAddr address);
+    static VAddr& MetaLink(Image& image, MetaType type);
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
+    absl::flat_hash_set<VAddr> meta_shader_read; ///< nhlport: see MarkMetaShaderRead
+
+    /// nhlport: NHL 24 builds its mip chains level by level (each downsample pass binds the
+    /// texture with one more mip), which upstream handles by re-creating the image for every
+    /// level. Remember the deepest chain seen per (address, mip-0 size, format) and create the
+    /// image with that depth straight away.
+    struct MipMemoKey {
+        VAddr address;
+        u32 width;
+        u32 height;
+        vk::Format format;
+        bool operator==(const MipMemoKey&) const = default;
+        template <typename H>
+        friend H AbslHashValue(H h, const MipMemoKey& k) {
+            return H::combine(std::move(h), k.address, k.width, k.height, static_cast<u32>(k.format));
+        }
+    };
+    absl::flat_hash_map<MipMemoKey, u32> mip_memo;
+
+    void RememberMips(const ImageInfo& info);
+    void ApplyRememberedMips(ImageInfo& info) const;
 };
 
 } // namespace VideoCore

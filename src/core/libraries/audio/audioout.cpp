@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -9,6 +10,7 @@
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
 
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -572,7 +574,13 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     s32 samples_sent = 0;
     {
         std::unique_lock lock{port->mutex};
+        const auto wait_start = std::chrono::steady_clock::now();
         port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
+        Diag::C::audio_wait_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - wait_start)
+                                 .count()),
+            std::memory_order_relaxed);
 
         if (port->closing) {
             LOG_DEBUG(Lib_AudioOut, "Port {} closed while waiting for drain", port_id);
@@ -583,6 +591,9 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             std::memcpy(port->output_buffer, ptr, port->BufferSize());
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
+            Diag::C::audio_outputs.fetch_add(1, std::memory_order_relaxed);
+            Diag::C::audio_samples.fetch_add(static_cast<u64>(samples_sent),
+                                             std::memory_order_relaxed);
         }
     }
 

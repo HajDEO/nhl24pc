@@ -75,6 +75,17 @@ public:
         return present_queue;
     }
 
+    /// nhlport: second queue of the graphics family used for GPU->CPU readback copies, so a
+    /// readback waits only for the submission that produced the data instead of draining the
+    /// whole graphics queue. Falls back to the graphics queue when the family has one queue.
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+
+    bool HasTransferQueue() const {
+        return has_transfer_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -458,6 +469,9 @@ public:
         return total_memory_budget;
     }
 
+    /// nhlport: current device memory use and budget of the heaps the allocator may use.
+    [[nodiscard]] std::pair<u64, u64> QueryMemoryUsage() const;
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
@@ -503,6 +517,8 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue transfer_queue;
+    bool has_transfer_queue{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

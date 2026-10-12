@@ -10,6 +10,7 @@
 #include "shader_recompiler/runtime_info.h"
 
 #include <boost/container/static_vector.hpp>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <spirv/unified1/spirv.hpp11>
 
@@ -606,6 +607,23 @@ void EmitContext::DefineVertexBlock() {
         const Id initializer{ConstantComposite(type, zero)};
         cull_distances = DefineVariable(type, spv::BuiltIn::CullDistance, spv::StorageClass::Output,
                                         initializer);
+    }
+    // nhlport: GCN discards primitives whose position exports contain NaN (vertex kill); the
+    // Vulkan clipper leaves that undefined and NHL 24 hides UI elements exactly that way (NaN
+    // positions, negative w), which showed up as a black strip. Emulate it with a cull distance
+    // written by the vertex epilogue: -1 for killed vertices, +1 otherwise. NHLPORT_VTX_KILL=0 off.
+    static const bool vtx_kill_enabled = [] {
+        const char* env = std::getenv("NHLPORT_VTX_KILL");
+        return !(env && env[0] == '0');
+    }();
+    if (vtx_kill_enabled && hw_stage == HwStage::Vertex &&
+        !info.stores.GetAny(IR::Attribute::CullDistance) &&
+        !info.stores.GetAny(IR::Attribute::ClipDistance)) {
+        AddCapability(spv::Capability::CullDistance);
+        const Id type{TypeArray(F32[1], ConstU32(1U))};
+        const Id initializer{ConstantComposite(type, f32_zero_value)};
+        vtx_kill_cull = DefineVariable(type, spv::BuiltIn::CullDistance, spv::StorageClass::Output,
+                                       initializer);
     }
     if (info.stores.GetAny(IR::Attribute::PointSize)) {
         output_point_size =

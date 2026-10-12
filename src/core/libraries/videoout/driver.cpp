@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <iterator>
+#include "common/diag_log.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/path_util.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "video_core/perf_counters.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
@@ -155,6 +163,14 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
              attribute->aspect_ratio, static_cast<u32>(attribute->tiling_mode), attribute->width,
              attribute->height, attribute->pitch_in_pixel, attribute->option);
 
+    Diag::Eventf("videoout",
+                 "sceVideoOutRegisterBuffers: {} buffers from index {}, {}x{} {} tiling {} pitch {} "
+                 "option {:#x}",
+                 bufferNum, startIndex, attribute->width, attribute->height,
+                 GetPixelFormatString(attribute->pixel_format),
+                 static_cast<u32>(attribute->tiling_mode), attribute->pitch_in_pixel,
+                 attribute->option);
+
     auto& group = port->groups[group_index];
     std::memcpy(&group.attrib, attribute, sizeof(BufferAttribute));
     group.is_occupied = true;
@@ -244,9 +260,14 @@ void VideoOutDriver::Flip(const Request& req) {
         static u32 frames = 0, slow33 = 0, slow100 = 0;
         static double max_ms = 0.0;
         static u64 pipelines_at_start = 0, shaders_at_start = 0;
+        static u64 waits_at_start = 0, rb_calls_at_start = 0, rb_bytes_at_start = 0;
+        static u64 tcx_at_start = 0, tco_at_start = 0, tcd_at_start = 0;
+        static u64 stall_at_start = 0, rbk_at_start = 0, rbo_at_start = 0;
         const auto now = Clock::now();
+        double frame_ms = -1.0;
         if (last_flip != Clock::time_point{}) {
             const double ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
+            frame_ms = ms;
             ++frames;
             max_ms = std::max(max_ms, ms);
             slow33 += ms > 33.0;
@@ -255,17 +276,262 @@ void VideoOutDriver::Flip(const Request& req) {
             window_start = now;
             pipelines_at_start = Vulkan::NumPipelinesCompiled();
             shaders_at_start = Vulkan::NumShadersCompiled();
+            waits_at_start = VideoCore::Perf::gpu_waits.load();
+            rb_calls_at_start = VideoCore::Perf::readback_calls.load();
+            rb_bytes_at_start = VideoCore::Perf::readback_bytes.load();
+            tcx_at_start = VideoCore::Perf::tc_expand.load();
+            tco_at_start = VideoCore::Perf::tc_overlap.load();
+            tcd_at_start = VideoCore::Perf::tc_depth_recreate.load();
+            stall_at_start = VideoCore::Perf::gpu_stall_ns.load();
+            rbk_at_start = VideoCore::Perf::readback_tick_known.load();
+            rbo_at_start = VideoCore::Perf::readback_tick_old.load();
         }
         last_flip = now;
+
+        // nhlport: diagnostic log, one row per presented frame (+ a game screenshot after a marker).
+        {
+            u32 vo_w = 0, vo_h = 0;
+            if (req.index >= 0) {
+                const auto& slot = req.port->buffer_slots[req.index];
+                if (slot.group_index >= 0) {
+                    const auto& attrib = req.port->groups[slot.group_index].attrib;
+                    vo_w = attrib.width;
+                    vo_h = attrib.height;
+                }
+            }
+            Diag::OnFramePresented(frame_ms, vo_w, vo_h,
+                                   static_cast<u32>(req.port->flip_status.flip_pending_num),
+                                   req.port->flip_status.count);
+            if (Diag::ConsumeMarkerScreenshot() && !VideoCore::HasPendingGameOnlyScreenshot()) {
+                VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+            }
+        }
+
+        // nhlport: exact game frames. Creating <user>/captures/screenshot (content = N, consumed)
+        // saves the next N presented frames as game-only PNGs into <user>/screenshots.
+        // nhlport: captures/dumpbuffer = "hexaddr size" lines; the GPU copy of each range is dumped
+        {
+            static u32 dumpbuf_poll = 0;
+            if (++dumpbuf_poll % 30 == 0) {
+                static const std::filesystem::path trigger =
+                    Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "dumpbuffer";
+                std::error_code ec;
+                if (std::filesystem::exists(trigger, ec)) {
+                    std::vector<std::pair<u64, u32>> reqs;
+                    if (std::ifstream in{trigger}; in) {
+                        std::string a;
+                        u32 n = 0;
+                        while (in >> a >> n) {
+                            try {
+                                reqs.emplace_back(std::stoull(a, nullptr, 16), n);
+                            } catch (...) {
+                            }
+                        }
+                    }
+                    std::filesystem::remove(trigger, ec);
+                    {
+                        std::scoped_lock lk{VideoCore::Perf::dump_mutex};
+                        VideoCore::Perf::dump_buffer_reqs = reqs;
+                    }
+                    VideoCore::Perf::dump_buffer_pending.store(u32(reqs.size()), std::memory_order_relaxed);
+                    LOG_WARNING(Lib_VideoOut, "buffer dump trigger: {} ranges", reqs.size());
+                }
+            }
+        }
+        // nhlport: captures/dumpimage = hex guest addresses (one per line) of images to dump
+        {
+            static u32 dump_poll = 0;
+            if (++dump_poll % 30 == 0) {
+                static const std::filesystem::path trigger =
+                    Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "dumpimage";
+                std::error_code ec;
+                if (std::filesystem::exists(trigger, ec)) {
+                    std::vector<u64> addrs;
+                    std::vector<u32> draws;
+                    if (std::ifstream in{trigger}; in) {
+                        std::string line;
+                        while (std::getline(in, line)) {
+                            try {
+                                if (!line.empty()) {
+                                    const auto colon = line.find(':');
+                                    addrs.push_back(std::stoull(line.substr(0, colon), nullptr, 16));
+                                    draws.push_back(colon == std::string::npos
+                                                        ? 0u
+                                                        : u32(std::stoul(line.substr(colon + 1))));
+                                }
+                            } catch (...) {
+                            }
+                        }
+                    }
+                    std::filesystem::remove(trigger, ec);
+                    {
+                        std::scoped_lock lk{VideoCore::Perf::dump_mutex};
+                        VideoCore::Perf::dump_image_addrs = addrs;
+                        VideoCore::Perf::dump_image_draws = draws;
+                    }
+                    // Counted requests start with the next complete gpu frame.
+                    VideoCore::Perf::dump_start_frame.store(
+                        VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed) + 1,
+                        std::memory_order_relaxed);
+                    VideoCore::Perf::dump_pending.store(u32(addrs.size()), std::memory_order_relaxed);
+                    LOG_WARNING(Lib_VideoOut, "image dump trigger: {} addresses", addrs.size());
+                }
+            }
+        }
+        {
+            static u32 shots_left = 0, shot_poll = 0;
+            if (shots_left == 0 && ++shot_poll % 30 == 0) {
+                static const std::filesystem::path trigger =
+                    Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "screenshot";
+                std::error_code ec;
+                if (std::filesystem::exists(trigger, ec)) {
+                    u32 count = 1;
+                    if (std::ifstream in{trigger}; in) {
+                        u32 value = 0;
+                        if (in >> value) {
+                            count = std::clamp<u32>(value, 1, 600);
+                        }
+                    }
+                    std::filesystem::remove(trigger, ec);
+                    shots_left = count;
+                    LOG_WARNING(Lib_VideoOut, "screenshot trigger: saving the next {} game frames", count);
+                }
+            }
+            if (shots_left > 0 && !VideoCore::HasPendingGameOnlyScreenshot()) {
+                VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+                --shots_left;
+            }
+        }
+
+        // nhlport: per-frame trace. Creating <user>/captures/frametrace (consumed) logs one line
+        // per presented frame for the next 600 frames: counter deltas since the previous frame.
+        {
+            static u32 trace_left = 0, trace_poll = 0, trace_no = 0, draw_trace_left = 0;
+            if (trace_left == 0 && ++trace_poll % 30 == 0) {
+                static const std::filesystem::path trigger =
+                    Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "frametrace";
+                std::error_code ec;
+                if (std::filesystem::exists(trigger, ec)) {
+                    u32 draw_frames = 90;
+                    if (std::ifstream in{trigger}; in) {
+                        u32 value = 0;
+                        if (in >> value) {
+                            draw_frames = std::clamp<u32>(value, 1, 600);
+                        }
+                    }
+                    std::filesystem::remove(trigger, ec);
+                    trace_left = 600;
+                    draw_trace_left = draw_frames;
+                    VideoCore::Perf::draw_trace.store(1, std::memory_order_relaxed);
+                    LOG_WARNING(Lib_VideoOut, "frame trace: logging the next 600 frames (draw log for {})", draw_frames);
+                }
+            }
+            if (trace_left > 0) {
+                --trace_left;
+                if (draw_trace_left > 0 && --draw_trace_left == 0) {
+                    VideoCore::Perf::draw_trace.store(0, std::memory_order_relaxed);
+                    // Write the buffered draw log on a helper thread so the present loop
+                    // does not stall on 50+ MB of file I/O.
+                    std::vector<std::string> lines;
+                    {
+                        std::scoped_lock lk{VideoCore::Perf::draw_log_mutex};
+                        lines.swap(VideoCore::Perf::draw_log);
+                    }
+                    const auto path = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) /
+                                      fmt::format("drawlog_{}.txt", trace_no);
+                    std::thread([lines = std::move(lines), path] {
+                        std::ofstream out{path, std::ios::binary};
+                        for (const auto& l : lines) {
+                            out << l << '\n';
+                        }
+                    }).detach();
+                    LOG_WARNING(Lib_VideoOut, "frame trace: draw log written to {} ({} lines)",
+                                path.string(), lines.size());
+                }
+                namespace P = VideoCore::Perf;
+                const std::atomic<u64>* const counters[] = {
+                    &P::draws,
+                    &P::dispatches,
+                    &P::draw_skip_pipeline,
+                    &P::draw_skip_bind,
+                    &P::tc_created,
+                    &P::tc_free[P::FreePoolAlias],
+                    &P::tc_free[P::FreeDepthRecreate],
+                    &P::tc_free[P::FreeExpand],
+                    &P::tc_free[P::FreeLeftTarget],
+                    &P::tc_free[P::FreeLeftCopy],
+                    &P::tc_free[P::FreeRightChance],
+                    &P::tc_free[P::FreeResolveFailed],
+                    &P::tc_free[P::FreeGc],
+                    &P::tc_free[P::FreeUnmap],
+                    &P::tc_free[P::FreeTileMode],
+                    &P::tc_expand,
+                    &P::tc_overlap,
+                    &P::tc_incompatible,
+                    &P::tc_right_view,
+                    &P::tc_left_copy,
+                    &P::gpu_waits,
+                    &P::readback_calls,
+                    &P::sched_submits,
+                    &P::tc_alias_pick,
+                    &P::tc_target_copy,
+                };
+                constexpr size_t num = std::size(counters);
+                static u64 prev[num]{};
+                u64 d[num];
+                for (size_t i = 0; i < num; ++i) {
+                    const u64 cur = counters[i]->load(std::memory_order_relaxed);
+                    d[i] = cur - prev[i];
+                    prev[i] = cur;
+                }
+                const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+                LOG_INFO(Lib_VideoOut,
+                         "frame trace #{} t={} dt={:.1f} draws {} disp {} skip-nopipe {} skip-bind {} "
+                         "img +{} -[pool {} depth {} expand {} ltarget {} lcopy {} rchance {} fail {} gc {} "
+                         "unmap {} tile {}] expand {} overlap {} incompat {} rview {} lcopy {} waits {} rb {} "
+                         "submits {} alias {} tcopy {} live {} gpuframe {} invalskip {} streamed {}",
+                         trace_no++, wall, frame_ms, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
+                         d[9], d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20],
+                         d[21], d[22], d[23], d[24], P::tc_images.load(), P::gpu_frame.load(),
+                         P::gpu_inval_skipped.load(), P::streamed_images.load());
+            }
+        }
         const double window_s = std::chrono::duration<double>(now - window_start).count();
         if (window_s >= 5.0 && frames > 0) {
             const u64 pipelines = Vulkan::NumPipelinesCompiled();
             const u64 shaders = Vulkan::NumShadersCompiled();
+            const u64 waits = VideoCore::Perf::gpu_waits.load();
+            const u64 rb_calls = VideoCore::Perf::readback_calls.load();
+            const u64 rb_bytes = VideoCore::Perf::readback_bytes.load();
             LOG_INFO(Lib_VideoOut,
                      "frame stats: {:.1f} fps avg {:.1f} ms max {:.1f} ms, >33ms {} >100ms {} of {} frames, "
-                     "compiled {} pipelines / {} shaders in this window",
+                     "compiled {} pipelines / {} shaders, gpu waits {} ({:.1f}/frame), readbacks {} "
+                     "({} KB, stalls {:.1f} ms, tick known {} old {}), texcache expand {} overlap {} depth-recreate {} (copy skipped {}) right-view {} left-copy {} incompatible {} skipped draws: no-pipeline {} bind-fail {}, live images {} in this window",
                      frames / window_s, 1000.0 * window_s / frames, max_ms, slow33, slow100, frames,
-                     pipelines - pipelines_at_start, shaders - shaders_at_start);
+                     pipelines - pipelines_at_start, shaders - shaders_at_start, waits - waits_at_start,
+                     double(waits - waits_at_start) / frames, rb_calls - rb_calls_at_start,
+                     (rb_bytes - rb_bytes_at_start) / 1024,
+                     double(VideoCore::Perf::gpu_stall_ns.load() - stall_at_start) / 1e6,
+                     VideoCore::Perf::readback_tick_known.load() - rbk_at_start,
+                     VideoCore::Perf::readback_tick_old.load() - rbo_at_start,
+                     VideoCore::Perf::tc_expand.load() - tcx_at_start,
+                     VideoCore::Perf::tc_overlap.load() - tco_at_start,
+                     VideoCore::Perf::tc_depth_recreate.load() - tcd_at_start,
+                     VideoCore::Perf::tc_depth_skip.load(), VideoCore::Perf::tc_right_view.load(),
+                     VideoCore::Perf::tc_left_copy.load(), VideoCore::Perf::tc_incompatible.load(),
+                     VideoCore::Perf::draw_skip_pipeline.load(), VideoCore::Perf::draw_skip_bind.load(),
+                     VideoCore::Perf::tc_images.load());
+            tcx_at_start = VideoCore::Perf::tc_expand.load();
+            tco_at_start = VideoCore::Perf::tc_overlap.load();
+            tcd_at_start = VideoCore::Perf::tc_depth_recreate.load();
+            stall_at_start = VideoCore::Perf::gpu_stall_ns.load();
+            rbk_at_start = VideoCore::Perf::readback_tick_known.load();
+            rbo_at_start = VideoCore::Perf::readback_tick_old.load();
+            waits_at_start = waits;
+            rb_calls_at_start = rb_calls;
+            rb_bytes_at_start = rb_bytes;
             window_start = now;
             frames = slow33 = slow100 = 0;
             max_ms = 0.0;
@@ -338,6 +604,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
             LOG_ERROR(Lib_VideoOut, "Flip queue is full");
+            Diag::C::flip_queue_full.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
@@ -422,7 +689,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
-                        DrawBlankFrame();
+                        // nhlport: nothing to show before the game opens its port; the blank
+                        // frame path raced with start-up and crashed inside the driver.
                     } else if (ImGui::Core::MustKeepDrawing()) {
                         DrawLastFrame();
                     }
