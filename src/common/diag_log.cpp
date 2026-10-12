@@ -1030,8 +1030,10 @@ void Init() {
         }
         return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
     };
-    if (!env_on("NHLPORT_DIAG", true)) {
-        LOG_INFO(Config, "nhlport diag log disabled (NHLPORT_DIAG=0)");
+    // Release builds run without the diagnostic log and the capture triggers; NHLPORT_DIAG=1
+    // turns them on (nhl24_diag.log, frames CSV, captures/* triggers, F1 marker).
+    if (!env_on("NHLPORT_DIAG", false)) {
+        LOG_INFO(Config, "nhlport diagnostics off (set NHLPORT_DIAG=1 to enable)");
         return;
     }
     s.frames_csv = env_on("NHLPORT_DIAG_FRAMES", true);
@@ -1196,6 +1198,58 @@ void Marker(std::string note) {
     WriteStamped(s, "marker",
                  fmt::format("#{} at frame {} (gpu frame {}): {}", s.marker_count, frame,
                              VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed), note));
+}
+
+static const std::vector<u64>& CaptureDispatchHashes() {
+    static const std::vector<u64> hashes = [] {
+        std::vector<u64> v;
+        if (const char* e = std::getenv("NHLPORT_DIAG_F1_CS"); e && *e) {
+            std::string list{e};
+            size_t pos = 0;
+            while (pos <= list.size()) {
+                const size_t comma = list.find(',', pos);
+                const std::string item = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!item.empty()) {
+                    v.push_back(std::strtoull(item.c_str(), nullptr, 16));
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+        } else {
+            v = {0x2c569595ull, 0x5bb1bf02ull};
+        }
+        return v;
+    }();
+    return hashes;
+}
+
+bool CaptureMatchesDispatch(u64 pgm_hash) {
+    if (VideoCore::Perf::dump_cs_pending.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    const auto& hashes = CaptureDispatchHashes();
+    return std::find(hashes.begin(), hashes.end(), pgm_hash) != hashes.end();
+}
+
+void ArmCapture(std::string note) {
+    State& s = S();
+    if (!s.enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    Marker(std::move(note));
+    VideoCore::Perf::trace_request.store(3, std::memory_order_relaxed);
+    if (!CaptureDispatchHashes().empty()) {
+        VideoCore::Perf::dump_cs_pending.store(1, std::memory_order_relaxed);
+    }
+    std::string list;
+    for (const u64 h : CaptureDispatchHashes()) {
+        list += fmt::format("{}{:#x}", list.empty() ? "" : ",", h);
+    }
+    WriteStamped(s, "capture",
+                 fmt::format("draw log 3 frames + images of cs [{}] (gpu frame {})", list,
+                             VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed)));
 }
 
 bool ConsumeMarkerScreenshot() {

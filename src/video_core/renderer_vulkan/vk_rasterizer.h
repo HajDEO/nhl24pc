@@ -132,10 +132,13 @@ private:
 
     void LogDrawTrace(const char* kind, const void* pipeline, const Shader::Info* cs_info = nullptr);
     void DumpBoundImages();
+    void DumpAllBoundImages();
+    void TraceGdsAfter(u64 pgm_hash);
     void DumpBuffers();
     u32 trace_clear_mask{}; ///< bit cb = colour attachment cleared, bit 8 depth, bit 9 stencil (trace)
     u32 trace_mrt_mask{};   ///< colour slots written by the current graphics pipeline (trace)
     void ResetBindings(bool is_compute);
+    u64 last_dispatch_hash{}; ///< nhlport: shader hash of the dispatch being bound
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);

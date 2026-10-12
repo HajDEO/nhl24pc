@@ -1,0 +1,361 @@
+From 0f878dcb1b382078a852bf7eb35199034841bcdd Mon Sep 17 00:00:00 2001
+From: nhlport <nhlport@local>
+Date: Wed, 7 Oct 2026 19:32:46 +0200
+Subject: [PATCH 7/8] NHL 24: raise GfxEop on plain flips, flip back-pressure,
+ stall diagnostics
+
+- gnmdriver/liverpool: plain prepareFlip / prepareFlipLabel requests are patched
+  into a new PatchedFlipEop NOP that raises GfxFlip and then GfxEop. Frostbite
+  writes all of its GPU fences without interrupts and relies on the per-flip
+  end-of-pipe interrupt that real hardware delivers to equeues registered with
+  sceGnmAddEqEvent(kEqEventGfxEop); without it NHL 24's GfxEopEventLoop never
+  woke up. sceGnmAddEqEvent now logs at Info.
+- gnmdriver: ThrottleFlipSubmit holds sceGnmSubmitAndFlipCommandBuffers until
+  the presenter is within 2 flips of the CPU (200 ms safety timeout), emulating
+  real flip latency so the game's RenderLoop pacing (max 3 outstanding) holds.
+- liverpool: SpinDiag warnings when a queue fiber spins > 2 s in WaitRegMem,
+  Rewind or MemSemaphore (address, function, ref, mask, current value).
+- equeue: infinite WaitForEvents reports every 5 s which queue/thread is stuck.
+- videoout: LOG_DEBUG for submitted/presented flips.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/core/libraries/gnmdriver/gnmdriver.cpp | 46 +++++++++-
+ src/core/libraries/kernel/equeue.cpp       | 16 +++-
+ src/core/libraries/videoout/driver.cpp     |  5 ++
+ src/video_core/amdgpu/liverpool.cpp        | 99 ++++++++++++++++++++++
+ src/video_core/amdgpu/pm4_cmds.h           |  1 +
+ 5 files changed, 161 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/libraries/gnmdriver/gnmdriver.cpp b/src/core/libraries/gnmdriver/gnmdriver.cpp
+index a6744f2e..269f89b9 100644
+--- a/src/core/libraries/gnmdriver/gnmdriver.cpp
++++ b/src/core/libraries/gnmdriver/gnmdriver.cpp
+@@ -24,6 +24,10 @@
+ #include "video_core/amdgpu/pm4_cmds.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
+ 
++#include <atomic>
++#include <chrono>
++#include <thread>
++
+ extern Frontend::WindowSDL* g_window;
+ std::unique_ptr<Vulkan::Presenter> presenter;
+ std::unique_ptr<AmdGpu::Liverpool> liverpool;
+@@ -125,12 +129,12 @@ static inline bool IsValidEventType(Platform::InterruptId id) {
+ }
+ 
+ s32 PS4_SYSV_ABI sceGnmAddEqEvent(OrbisKernelEqueue eq, u64 id, void* udata) {
+-    LOG_TRACE(Lib_GnmDriver, "called");
+-
+     auto equeue = GetEqueue(eq);
+     if (!equeue) {
+         return ORBIS_KERNEL_ERROR_EBADF;
+     }
++    LOG_INFO(Lib_GnmDriver, "sceGnmAddEqEvent: equeue = {} id = {:#x} udata = {}", equeue->GetName(), id,
++             udata);
+ 
+     EqueueEvent kernel_event{};
+     kernel_event.event.ident = id;
+@@ -2087,6 +2091,38 @@ int PS4_SYSV_ABI sceGnmSqttWaitForEvent() {
+     return ORBIS_GNM_ERROR_FAILURE;
+ }
+ 
++// nhlport: emulate the flip latency of real hardware. The emulated GPU thread and the presenter
++// can run several frames behind the CPU; NHL 24 counts the flips it submitted and its RenderLoop
++// thread only resumes while at most 3 of them are still outstanding. With 4 or more it waits
++// forever: the 3D scene is never rendered (black ice, HUD only) and the game stops reacting to
++// input. Hold the submitting thread until the presenter is within kMaxFlipsInFlight flips of it.
++static std::atomic<u64> cpu_flip_submits{0};
++
++static void ThrottleFlipSubmit(u32 vo_handle) {
++    constexpr u64 kMaxFlipsInFlight = 2;
++    constexpr auto kMaxWait = std::chrono::milliseconds(200);
++    const auto t0 = std::chrono::steady_clock::now();
++    VideoOut::FlipStatus status{};
++    u32 polls = 0;
++    while (VideoOut::sceVideoOutGetFlipStatus(static_cast<s32>(vo_handle), &status) == ORBIS_OK &&
++           cpu_flip_submits.load() > status.count + kMaxFlipsInFlight) {
++        if (std::chrono::steady_clock::now() - t0 > kMaxWait) {
++            LOG_WARNING(Lib_GnmDriver, "flip throttle timed out: cpu_submits={} presented={}",
++                        cpu_flip_submits.load(), status.count);
++            break;
++        }
++        std::this_thread::sleep_for(std::chrono::microseconds(250));
++        ++polls;
++    }
++    static u32 reports = 0;
++    if (polls != 0 && reports < 5) {
++        ++reports;
++        LOG_INFO(Lib_GnmDriver, "flip throttle: waited {} polls (cpu_submits={} presented={})",
++                 polls, cpu_flip_submits.load(), status.count);
++    }
++    ++cpu_flip_submits;
++}
++
+ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf_idx, u32 flip_mode,
+                                    s64 flip_arg, void* unk) {
+     // check for `prepareFlip` packet
+@@ -2128,11 +2164,11 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
+ 
+     if (backup[1] == PM4CmdNop::PayloadType::PrepareFlip) {
+         nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x39};
+-        nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
++        nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlipEop;
+     } else {
+         if (backup[1] == PM4CmdNop::PayloadType::PrepareFlipLabel) {
+             nop->header = PM4Type3Header{PM4ItOpcode::Nop, 0x34};
+-            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlip;
++            nop->data_block[0] = PM4CmdNop::PayloadType::PatchedFlipEop;
+ 
+             // Write event to update label
+             auto* write_label = reinterpret_cast<PM4CmdWriteData*>(cmdbuf + 0x3b);
+@@ -2295,6 +2331,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
+     auto* cmdbuf = dcb_gpu_addrs[count - 1];
+     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
+ 
++    ThrottleFlipSubmit(vo_handle);
++
+     std::scoped_lock lk{m_submit_lock};
+     WaitGpuIdle();
+ 
+diff --git a/src/core/libraries/kernel/equeue.cpp b/src/core/libraries/kernel/equeue.cpp
+index 29ab897f..5d193259 100644
+--- a/src/core/libraries/kernel/equeue.cpp
++++ b/src/core/libraries/kernel/equeue.cpp
+@@ -8,6 +8,7 @@
+ #include "common/debug.h"
+ #include "common/logging/log.h"
+ #include "common/singleton.h"
++#include "common/thread.h"
+ #include "core/file_sys/fs.h"
+ #include "core/libraries/kernel/equeue.h"
+ #include "core/libraries/kernel/kernel.h"
+@@ -193,9 +194,20 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
+     };
+ 
+     if (micros == 0) {
+-        // Wait indefinitely for events
++        // Wait indefinitely for events. nhlport diagnostics: a wait that never ends is reported
++        // (NHL 24 deadlocks with its RenderLoop thread parked on the flip event queue).
+         std::unique_lock lock{m_mutex};
+-        m_cond.wait(lock, predicate);
++        u32 slices = 0;
++        while (!m_cond.wait_for(lock, std::chrono::seconds(5), predicate)) {
++            ++slices;
++            if (slices <= 2 || slices % 12 == 0) {
++                LOG_WARNING(Kernel_Event,
++                            "equeue '{}' waited {}s on thread '{}' ({} events registered, {} small "
++                            "timers)",
++                            m_name, slices * 5, Common::GetCurrentThreadName(), m_events.size(),
++                            m_small_timers.size());
++            }
++        }
+     } else {
+         // Wait up until the timeout value
+         std::unique_lock lock{m_mutex};
+diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
+index 8d8d988a..2f4e2bb2 100644
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -254,6 +254,9 @@ void VideoOutDriver::Flip(const Request& req) {
+             --flip_status.gc_queue_num;
+         }
+         --flip_status.flip_pending_num;
++        LOG_DEBUG(Lib_VideoOut, "flip presented: index={} arg={} eop={} count={} pending={}",
++                  req.index, req.flip_arg, req.eop, flip_status.count,
++                  flip_status.flip_pending_num);
+     }
+ 
+     // Trigger flip events for the port.
+@@ -326,6 +329,8 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
+         frame = presenter->PrepareFrame(group, buffer.address_left);
+     }
+ 
++    LOG_DEBUG(Lib_VideoOut, "flip submitted: index={} arg={} eop={} pending={}", index, flip_arg,
++              is_eop, port->flip_status.flip_pending_num);
+     std::scoped_lock lock{mutex};
+     requests.push({
+         .frame = frame,
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index 4374d6b8..ee65300d 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -17,6 +17,48 @@
+ #include "video_core/amdgpu/pm4_cmds.h"
+ #include "video_core/renderdoc.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include <chrono>
++
++namespace {
++// nhlport diagnostics: a queue fiber that spins on a wait for seconds means the game waits for
++// something the emulator never produces (a CPU label write, another queue, a flip). Report it.
++struct SpinDiag {
++    u64 spins = 0;
++    std::chrono::steady_clock::time_point start;
++    bool reported = false;
++
++    bool Tick() {
++        if (spins++ == 0) {
++            start = std::chrono::steady_clock::now();
++            return false;
++        }
++        if (reported || (spins & 1023) != 0) {
++            return false;
++        }
++        if (std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
++            return false;
++        }
++        reported = true;
++        return true;
++    }
++
++    double Seconds() const {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++    }
++};
++
++void LogWaitRegMemSpin(const char* queue, const AmdGpu::PM4CmdWaitRegMem& w, bool is_vo_label,
++                       u32 num_submits, size_t gfx_submits, u32 num_mapped_queues) {
++    const bool mem = w.mem_space.Value() == AmdGpu::PM4CmdWaitRegMem::MemSpace::Memory;
++    const u32 value = mem ? *w.Address<const u32*>() : 0u;
++    LOG_WARNING(Render,
++                "{} WaitRegMem spinning > 2s: {} {:#x} func={} ref={:#x} mask={:#x} cur={:#x} "
++                "vo_label={} engine={} (num_submits={} gfx_submits={} mapped_queues={})",
++                queue, mem ? "addr" : "reg", mem ? w.Address<uintptr_t>() : uintptr_t(w.Reg()),
++                static_cast<u32>(w.function.Value()), w.ref, w.mask, value, is_vo_label,
++                static_cast<u32>(w.engine.Value()), num_submits, gfx_submits, num_mapped_queues);
++}
++} // namespace
+ 
+ namespace AmdGpu {
+ 
+@@ -270,6 +312,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                     break;
+                 }
++                case PM4CmdNop::PayloadType::PatchedFlipEop: {
++                    // nhlport: on real hardware the flip is driven by an end-of-pipe interrupt
++                    // that is also delivered to every equeue registered for kEqEventGfxEop.
++                    // NHL 24 (Frostbite) writes all of its GPU fences without interrupts and
++                    // relies on that per-flip EOP event to wake its GfxEopEventLoop thread,
++                    // which processes the fences; without it the ice, players and textures
++                    // never arrive and the game eventually deadlocks.
++                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
++                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
++                    break;
++                }
+                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
+                     if (guest_markers_enabled) {
+                         const auto marker_sz = nop->header.count.Value() * 2;
+@@ -753,9 +806,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                 if (mem_semaphore->IsSignaling()) {
+                     mem_semaphore->Signal();
+                 } else {
++                    SpinDiag diag{};
+                     while (!mem_semaphore->Signaled()) {
++                        if (diag.Tick()) {
++                            LOG_WARNING(Render, "GFX MemSemaphore spinning > 2s: packet {:#x}",
++                                        reinterpret_cast<uintptr_t>(mem_semaphore));
++                        }
+                         YIELD_GFX();
+                     }
++                    if (diag.reported) {
++                        LOG_WARNING(Render, "GFX MemSemaphore resolved after {:.1f}s",
++                                    diag.Seconds());
++                    }
+                     mem_semaphore->Decrement();
+                 }
+                 break;
+@@ -769,9 +831,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                     break;
+                 }
+                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
++                SpinDiag diag{};
+                 while (!rewind->Valid()) {
++                    if (diag.Tick()) {
++                        LOG_WARNING(Render, "GFX Rewind spinning > 2s: packet {:#x}",
++                                    reinterpret_cast<uintptr_t>(rewind));
++                    }
+                     YIELD_GFX();
+                 }
++                if (diag.reported) {
++                    LOG_WARNING(Render, "GFX Rewind resolved after {:.1f}s", diag.Seconds());
++                }
+                 break;
+             }
+             case PM4ItOpcode::WaitRegMem: {
+@@ -787,9 +857,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
+                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                     break;
+                 }
++                SpinDiag diag{};
+                 while (!wait_reg_mem->Test(regs.reg_array)) {
++                    if (diag.Tick()) {
++                        LogWaitRegMemSpin("GFX", *wait_reg_mem, vo_port->IsVoLabel(wait_addr),
++                                          num_submits, mapped_queues[GfxQueueId].submits.size(),
++                                          num_mapped_queues);
++                    }
+                     YIELD_GFX();
+                 }
++                if (diag.reported) {
++                    LOG_WARNING(Render, "GFX WaitRegMem resolved after {:.1f}s", diag.Seconds());
++                }
+                 break;
+             }
+             case PM4ItOpcode::IndirectBuffer: {
+@@ -1085,9 +1164,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+             if (mem_semaphore->IsSignaling()) {
+                 mem_semaphore->Signal();
+             } else {
++                SpinDiag diag{};
+                 while (!mem_semaphore->Signaled()) {
++                    if (diag.Tick()) {
++                        LOG_WARNING(Render, "ASC{} MemSemaphore spinning > 2s: packet {:#x}", vqid,
++                                    reinterpret_cast<uintptr_t>(mem_semaphore));
++                    }
+                     YIELD_ASC(vqid);
+                 }
++                if (diag.reported) {
++                    LOG_WARNING(Render, "ASC{} MemSemaphore resolved after {:.1f}s", vqid,
++                                diag.Seconds());
++                }
+                 mem_semaphore->Decrement();
+             }
+             break;
+@@ -1095,9 +1183,20 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+         case PM4ItOpcode::WaitRegMem: {
+             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
++            SpinDiag diag{};
+             while (!wait_reg_mem->Test(regs.reg_array)) {
++                if (diag.Tick()) {
++                    const std::string name = fmt::format("ASC{}", vqid);
++                    LogWaitRegMemSpin(name.c_str(), *wait_reg_mem,
++                                      vo_port->IsVoLabel(wait_reg_mem->Address<u64*>()),
++                                      num_submits, mapped_queues[GfxQueueId].submits.size(),
++                                      num_mapped_queues);
++                }
+                 YIELD_ASC(vqid);
+             }
++            if (diag.reported) {
++                LOG_WARNING(Render, "ASC{} WaitRegMem resolved after {:.1f}s", vqid, diag.Seconds());
++            }
+             break;
+         }
+         case PM4ItOpcode::ReleaseMem: {
+diff --git a/src/video_core/amdgpu/pm4_cmds.h b/src/video_core/amdgpu/pm4_cmds.h
+index f4a07025..18f153c7 100644
+--- a/src/video_core/amdgpu/pm4_cmds.h
++++ b/src/video_core/amdgpu/pm4_cmds.h
+@@ -239,6 +239,7 @@ struct PM4CmdNop {
+         SetSsharpInUdata = 0x68750006u,     ///< Indicates that S# will be set in the next packet
+         DebugColorMarkerPush = 0x6875000eu, ///< Begin of GPU event scope with color
+         PatchedFlip = 0x68750776u,          ///< Patched flip marker
++        PatchedFlipEop = 0x68750775u,       ///< nhlport: patched flip that also raises GfxEop
+         PrepareFlip = 0x68750777u,          ///< Flip marker
+         PrepareFlipLabel = 0x68750778u,     ///< Flip marker with label address
+         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
+-- 
+2.55.0.windows.2
+

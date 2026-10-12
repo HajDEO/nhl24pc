@@ -10,12 +10,12 @@
 LANGUAGE LANG_NEUTRAL, 0x8
 
 // ICON
-IDI_ICON1 ICON "shadps4.ico"
+IDI_ICON1 ICON "nhl24.ico"
 
 // VERSION
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    EMULATOR_VERSION_MAJOR, EMULATOR_VERSION_MINOR, EMULATOR_VERSION_PATCH, 0
- PRODUCTVERSION EMULATOR_VERSION_MAJOR, EMULATOR_VERSION_MINOR, EMULATOR_VERSION_PATCH, 0
+ FILEVERSION    NHLPORT_VERSION_MAJOR, NHLPORT_VERSION_MINOR, NHLPORT_VERSION_PATCH, 0
+ PRODUCTVERSION NHLPORT_VERSION_MAJOR, NHLPORT_VERSION_MINOR, NHLPORT_VERSION_PATCH, 0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -26,14 +26,14 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "\0"
-            VALUE "FileDescription", "shadPS4 - PlayStation 4 Emulator\0"
-            VALUE "FileVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) ".0\0"
-            VALUE "InternalName", "shadPS4\0"
-            VALUE "LegalCopyright", "Copyright 2025 shadPS4 Team\0"
-            VALUE "OriginalFilename", "shadPS4.exe\0"
-            VALUE "ProductName", "shadPS4\0"
-            VALUE "ProductVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) ".0\0"
+            VALUE "CompanyName", "NHL24 PC\0"
+            VALUE "FileDescription", "NHL24 PC\0"
+            VALUE "FileVersion", xstr(NHLPORT_VERSION_MAJOR) "." xstr(NHLPORT_VERSION_MINOR) "." xstr(NHLPORT_VERSION_PATCH) ".0\0"
+            VALUE "InternalName", "nhl24\0"
+            VALUE "LegalCopyright", "NHL24 PC port, based on shadPS4 (GPL-2.0-or-later)\0"
+            VALUE "OriginalFilename", "nhl24.exe\0"
+            VALUE "ProductName", "NHL24 PC\0"
+            VALUE "ProductVersion", xstr(NHLPORT_VERSION_MAJOR) "." xstr(NHLPORT_VERSION_MINOR) "." xstr(NHLPORT_VERSION_PATCH) ".0\0"
         END
     END
     BLOCK "VarFileInfo"

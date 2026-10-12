@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NHL 24 (CUSA37933, APP_VER 01.00) - nhlport game patches, loaded by shadPS4's MemoryPatcher
+  (run with  shadPS4.exe -p nhl24.xml ; the file is looked up in <user>/patches/).
+
+  Addresses are eboot.bin virtual addresses with the 0x400000 base the patch repository uses,
+  i.e. Address = 0x400000 + file/image offset.
+-->
+<Patch>
+  <Metadata Name="Synchronous replay compression (fixes black ice / frozen gameplay)" isEnabled="true" AppVer="01.00" AppElf="eboot.bin" Author="nhlport">
+    <PatchList>
+      <!--
+        eboot+0x64acb6b: cmp qword ptr [rdi+8], 0 ; je +0x48      (ring->jobSystem == nullptr ?)
+        The "rplyCompress" ring enqueue function schedules one compression job per 128 KB block
+        through a job queue that the emulated job workers never drain; after 64 blocks the ring
+        wraps, waits for the first job forever, the game thread Job3 spins, GameSimulationLoop
+        stalls and only the HUD keeps rendering. Turning the conditional jump into an unconditional
+        one makes the game take its own synchronous path (compress inline, no job, no wait).
+      -->
+      <Line Type="byte" Address="0x068ACB70" Value="0xEB"/>
+    </PatchList>
+  </Metadata>
+</Patch>

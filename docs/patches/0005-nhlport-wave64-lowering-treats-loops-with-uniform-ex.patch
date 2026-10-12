@@ -1,0 +1,109 @@
+From df3b56012eed5f5d345db415297157cde59745a3 Mon Sep 17 00:00:00 2001
+From: nhlport <nhlport@localhost>
+Date: Wed, 7 Oct 2026 16:10:55 +0200
+Subject: [PATCH 5/8] nhlport: wave64 lowering treats loops with uniform exit
+ conditions as uniform (NHL 24 HiZ reduction uses ReadLane 32 inside a
+ constant-count loop)
+
+---
+ src/core/libraries/json/json.cpp              |  4 +-
+ .../ir/passes/lower_wave64_pass.cpp           | 52 +++++++++++++++++--
+ 2 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/libraries/json/json.cpp b/src/core/libraries/json/json.cpp
+index 8ec0fba9..dfe8f6de 100644
+--- a/src/core/libraries/json/json.cpp
++++ b/src/core/libraries/json/json.cpp
+@@ -318,7 +318,9 @@ const char* PS4_SYSV_ABI String_c_str(const void* self) {
+ 
+ s32 PS4_SYSV_ABI Parser_parse(void* root, const char* buffer, u64 size) {
+     if (!buffer) {
+-        LOG_ERROR(Lib_Json, "Parser::parse with null buffer");
++        // NHL 24 does this when a config file it tried to read is missing; the real library
++        // rejects the call as well and the game carries on.
++        LOG_WARNING(Lib_Json, "Parser::parse with null buffer (size {})", size);
+         return ORBIS_JSON_ERROR_PARSE;
+     }
+     const std::string_view text{buffer, size != 0 ? size : std::strlen(buffer)};
+diff --git a/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp b/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+index d125a5f0..38e50f64 100644
+--- a/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
++++ b/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+@@ -43,9 +43,46 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
+         bool divergent;
+     };
+ 
++    // nhlport: a loop whose every exit condition (Break / Repeat) is uniform runs the same
++    // number of iterations on all threads of the workgroup, so blocks inside it may still host
++    // the barriers the wave64 lowering inserts. Only loops with a divergent exit make their body
++    // non-uniform. NHL 24's HiZ reduction shader loops over a constant-buffer count and combines
++    // the two wave halves with ReadLane 32 inside that loop; without this the lowering was
++    // skipped and the depth pyramid (and with it GPU occlusion culling) was garbage.
++    std::vector<const IR::Block*> divergent_loops;
++    {
++        std::vector<const IR::Block*> loop_stack;
++        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
++            switch (node.type) {
++            case Type::Loop:
++                loop_stack.push_back(node.data.loop.merge);
++                break;
++            case Type::Break:
++                if (!loop_stack.empty() && IsDivergentCondition(node.data.break_node.cond)) {
++                    divergent_loops.push_back(loop_stack.back());
++                }
++                break;
++            case Type::Repeat:
++                if (loop_stack.empty() || loop_stack.back() != node.data.repeat.merge) {
++                    return {};
++                }
++                if (IsDivergentCondition(node.data.repeat.cond)) {
++                    divergent_loops.push_back(loop_stack.back());
++                }
++                loop_stack.pop_back();
++                break;
++            default:
++                break;
++            }
++        }
++        if (!loop_stack.empty()) {
++            return {};
++        }
++    }
++
+     std::vector<IR::Block*> blocks;
+     std::vector<ConditionalScope> conditionals;
+-    std::vector<const IR::Block*> loops;
++    std::vector<ConditionalScope> loops;
+     u32 divergence_depth{};
+     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+         switch (node.type) {
+@@ -60,17 +97,22 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
+             divergence_depth -= static_cast<u32>(conditionals.back().divergent);
+             conditionals.pop_back();
+             break;
+-        case Type::Loop:
+-            loops.push_back(node.data.loop.merge);
++        case Type::Loop: {
++            const bool divergent =
++                std::ranges::contains(divergent_loops, node.data.loop.merge);
++            loops.push_back({node.data.loop.merge, divergent});
++            divergence_depth += static_cast<u32>(divergent);
+             break;
++        }
+         case Type::Repeat:
+-            if (loops.empty() || loops.back() != node.data.repeat.merge) {
++            if (loops.empty() || loops.back().merge != node.data.repeat.merge) {
+                 return {};
+             }
++            divergence_depth -= static_cast<u32>(loops.back().divergent);
+             loops.pop_back();
+             break;
+         case Type::Block:
+-            if (divergence_depth == 0 && loops.empty()) {
++            if (divergence_depth == 0) {
+                 blocks.push_back(node.data.block);
+             }
+             break;
+-- 
+2.55.0.windows.2
+

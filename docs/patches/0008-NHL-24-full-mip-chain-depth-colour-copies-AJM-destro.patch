@@ -1,0 +1,364 @@
+From a5bd8fef695fe5eb2926d413c578ee8a7acbb0b9 Mon Sep 17 00:00:00 2001
+From: nhlport <nhlport@local>
+Date: Wed, 7 Oct 2026 20:29:59 +0200
+Subject: [PATCH 8/8] NHL 24: full mip-chain depth/colour copies, AJM
+ destroyed-instance jobs, perf stats, RenderDoc trigger
+
+- vk_runtime: CopyImageWithBuffer copies every common mip level through the
+  staging buffer instead of level 0 only (the lower levels feed the pre-game
+  cutscene blur/DoF chains and were left uninitialised -> noise).
+- ajm: a batch job that references an already destroyed decoder instance is
+  skipped with a warning instead of asserting (NHL 24 crashed on goal scenes).
+- videoout: frame statistics every 5 s (fps, avg/max frame time, frames above
+  33/100 ms, pipelines/shaders compiled in the window); pipeline cache counts.
+- renderdoc: hotkey uses RenderDoc's present-to-present TriggerCapture and a
+  "captures/trigger" file polled by the present thread can start a capture
+  without keyboard focus (manual Start/EndFrameCapture never produced a file).
+- buffer cache: residency message demoted to debug.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/core/libraries/ajm/ajm_context.cpp        |  9 ++-
+ src/core/libraries/videoout/driver.cpp        | 46 +++++++++++++
+ src/video_core/buffer_cache/buffer_cache.cpp  |  2 +-
+ src/video_core/renderdoc.cpp                  | 24 ++++++-
+ src/video_core/renderdoc.h                    |  4 ++
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 14 ++++
+ .../renderer_vulkan/vk_pipeline_cache.h       |  4 ++
+ src/video_core/renderer_vulkan/vk_runtime.cpp | 64 +++++++++++--------
+ 8 files changed, 136 insertions(+), 31 deletions(-)
+
+diff --git a/src/core/libraries/ajm/ajm_context.cpp b/src/core/libraries/ajm/ajm_context.cpp
+index 8ce8f343..12e25ca2 100644
+--- a/src/core/libraries/ajm/ajm_context.cpp
++++ b/src/core/libraries/ajm/ajm_context.cpp
+@@ -86,7 +86,14 @@ void AjmContext::ProcessBatch(u32 id, std::span<AjmJob> jobs) {
+             {
+                 std::shared_lock lock(instances_mutex);
+                 auto* p_instance = instances.Get(job.instance_id & INSTANCE_ID_MASK);
+-                ASSERT_MSG(p_instance != nullptr, "Attempting to execute job on null instance");
++                if (p_instance == nullptr) {
++                    // nhlport: NHL 24 destroys MP3 decoder instances while a batch that references
++                    // them is still queued; real hardware just fails that job. Skip it instead of
++                    // taking the whole emulator down.
++                    LOG_WARNING(Lib_Ajm, "Batch {} references destroyed instance {}, job skipped",
++                                id, job.instance_id);
++                    continue;
++                }
+                 instance = *p_instance;
+             }
+ 
+diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
+index 2f4e2bb2..8d17fb5d 100644
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -8,9 +8,11 @@
+ #include "core/emulator_settings.h"
+ #include "core/libraries/kernel/time.h"
+ #include "core/libraries/videoout/driver.h"
++#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include "core/libraries/videoout/videoout_error.h"
+ #include "imgui/renderer/imgui_core.h"
+ #include "video_core/amdgpu/liverpool.h"
++#include "video_core/renderdoc.h"
+ #include "video_core/renderer_vulkan/vk_presenter.h"
+ 
+ extern std::unique_ptr<Vulkan::Presenter> presenter;
+@@ -234,6 +236,44 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
+ }
+ 
+ void VideoOutDriver::Flip(const Request& req) {
++    // nhlport perf statistics: frame interval distribution of presented flips, every 5 s.
++    {
++        using Clock = std::chrono::steady_clock;
++        static Clock::time_point last_flip{};
++        static Clock::time_point window_start{};
++        static u32 frames = 0, slow33 = 0, slow100 = 0;
++        static double max_ms = 0.0;
++        static u64 pipelines_at_start = 0, shaders_at_start = 0;
++        const auto now = Clock::now();
++        if (last_flip != Clock::time_point{}) {
++            const double ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
++            ++frames;
++            max_ms = std::max(max_ms, ms);
++            slow33 += ms > 33.0;
++            slow100 += ms > 100.0;
++        } else {
++            window_start = now;
++            pipelines_at_start = Vulkan::NumPipelinesCompiled();
++            shaders_at_start = Vulkan::NumShadersCompiled();
++        }
++        last_flip = now;
++        const double window_s = std::chrono::duration<double>(now - window_start).count();
++        if (window_s >= 5.0 && frames > 0) {
++            const u64 pipelines = Vulkan::NumPipelinesCompiled();
++            const u64 shaders = Vulkan::NumShadersCompiled();
++            LOG_INFO(Lib_VideoOut,
++                     "frame stats: {:.1f} fps avg {:.1f} ms max {:.1f} ms, >33ms {} >100ms {} of {} frames, "
++                     "compiled {} pipelines / {} shaders in this window",
++                     frames / window_s, 1000.0 * window_s / frames, max_ms, slow33, slow100, frames,
++                     pipelines - pipelines_at_start, shaders - shaders_at_start);
++            window_start = now;
++            frames = slow33 = slow100 = 0;
++            max_ms = 0.0;
++            pipelines_at_start = pipelines;
++            shaders_at_start = shaders;
++        }
++    }
++
+     // Update HDR status before presenting.
+     presenter->SetHDR(req.port->is_hdr);
+ 
+@@ -360,9 +400,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+         return {};
+     };
+ 
++    u32 trigger_poll = 0;
+     while (!token.stop_requested()) {
+         timer.Start();
+ 
++        // nhlport: file-based RenderDoc capture trigger, checked twice a second.
++        if (++trigger_poll % 30 == 0) {
++            VideoCore::PollCaptureTrigger();
++        }
++
+         if (DebugState.IsGuestThreadsPaused()) {
+             DrawLastFrame();
+             timer.End();
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index 3600ffbf..ef5949db 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -308,7 +308,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+         backing.offset = memory_offset >> block_shift;
+         resident_ranges.Add(backing);
+ 
+-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
++        LOG_DEBUG(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+ 
+         const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
+             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
+diff --git a/src/video_core/renderdoc.cpp b/src/video_core/renderdoc.cpp
+index 0fe7e9fc..36dd8c3e 100644
+--- a/src/video_core/renderdoc.cpp
++++ b/src/video_core/renderdoc.cpp
+@@ -16,6 +16,8 @@
+ #endif
+ 
+ #include <filesystem>
++#include "common/logging/log.h"
++#include "common/path_util.h"
+ 
+ namespace VideoCore {
+ 
+@@ -116,8 +118,26 @@ void EndCapture() {
+ }
+ 
+ void TriggerCapture() {
+-    if (capture_state == CaptureState::Idle) {
+-        capture_state = CaptureState::Triggered;
++    // nhlport: use RenderDoc's own present-to-present capture instead of the manual
++    // StartFrameCapture/EndFrameCapture pair around GPU submits. With NHL 24 the manual end
++    // arrived seconds later and RenderDoc had no frame capturer left ("Couldn't find matching
++    // frame capturer ... from 0 device frame capturers"), so no capture was ever written.
++    if (rdoc_api) {
++        LOG_WARNING(Common, "RenderDoc: capturing the next presented frame");
++        rdoc_api->TriggerCapture();
++    }
++}
++
++void PollCaptureTrigger() {
++    if (!rdoc_api) {
++        return;
++    }
++    static const std::filesystem::path trigger =
++        Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "trigger";
++    std::error_code ec;
++    if (std::filesystem::exists(trigger, ec)) {
++        std::filesystem::remove(trigger, ec);
++        TriggerCapture();
+     }
+ }
+ 
+diff --git a/src/video_core/renderdoc.h b/src/video_core/renderdoc.h
+index 5e87be57..ec7bdd96 100644
+--- a/src/video_core/renderdoc.h
++++ b/src/video_core/renderdoc.h
+@@ -21,6 +21,10 @@ void EndCapture();
+ /// Triggers capturing process.
+ void TriggerCapture();
+ 
++/// nhlport: capture when a file named "trigger" appears in the captures directory (removed
++/// once consumed). Lets a script take a RenderDoc capture without keyboard focus.
++void PollCaptureTrigger();
++
+ /// Sets output directory for captures
+ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 8c63126d..4d1237cf 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -22,6 +22,17 @@
+ 
+ namespace Vulkan {
+ 
++static std::atomic<u64> g_pipelines_compiled{0};
++static std::atomic<u64> g_shaders_compiled{0};
++
++u64 NumPipelinesCompiled() {
++    return g_pipelines_compiled.load(std::memory_order_relaxed);
++}
++
++u64 NumShadersCompiled() {
++    return g_shaders_compiled.load(std::memory_order_relaxed);
++}
++
+ using Shader::HwStage;
+ using Shader::Output;
+ using Shader::SwStage;
+@@ -346,6 +357,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
+     if (is_new) {
+         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
++        g_pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
+ 
+         GraphicsPipeline::SerializationSupport sdata{};
+         it.value() = std::make_unique<GraphicsPipeline>(
+@@ -375,6 +387,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
+     if (is_new) {
+         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
++        g_pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
+ 
+         ComputePipeline::SerializationSupport sdata{};
+         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+@@ -623,6 +636,7 @@ bool PipelineCache::RefreshComputeKey() {
+ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
+                                               const std::span<const u32>& code, size_t perm_idx,
+                                               Shader::Backend::Bindings& binding) {
++    g_shaders_compiled.fetch_add(1, std::memory_order_relaxed);
+     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
+              perm_idx != 0 ? "(permutation)" : "");
+     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index edd9737b..b6843575 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -34,6 +34,10 @@ struct Info;
+ 
+ namespace Vulkan {
+ 
++// nhlport perf statistics: pipelines/shaders compiled so far (read by the flip statistics log).
++u64 NumPipelinesCompiled();
++u64 NumShadersCompiled();
++
+ class Instance;
+ class Scheduler;
+ class ShaderCache;
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 1368edf7..58a7c163 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <boost/container/small_vector.hpp>
++#include "common/alignment.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -325,36 +327,42 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
+                                   const VideoCore::Buffer* buffer, u64 offset) {
+     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
+-    // nhlport: NHL 24 (Frostbite) copies between images whose layer or mip counts differ
+-    // (a slice of an array / the top level of a mip chain). Copy the common part (mip 0,
+-    // the shared layers) instead of asserting; the copy below never exceeded this size.
+-    if (src->info.resources.layers != dst->info.resources.layers || num_mips != 1) {
++    // nhlport: NHL 24 (Frostbite) aliases a depth buffer with a colour image that carries a full
++    // mip chain (and sometimes a different layer count). Copy every common mip level through the
++    // staging buffer instead of only level 0: the lower levels feed depth-of-field / blur chains in
++    // the pre-game cutscenes and were left uninitialised (noise) before.
++    if (src->info.resources.layers != dst->info.resources.layers) {
+         LOG_WARNING(Render_Vulkan,
+-                    "Partial image copy through buffer: src {}x{}x{} layers {} mips {} -> dst "
+-                    "{}x{}x{} layers {} mips {}",
+-                    src->info.size.width, src->info.size.height, src->info.size.depth,
+-                    src->info.resources.layers, src->info.resources.levels, dst->info.size.width,
+-                    dst->info.size.height, dst->info.size.depth, dst->info.resources.layers,
+-                    dst->info.resources.levels);
++                    "Image copy through buffer with different layer counts: src {} dst {}, copying {}",
++                    src->info.resources.layers, dst->info.resources.layers, num_layers);
+     }
+ 
+     SetBackingSamples(dst, dst->info.num_samples, false);
+     SetBackingSamples(src, src->info.num_samples);
+ 
+-    vk::BufferImageCopy buffer_copy = {
+-        .bufferOffset = offset,
+-        .bufferRowLength = 0,
+-        .bufferImageHeight = 0,
+-        .imageSubresource{
+-            .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+-            .mipLevel = 0u,
+-            .baseArrayLayer = 0,
+-            .layerCount = num_layers,
+-        },
+-        .imageOffset = {0, 0, 0},
+-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+-    };
+-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
++    boost::container::small_vector<vk::BufferImageCopy, 16> copies;
++    u64 running_offset = offset;
++    for (u32 mip = 0; mip < num_mips; ++mip) {
++        vk::BufferImageCopy buffer_copy = {
++            .bufferOffset = running_offset,
++            .bufferRowLength = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource{
++                .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
++                .mipLevel = mip,
++                .baseArrayLayer = 0,
++                .layerCount = num_layers,
++            },
++            .imageOffset = {0, 0, 0},
++            .imageExtent = {std::max(src->info.size.width >> mip, 1u),
++                            std::max(src->info.size.height >> mip, 1u),
++                            std::max(src->info.size.depth >> mip, 1u)},
++        };
++        const auto level_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
++        running_offset = Common::AlignUp(running_offset + level_size, 16);
++        copies.push_back(buffer_copy);
++    }
++    const u64 copy_size = running_offset - offset;
+ 
+     scheduler.EndRendering();
+ 
+@@ -370,7 +378,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
+ 
+     auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+-                             buffer->Handle(), buffer_copy);
++                             buffer->Handle(), copies);
+ 
+     const vk::MemoryBarrier2 post_copy_barrier = {
+         .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+@@ -384,9 +392,11 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
+         .pMemoryBarriers = &post_copy_barrier,
+     });
+ 
+-    buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
++    for (auto& copy : copies) {
++        copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
++    }
+     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
+-                             vk::ImageLayout::eTransferDstOptimal, buffer_copy);
++                             vk::ImageLayout::eTransferDstOptimal, copies);
+ 
+     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+-- 
+2.55.0.windows.2
+

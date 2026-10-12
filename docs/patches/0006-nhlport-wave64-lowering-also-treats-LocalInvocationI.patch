@@ -1,0 +1,33 @@
+From 0a942100f82eb462da96bec28a9df84312dd2ed4 Mon Sep 17 00:00:00 2001
+From: nhlport <nhlport@localhost>
+Date: Wed, 7 Oct 2026 16:12:00 +0200
+Subject: [PATCH 6/8] nhlport: wave64 lowering also treats
+ LocalInvocationIndex/GlobalInvocationId-derived conditions as divergent
+
+---
+ src/shader_recompiler/ir/passes/lower_wave64_pass.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp b/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+index 38e50f64..5d214f18 100644
+--- a/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
++++ b/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+@@ -22,9 +22,13 @@ static bool IsDivergentCondition(const IR::U1& condition) {
+                                       case IR::Opcode::LaneId:
+                                           return true;
+                                       case IR::Opcode::GetAttributeU32:
+-                                          if (inst->Arg(0).Attribute() ==
+-                                              IR::Attribute::LocalInvocationId) {
++                                          switch (inst->Arg(0).Attribute()) {
++                                          case IR::Attribute::LocalInvocationId:
++                                          case IR::Attribute::LocalInvocationIndex:
++                                          case IR::Attribute::GlobalInvocationId:
+                                               return true;
++                                          default:
++                                              break;
+                                           }
+                                           break;
+                                       default:
+-- 
+2.55.0.windows.2
+

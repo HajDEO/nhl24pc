@@ -788,7 +788,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             PushSDLEvent(SDL_EVENT_SCREENSHOT_WITH_OVERLAYS);
             break;
         case HOTKEY_DIAG_MARK:
-            PushSDLEvent(SDL_EVENT_DIAG_MARK);
+            if (new_button_state) {
+                PushSDLEvent(SDL_EVENT_DIAG_MARK);
+            }
             break;
         case HOTKEY_ADD_VIRTUAL_USER:
             PushSDLEvent(SDL_EVENT_ADD_VIRTUAL_USER);

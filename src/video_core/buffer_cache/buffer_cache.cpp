@@ -126,6 +126,12 @@ void BufferCache::TickFrame() {
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        VideoCore::Perf::DrawLog(fmt::format(
+            "buf-inval f{} addr {:#x} size {:#x} gpumod {} thread {}",
+            VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed), device_addr, size,
+            IsRegionGpuModified(device_addr, size) ? 1 : 0, Common::GetCurrentThreadName()));
+    }
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, assume_locks);
     });
@@ -181,14 +187,38 @@ bool BufferCache::InlineData(VAddr address, const void* data, u32 num_bytes) {
     if (!memory->TryWriteBacking(std::bit_cast<void*>(address), data, num_bytes)) {
         return false;
     }
-    if (!IsRegionGpuModified(address, num_bytes)) {
-        // No newer GPU copy of this range: the next GPU use re-uploads the page.
-        memory_tracker->MarkRegionAsCpuModified(address, num_bytes);
+    if (IsRegionGpuModified(address, num_bytes)) {
+        // The GPU copy is authoritative; patch it so shaders and later readbacks see the write.
+        const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
+        runtime.InlineData(buffer, offset, data, num_bytes);
         return true;
     }
-    // The GPU copy is authoritative; patch it so shaders and later readbacks see the write.
-    const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
-    runtime.InlineData(buffer, offset, data, num_bytes);
+    // nhlport: a resident GPU copy gets the value as well instead of marking the page
+    // CPU-modified. The next upload of a CPU-modified page copies the whole host page over
+    // GPU-written ranges that share it, and unlike a guest write this path has no readback first:
+    // NHL 24 keeps its fence labels next to the tile counters and indirect dispatch arguments of
+    // the deferred lighting, which lost tile columns (black rectangles) in cutscenes whenever the
+    // dynamic resolution changed between frames.
+    const u64 first_block = address >> block_shift;
+    const u64 last_block = (address + num_bytes - 1) >> block_shift;
+    bool resident = true;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
+    if (!resident) {
+        memory_tracker->MarkRegionAsCpuModified(address, num_bytes);
+        if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+            VideoCore::Perf::DrawLog(fmt::format(
+                "inline f{} addr {:#x} size {} not-resident cpu-marked",
+                VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed), address, num_bytes));
+        }
+        return true;
+    }
+    const auto* arena = GetArena(first_block, last_block);
+    runtime.InlineData(arena, arena->Offset(address), data, num_bytes);
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        VideoCore::Perf::DrawLog(fmt::format("inline f{} addr {:#x} size {} gpu-patched",
+                                             VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                             address, num_bytes));
+    }
     return true;
 }
 
@@ -253,6 +283,17 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     VideoCore::Perf::readback_calls.fetch_add(1, std::memory_order_relaxed);
     VideoCore::Perf::readback_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        std::string ranges;
+        for (size_t i = 0; i < copies.size() && i < 8; ++i) {
+            ranges += fmt::format(" [{:#x}+{:#x}]", arena_base + copies[i].srcOffset, copies[i].size);
+        }
+        VideoCore::Perf::DrawLog(fmt::format(
+            "readback f{} window {:#x}+{:#x} ranges {} bytes {} max_tick {} known {} current {} thread {}:{}",
+            VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed), device_addr, size,
+            copies.size(), total_size_bytes, max_tick, ticks_known ? 1 : 0, scheduler.CurrentTick(),
+            Common::GetCurrentThreadName(), ranges));
+    }
     // nhlport: which GPU-written ranges a readback actually downloads (first 40, then every 500th)
     {
         static std::atomic<u64> count{0};
@@ -518,6 +559,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
         copies.emplace_back(total_size_bytes, addr, size);
         total_size_bytes += size;
+        if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+            // nhlport trace: a host page copied over ranges the GPU wrote ("clobber")
+            gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
+                VideoCore::Perf::DrawLog(fmt::format(
+                    "clobber f{} req {:#x}+{:#x} {} upload {:#x}+{:#x} over gpu {:#x}+{:#x} thread {}",
+                    VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed), device_addr, size,
+                    is_written ? "w" : "r", addr, size, start, end - start,
+                    Common::GetCurrentThreadName()));
+            });
+        }
     });
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);

@@ -1,6 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
@@ -30,6 +40,7 @@
 #include "input/input_mouse.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
+#include "video_core/perf_counters.h"
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
@@ -83,9 +94,11 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
     }
 }
 
-static Uint32 SDLCALL PollController(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
-    auto* controller = reinterpret_cast<Input::GameController*>(userdata);
-    controller->PollState();
+static Uint32 SDLCALL PollControllers(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
+    auto* controllers = reinterpret_cast<Input::GameControllers*>(userdata);
+    for (size_t i = 0; i < 4; ++i) {
+        (*controllers)[i]->PollState();
+    }
     return interval;
 }
 
@@ -99,7 +112,7 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
-    if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
+    if (!SDL_SetHint(SDL_HINT_APP_NAME, "NHL24 PC")) {
         UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
     }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -336,8 +349,8 @@ void WindowSDL::WaitEvent() {
         VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
         break;
     case SDL_EVENT_DIAG_MARK:
-        // nhlport: the user saw something; mark the diagnostic log (a game screenshot follows).
-        Diag::Marker("hotkey");
+        // nhlport: the user saw something; marker, screenshot, draw log and composite image dumps.
+        Diag::ArmCapture("hotkey");
         break;
     default:
         break;
@@ -345,9 +358,7 @@ void WindowSDL::WaitEvent() {
 }
 
 void WindowSDL::InitTimers() {
-    for (int i = 0; i < 4; ++i) {
-        SDL_AddTimer(4, &PollController, controllers[i]);
-    }
+    SDL_AddTimer(4, &PollControllers, &controllers);
     SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
 }
 
@@ -463,8 +474,54 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     }
 }
 
+#ifdef _WIN32
+// nhlport: the window, taskbar and Alt-Tab icons come from the exe's own icon resource (the
+// same .ico as the launcher, with dedicated 16/32 px frames) instead of a downscaled PNG.
+static bool SetWindowIconFromExe(SDL_Window* window) {
+    auto* hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+                                                          SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (!hwnd) {
+        return false;
+    }
+    const HINSTANCE module = GetModuleHandleW(nullptr);
+    LPWSTR group_name = nullptr;
+    EnumResourceNamesW(
+        module, MAKEINTRESOURCEW(14), // RT_GROUP_ICON
+        [](HMODULE, LPCWSTR, LPWSTR name, LONG_PTR param) -> BOOL {
+            *reinterpret_cast<LPWSTR*>(param) = name;
+            return FALSE; // first icon group only
+        },
+        reinterpret_cast<LONG_PTR>(&group_name));
+    if (!group_name) {
+        return false;
+    }
+    const auto big = static_cast<HICON>(LoadImageW(module, group_name, IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                                   GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    // The launcher (WinForms) hands the same 32 px frame to the title bar as well; do the same so
+    // both windows look identical.
+    const auto small = big;
+    if (!big) {
+        return false;
+    }
+    if (big) {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+        SetClassLongPtrW(hwnd, GCLP_HICON, reinterpret_cast<LONG_PTR>(big));
+    }
+    if (small) {
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+        SetClassLongPtrW(hwnd, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(small));
+    }
+    return true;
+}
+#endif
+
 #ifndef __APPLE__
 void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png) {
+#ifdef _WIN32
+    if (SetWindowIconFromExe(window)) {
+        return;
+    }
+#endif
     int imageWidth = 0;
     int imageHeight = 0;
     constexpr int numChannels = 4;
@@ -492,7 +549,7 @@ void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png) {
 
 void SetDefaultWindowIcon(SDL_Window* window) {
     const auto resource = cmrc::res::get_filesystem();
-    const auto file = resource.open("src/resources/shadps4.png");
+    const auto file = resource.open("src/resources/nhl24.png");
     const std::vector<u8> texData = std::vector<u8>(file.begin(), file.end());
     SetWindowIcon(window, texData);
 }

@@ -22,6 +22,7 @@
 #include "core/debugger.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
+#include "core/file_format/pkg_extract.h"
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
 #include "core/user_settings.h"
@@ -82,6 +83,13 @@ int main(int argc, char* argv[]) {
     app.add_option("guest_arg", gamePath, "Game path or ID"); // positional
     app.add_option("-g,--game", gamePath, "Game path or ID");
     app.add_option("-p,--patch", patchFile, "Patch file to apply");
+    // nhlport: package installation for the launcher (see core/file_format/pkg_extract.h).
+    std::optional<std::string> extractPkg;
+    std::optional<std::string> extractTo;
+    app.add_option("--extract-pkg", extractPkg, "Install a PS4 package (PKG) into the game folder and exit");
+    app.add_option("--extract-to", extractTo, "Target folder for --extract-pkg");
+    bool pkgInfo = false;
+    app.add_flag("--pkg-info", pkgInfo, "With --extract-pkg: only print the package information");
     app.add_flag("-i,--ignore-game-patch", ignoreGamePatch,
                  "Disable automatic loading of game patches");
 
@@ -179,6 +187,13 @@ int main(int argc, char* argv[]) {
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
+
+    if (extractPkg) {
+        return PkgExtract::Run(std::filesystem::path(*extractPkg),
+                               extractTo ? std::optional<std::filesystem::path>(*extractTo)
+                                         : std::nullopt,
+                               pkgInfo);
+    }
 
     LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), " "));
 

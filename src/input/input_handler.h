@@ -543,7 +543,7 @@ public:
 
 class ControllerAllOutputs {
 public:
-    static constexpr u64 output_count = 43;
+    static constexpr u64 output_count = 44;
     std::array<ControllerOutput, output_count> data = {
         // Important: these have to be the first, or else they will update in the wrong order
         ControllerOutput(LEFTJOYSTICK_HALFMODE),
@@ -598,6 +598,7 @@ public:
         ControllerOutput(HOTKEY_VOLUME_DOWN),
         ControllerOutput(HOTKEY_OPEN_EMULATOR_SETTINGS),
         ControllerOutput(HOTKEY_TOGGLE_FRIENDS),
+        ControllerOutput(HOTKEY_DIAG_MARK), // nhlport: without this entry the binding is dangling
 
         ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_INVALID),
     };

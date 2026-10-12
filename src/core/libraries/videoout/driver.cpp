@@ -253,7 +253,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 void VideoOutDriver::Flip(const Request& req) {
     // nhlport perf statistics: frame interval distribution of presented flips, every 5 s.
-    {
+    if (Diag::Enabled()) {
         using Clock = std::chrono::steady_clock;
         static Clock::time_point last_flip{};
         static Clock::time_point window_start{};
@@ -310,7 +310,7 @@ void VideoOutDriver::Flip(const Request& req) {
         // nhlport: exact game frames. Creating <user>/captures/screenshot (content = N, consumed)
         // saves the next N presented frames as game-only PNGs into <user>/screenshots.
         // nhlport: captures/dumpbuffer = "hexaddr size" lines; the GPU copy of each range is dumped
-        {
+        if (Diag::Enabled()) {
             static u32 dumpbuf_poll = 0;
             if (++dumpbuf_poll % 30 == 0) {
                 static const std::filesystem::path trigger =
@@ -339,7 +339,7 @@ void VideoOutDriver::Flip(const Request& req) {
             }
         }
         // nhlport: captures/dumpimage = hex guest addresses (one per line) of images to dump
-        {
+        if (Diag::Enabled()) {
             static u32 dump_poll = 0;
             if (++dump_poll % 30 == 0) {
                 static const std::filesystem::path trigger =
@@ -378,7 +378,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
             }
         }
-        {
+        if (Diag::Enabled()) {
             static u32 shots_left = 0, shot_poll = 0;
             if (shots_left == 0 && ++shot_poll % 30 == 0) {
                 static const std::filesystem::path trigger =
@@ -405,7 +405,7 @@ void VideoOutDriver::Flip(const Request& req) {
 
         // nhlport: per-frame trace. Creating <user>/captures/frametrace (consumed) logs one line
         // per presented frame for the next 600 frames: counter deltas since the previous frame.
-        {
+        if (Diag::Enabled()) {
             static u32 trace_left = 0, trace_poll = 0, trace_no = 0, draw_trace_left = 0;
             if (trace_left == 0 && ++trace_poll % 30 == 0) {
                 static const std::filesystem::path trigger =
@@ -424,6 +424,35 @@ void VideoOutDriver::Flip(const Request& req) {
                     draw_trace_left = draw_frames;
                     VideoCore::Perf::draw_trace.store(1, std::memory_order_relaxed);
                     LOG_WARNING(Lib_VideoOut, "frame trace: logging the next 600 frames (draw log for {})", draw_frames);
+                }
+            }
+            // nhlport: captures/capture (consumed, content = note) = the same capture as the F1
+            // hotkey, for scripts; polled every 5 flips.
+            static u32 capture_poll = 0;
+            if (++capture_poll % 5 == 0) {
+                static const std::filesystem::path capture_trigger =
+                    Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "capture";
+                std::error_code ec;
+                if (std::filesystem::exists(capture_trigger, ec)) {
+                    std::string note;
+                    if (std::ifstream in{capture_trigger}; in) {
+                        std::getline(in, note);
+                    }
+                    std::filesystem::remove(capture_trigger, ec);
+                    Diag::ArmCapture(note.empty() ? "capture file" : note);
+                }
+            }
+            // nhlport: hotkey capture (Diag::ArmCapture): draw log for the next N frames right away.
+            if (draw_trace_left == 0) {
+                if (const u32 req = VideoCore::Perf::trace_request.exchange(0, std::memory_order_relaxed);
+                    req != 0) {
+                    draw_trace_left = std::clamp<u32>(req, 1, 600);
+                    if (trace_left == 0) {
+                        trace_left = 600;
+                    }
+                    VideoCore::Perf::draw_trace.store(1, std::memory_order_relaxed);
+                    LOG_WARNING(Lib_VideoOut, "frame trace (hotkey): draw log for the next {} frames",
+                                draw_trace_left);
                 }
             }
             if (trace_left > 0) {
@@ -672,7 +701,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         timer.Start();
 
         // nhlport: file-based RenderDoc capture trigger, checked twice a second.
-        if (++trigger_poll % 30 == 0) {
+        if (++trigger_poll % 30 == 0 && Diag::Enabled()) {
             VideoCore::PollCaptureTrigger();
         }
 

@@ -373,6 +373,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    last_dispatch_hash = cs.pgm_hash;
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         Diag::C::cs_hle.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -398,6 +399,7 @@ void Rasterizer::DispatchDirect() {
 
     if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
         LogDrawTrace("disp", pipeline, &pipeline->GetStage(Shader::SwStage::Compute));
+        TraceGdsAfter(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
     }
     ResetBindings(true);
 }
@@ -419,6 +421,19 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        // nhlport trace: where the indirect arguments come from (host copy = stream path)
+        const bool gpu = buffer_cache.IsRegionGpuModified(address + offset, size);
+        std::string vals;
+        if (!gpu) {
+            u32 v[3] = {0, 0, 0};
+            std::memcpy(v, std::bit_cast<const void*>(address + offset), std::min<u32>(size, 12));
+            vals = fmt::format(" host-vals {} {} {}", v[0], v[1], v[2]);
+        }
+        VideoCore::Perf::DrawLog(fmt::format("dispi-args f{} addr {:#x} size {} {}{}",
+                                             VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                             address + offset, size, gpu ? "gpu" : "host", vals));
+    }
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
     bound_buffers.emplace_back(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
@@ -437,6 +452,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
         LogDrawTrace("disp", pipeline, &pipeline->GetStage(Shader::SwStage::Compute));
+        TraceGdsAfter(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
     }
     ResetBindings(true);
 }
@@ -748,6 +764,15 @@ void Rasterizer::LogDrawTrace(const char* kind, const void* pipeline, const Shad
                     }
                     line += "]";
                 }
+                // nhlport trace: the flattened shader resource table as the shader reads it
+                if (cs_info->flattened_ud_buf.size() > 16) {
+                    line += " srt=[";
+                    const u32 n = std::min<u32>(u32(cs_info->flattened_ud_buf.size()), 80);
+                    for (u32 i = 16; i < n; ++i) {
+                        line += fmt::format("{}{:x}", i > 16 ? " " : "", cs_info->flattened_ud_buf[i]);
+                    }
+                    line += "]";
+                }
             }
         } else {
             const auto& vp = regs.viewports[0];
@@ -906,10 +931,69 @@ void Rasterizer::LogDrawTrace(const char* kind, const void* pipeline, const Shad
     VideoCore::Perf::DrawLog(std::move(line));
 }
 
+// nhlport: hotkey capture: raw dump of every image bound to the current dispatch (UI composite).
+// nhlport trace: GDS counters once the GPU has executed everything recorded so far
+void Rasterizer::TraceGdsAfter(u64 pgm_hash) {
+    static constexpr u64 watched[] = {0x172839d0ull, 0x55714361ull, 0xe7e4752cull, 0xccd3f3b4ull,
+                                      0xa5821966ull, 0xeab78653ull, 0xf85763dcull, 0x5fddf9ecull};
+    if (std::find(std::begin(watched), std::end(watched), pgm_hash) == std::end(watched)) {
+        return;
+    }
+    scheduler.Finish();
+    const auto* gds = buffer_cache.GetGdsBuffer();
+    const u32* dw = std::bit_cast<const u32*>(gds->mapped_data.data());
+    std::string dws;
+    for (u32 i = 0; i < 16; ++i) {
+        dws += fmt::format("{}{}", i ? " " : "", dw[i]);
+    }
+    VideoCore::Perf::DrawLog(fmt::format("gds-after f{} hash={:#x} dw0-15 [{}]",
+                                         VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                         pgm_hash, dws));
+}
+
+void Rasterizer::DumpAllBoundImages() {
+    u32 count = 0;
+    for (const auto image_id : bound_images) {
+        texture_cache.DumpImage(image_id);
+        ++count;
+    }
+    {
+        // nhlport trace: the GDS contents (tile list counters) once the GPU is idle
+        scheduler.Finish();
+        const auto* gds = buffer_cache.GetGdsBuffer();
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) /
+                          fmt::format("gds_f{}.bin", VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed));
+        Common::FS::IOFile file{path, Common::FS::FileAccessMode::Create};
+        file.WriteSpan(std::span<const u8>{gds->mapped_data.data(), gds->mapped_data.size()});
+        std::string dws;
+        const u32* dw = std::bit_cast<const u32*>(gds->mapped_data.data());
+        for (u32 i = 0; i < 24; ++i) {
+            dws += fmt::format("{}{}", i ? " " : "", dw[i]);
+        }
+        VideoCore::Perf::DrawLog(fmt::format("gds f{} dw0-23 [{}]",
+                                             VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed), dws));
+    }
+    std::string line = fmt::format("dump-cs f{} hash={:#x} images={}",
+                                   VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                   last_dispatch_hash, count);
+    LOG_WARNING(Render, "{}", line);
+    if (VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        VideoCore::Perf::DrawLog(std::move(line));
+    }
+}
+
 void Rasterizer::ResetBindings(bool is_compute) {
     if (VideoCore::Perf::dump_pending.load(std::memory_order_relaxed) != 0) {
         DumpBoundImages();
     }
+    // The dump waits for the draw log to be active so the dumped frame is the logged one.
+    if (is_compute && last_dispatch_hash != 0 &&
+        VideoCore::Perf::draw_trace.load(std::memory_order_relaxed) != 0 &&
+        Diag::CaptureMatchesDispatch(last_dispatch_hash)) {
+        DumpAllBoundImages();
+        VideoCore::Perf::dump_cs_pending.store(0, std::memory_order_relaxed);
+    }
+    last_dispatch_hash = 0;
     if (VideoCore::Perf::dump_buffer_pending.load(std::memory_order_relaxed) != 0) {
         DumpBuffers();
     }
@@ -1578,6 +1662,11 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
             return;
         }
     }
+    if (is_gds && VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        VideoCore::Perf::DrawLog(fmt::format("gds-fill f{} off {:#x} size {} value {:#x}",
+                                             VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                             address, num_bytes, value));
+    }
     const auto [buffer, offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
@@ -1608,6 +1697,12 @@ void Rasterizer::InlineData(VAddr address, const void* data, u32 num_bytes) {
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if ((dst_gds || src_gds) && VideoCore::Perf::draw_trace.load(std::memory_order_relaxed)) {
+        VideoCore::Perf::DrawLog(fmt::format("gds-copy f{} {} {:#x} -> {} {:#x} size {}",
+                                             VideoCore::Perf::gpu_frame.load(std::memory_order_relaxed),
+                                             src_gds ? "gds" : "mem", src, dst_gds ? "gds" : "mem", dst,
+                                             num_bytes));
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {

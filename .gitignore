@@ -421,3 +421,29 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# nhlport: the ready-to-run package is tracked (the VS template ignores [Rr]elease/), minus the data
+# the emulator and launcher create inside it
+!/release/
+/release/user/home/
+/release/user/log/
+/release/user/cache/
+/release/user/shader/
+/release/user/captures/
+/release/user/screenshots/
+/release/user/temp/
+/release/user/download/
+/release/user/game_data/
+/release/user/data/
+/release/user/trophy/
+/release/user/custom_modules/
+/release/user/custom_trophy/
+/release/user/fonts/
+/release/user/users.json
+/release/user/play_time.txt
+/release/user/imgui.ini
+/release/user/keys.json
+/release/user/game_path.txt
+/release/game/
+/release/game-UPDATE/
+/build/

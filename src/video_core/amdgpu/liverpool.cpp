@@ -19,7 +19,13 @@
 #include "video_core/perf_counters.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <thread>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace {
 // nhlport diagnostics: a queue fiber that spins on a wait for seconds means the game waits for
@@ -95,7 +101,32 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+// nhlport: packets consumed by the command processor; the processing loop backs off when a
+// full pass over the queues made no progress (every task is waiting on a label or the GPU).
+static u64 packets_processed = 0;
+
+static u32 GpuIdleBackoffUs() {
+    static const u32 value = [] {
+        if (const char* v = std::getenv("NHLPORT_GPU_IDLE_US"); v && *v) {
+            return static_cast<u32>(std::clamp(std::atoi(v), 0, 20000));
+        }
+        return 1000u;
+    }();
+    return value;
+}
+
+static void CpuRelax() {
+#if defined(_M_X64) || defined(__x86_64__)
+    for (int i = 0; i < 32; ++i) {
+        _mm_pause();
+    }
+#else
+    std::this_thread::yield();
+#endif
+}
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
+    ++packets_processed;
     if (offset > span.size()) {
         LOG_ERROR(
             Lib_GnmDriver,
@@ -130,6 +161,7 @@ void Liverpool::ProcessCommands() {
             --num_commands;
         }
         callback();
+        ++packets_processed;
     }
 }
 
@@ -153,8 +185,10 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        u32 idle_iterations = 0;
 
         while (num_submits || num_commands) {
+            const u64 progress_before = packets_processed;
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
@@ -180,6 +214,22 @@ void Liverpool::Process(std::stop_token stoken) {
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
+                ++packets_processed;
+            }
+
+            // Back off instead of spinning through the queues while nothing can make progress:
+            // first a few passes with pause instructions, then short waits that a new submit or
+            // command wakes up (label writes of guest threads are noticed at the next timeout).
+            if (packets_processed != progress_before) {
+                idle_iterations = 0;
+            } else if (const u32 idle_us = GpuIdleBackoffUs(); idle_us != 0) {
+                ++idle_iterations;
+                if (idle_iterations > num_mapped_queues * 64u) {
+                    std::unique_lock lk{submit_mutex};
+                    submit_cv.wait_for(lk, std::chrono::microseconds(idle_us));
+                } else if (idle_iterations > num_mapped_queues * 4u) {
+                    CpuRelax();
+                }
             }
         }
 

@@ -96,6 +96,14 @@ void Eventf(const char* category, fmt::format_string<Args...> format, Args&&... 
 
 /// User marker: the user saw something (glitch, flicker, stutter). The next frame row is flagged.
 void Marker(std::string note);
+/// Marker + screenshot + draw log of the next 3 frames + raw dump of the images bound to the UI
+/// composite dispatch (NHLPORT_DIAG_F1_CS = hex shader hash, default 0x2c569595, 0 = no dump).
+/// Raised by the F1 hotkey and by the file <user>/captures/capture (content = note).
+void ArmCapture(std::string note);
+/// True while a capture is pending and the compute shader is one of the composite shaders whose
+/// bound images the capture dumps (NHLPORT_DIAG_F1_CS = comma separated hex hashes; default: the
+/// NHL 24 UI composites 2c569595 and 5bb1bf02).
+bool CaptureMatchesDispatch(u64 pgm_hash);
 
 /// True once per marker: the present thread then requests a game screenshot for correlation.
 bool ConsumeMarkerScreenshot();

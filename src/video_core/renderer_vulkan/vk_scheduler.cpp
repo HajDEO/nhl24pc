@@ -5,7 +5,10 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <thread>
 #include "common/diag_log.h"
 #include "video_core/perf_counters.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -284,7 +287,26 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        work_semaphore.Wait(op.gpu_tick);
+        // nhlport: the driver's semaphore wait spins on the CPU; these operations (readback copies,
+        // screenshots) are not latency critical, so poll the GPU tick with short sleeps instead.
+        // NHLPORT_PENDING_POLL_US=0 restores the plain wait.
+        static const u32 poll_us = [] {
+            if (const char* v = std::getenv("NHLPORT_PENDING_POLL_US"); v && *v) {
+                return static_cast<u32>(std::clamp(std::atoi(v), 0, 20000));
+            }
+            return 500u;
+        }();
+        if (poll_us == 0) {
+            work_semaphore.Wait(op.gpu_tick);
+        } else {
+            while (!stoken.stop_requested() && !work_semaphore.IsFree(op.gpu_tick)) {
+                work_semaphore.Refresh();
+                if (work_semaphore.IsFree(op.gpu_tick)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(poll_us));
+            }
+        }
         if (stoken.stop_requested()) {
             break;
         }

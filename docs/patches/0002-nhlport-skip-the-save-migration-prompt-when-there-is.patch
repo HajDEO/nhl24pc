@@ -1,0 +1,71 @@
+From 9df799cf87be6191eb3fd59b2219a39b871d52f6 Mon Sep 17 00:00:00 2001
+From: nhlport <nhlport@localhost>
+Date: Wed, 7 Oct 2026 15:33:53 +0200
+Subject: [PATCH 2/8] nhlport: skip the save-migration prompt when there is
+ nothing to migrate; CopyImageWithBuffer copies the common subresources
+ instead of asserting on layer/mip mismatch
+
+---
+ src/core/user_manager.cpp                     | 21 ++++++++++++++++++-
+ src/video_core/renderer_vulkan/vk_runtime.cpp | 13 +++++++++++-
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/user_manager.cpp b/src/core/user_manager.cpp
+index 069df972..a6204481 100644
+--- a/src/core/user_manager.cpp
++++ b/src/core/user_manager.cpp
+@@ -297,7 +297,26 @@ Users UserManager::CreateDefaultUsers() {
+             std::filesystem::create_directory(user_dir / "trophy");
+             std::filesystem::create_directory(user_dir / "inputs");
+             if (u.user_id == 1000) {
+-                TransferOption user_choice = AskMigrationOption();
++                // nhlport: only interrupt the start with the migration dialog when there is
++                // something to migrate; a fresh portable user directory has nothing.
++                const auto old_save_dir =
++                    Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "savedata" / "1";
++                const auto old_trophy_dir =
++                    Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "game_data";
++                const bool old_saves = fs::exists(old_save_dir) && !fs::is_empty(old_save_dir);
++                bool old_trophies = false;
++                if (fs::exists(old_trophy_dir)) {
++                    for (auto const& entry : fs::directory_iterator(old_trophy_dir)) {
++                        if (entry.is_directory() && fs::exists(entry.path() / "TrophyFiles")) {
++                            old_trophies = true;
++                            break;
++                        }
++                    }
++                }
++                TransferOption user_choice = TransferOption::Nothing;
++                if (old_saves || old_trophies) {
++                    user_choice = AskMigrationOption();
++                }
+                 CheckAndMigrateSaves(user_choice);
+                 CheckAndMigrateTrophies(user_choice);
+             }
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 59222f54..1368edf7 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -325,7 +325,18 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
+                                   const VideoCore::Buffer* buffer, u64 offset) {
+     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
+-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
++    // nhlport: NHL 24 (Frostbite) copies between images whose layer or mip counts differ
++    // (a slice of an array / the top level of a mip chain). Copy the common part (mip 0,
++    // the shared layers) instead of asserting; the copy below never exceeded this size.
++    if (src->info.resources.layers != dst->info.resources.layers || num_mips != 1) {
++        LOG_WARNING(Render_Vulkan,
++                    "Partial image copy through buffer: src {}x{}x{} layers {} mips {} -> dst "
++                    "{}x{}x{} layers {} mips {}",
++                    src->info.size.width, src->info.size.height, src->info.size.depth,
++                    src->info.resources.layers, src->info.resources.levels, dst->info.size.width,
++                    dst->info.size.height, dst->info.size.depth, dst->info.resources.layers,
++                    dst->info.resources.levels);
++    }
+ 
+     SetBackingSamples(dst, dst->info.num_samples, false);
+     SetBackingSamples(src, src->info.num_samples);
+-- 
+2.55.0.windows.2
+

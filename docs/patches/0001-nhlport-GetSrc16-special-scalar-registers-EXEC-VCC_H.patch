@@ -1,0 +1,111 @@
+From e5c4ed6b31596dc25ea80ea71103120617e2e6b6 Mon Sep 17 00:00:00 2001
+From: nhlport <nhlport@localhost>
+Date: Wed, 7 Oct 2026 15:00:27 +0200
+Subject: [PATCH 1/8] nhlport: GetSrc16 special scalar registers
+ (EXEC/VCC_HI/M0/SCC); libSceLibcInternal imports fall back to the game's
+ libc.prx
+
+---
+ src/core/linker.cpp                           | 31 ++++++++++++++++
+ .../frontend/translate/translate.cpp          | 36 +++++++++++++++----
+ 2 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/src/core/linker.cpp b/src/core/linker.cpp
+index 8251e5b1..6e7256b1 100644
+--- a/src/core/linker.cpp
++++ b/src/core/linker.cpp
+@@ -439,6 +439,37 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
+         }
+     }
+ 
++    // nhlport: libSceLibcInternal and the libc.prx shipped with a game share one implementation
++    // and export the same NIDs. Without a firmware libSceLibcInternal.sprx, imports that the HLE
++    // library does not cover (NHL 24's Fios2/Face/Hand/NpToolkit2/S3DConversion modules need 36
++    // of them) are served by the game's own libc.prx instead of a stub that returns zero.
++    if (library->name == "libSceLibcInternal") {
++        for (const auto& mod : m_modules) {
++            if (mod->export_sym.GetSize() == 0) {
++                continue;
++            }
++            for (const auto& lib : mod->GetExportLibs()) {
++                if (lib.name != "libc") {
++                    continue;
++                }
++                for (const auto& exp_mod : mod->GetExportModules()) {
++                    Loader::SymbolResolver alt = sr;
++                    alt.library = lib.name;
++                    alt.library_version = lib.version;
++                    alt.module = exp_mod.name;
++                    record = mod->export_sym.FindSymbol(alt);
++                    if (record) {
++                        LOG_INFO(Core_Linker,
++                                 "Linker: libSceLibcInternal import {} ({}) served by libc.prx {}",
++                                 sr.name, record->symbol.nidName, mod->file.filename().string());
++                        *return_info = *record;
++                        return true;
++                    }
++                }
++            }
++        }
++    }
++
+     const auto aeronid = AeroLib::FindByNid(sr.name.c_str());
+     if (sym_type == Loader::SymbolType::Object) {
+         return_info->symbol.nidName = aeronid ? aeronid->name : "Unknown object";
+diff --git a/src/shader_recompiler/frontend/translate/translate.cpp b/src/shader_recompiler/frontend/translate/translate.cpp
+index ed2a5b67..55904bf9 100644
+--- a/src/shader_recompiler/frontend/translate/translate.cpp
++++ b/src/shader_recompiler/frontend/translate/translate.cpp
+@@ -507,6 +507,17 @@ T Translator::GetSrc16(const InstOperand& operand) {
+ 
+     const auto op_sel = operand.op_sel.op_sel;
+ 
++    // nhlport: 16-bit reads of the special scalar registers (VCC, M0, SCC, EXEC) select a half of
++    // the 32-bit register value like a scalar GPR does.
++    const auto from_u32 = [&](const IR::U32& u) -> T {
++        if constexpr (is_float) {
++            return IR::F32{ir.CompositeExtract(ir.Unpack2x16(number_format, u), op_sel ? 1 : 0)};
++        } else {
++            return cast(
++                IR::F32{ir.CompositeExtract(ir.Unpack2x16(number_format, u), op_sel ? 1 : 0)});
++        }
++    };
++
+     T value{};
+     switch (operand.field) {
+     case OperandField::ScalarGPR: {
+@@ -569,13 +580,24 @@ T Translator::GetSrc16(const InstOperand& operand) {
+         value = get_imm(0U);
+         break;
+     case OperandField::VccLo:
+-        if constexpr (is_float) {
+-            value = IR::F32{
+-                ir.CompositeExtract(ir.Unpack2x16(number_format, ir.GetVccLo()), op_sel ? 1 : 0)};
+-        } else {
+-            value = cast(IR::F32{ir.CompositeExtract(
+-                ir.Unpack2x16(number_format, bitcast_to_u(ir.GetVccLo())), op_sel ? 1 : 0)});
+-        }
++        value = from_u32(ir.GetVccLo());
++        break;
++    case OperandField::VccHi:
++        value = from_u32(ir.GetVccHi());
++        break;
++    case OperandField::M0:
++        value = from_u32(ir.GetM0());
++        break;
++    case OperandField::Scc:
++        value = from_u32(IR::U32{ir.Select(ir.GetScc(), ir.Imm32(1u), ir.Imm32(0u))});
++        break;
++    case OperandField::ExecLo:
++        value = from_u32(
++            IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(ir.GetExec())), 0)});
++        break;
++    case OperandField::ExecHi:
++        value = from_u32(
++            IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(ir.GetExec())), 1)});
+         break;
+     default:
+         UNREACHABLE_MSG("Unexpected operand: {}", std::to_underlying(operand.field));
+-- 
+2.55.0.windows.2
+

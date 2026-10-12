@@ -46,6 +46,12 @@ inline std::mutex dump_mutex;
 inline std::vector<u64> dump_image_addrs;
 inline std::vector<u32> dump_image_draws; ///< per address: 0 = first binding, N = after N-th target draw
 inline std::atomic<u32> dump_pending{0};
+/// nhlport: hotkey capture (F1 with diagnostics on, sdl_window.cpp): draw log for the next N frames
+/// and a raw dump of every image bound to the next dispatch of the compute shader with this hash
+/// (the UI composite by default).
+inline std::atomic<u32> trace_request{0};
+inline std::atomic<u64> dump_cs_hash{0};
+inline std::atomic<u32> dump_cs_pending{0};
 /// nhlport: "addr:N" requests only start counting target draws from this gpu frame on, so the
 /// N-th draw is the N-th one of a frame regardless of when the trigger file was noticed.
 inline std::atomic<u64> dump_start_frame{0};
