@@ -62,8 +62,7 @@ extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatical
 too.
 
 **Known issues** (v0.8.1): occasional black tile columns in cutscenes that run at a dynamic resolution
-(analysis and next steps in `docs/DEVLOG.sk.md`, section "Finálny build v0.8.1"); untextured white light
-sticks in the crowd; rare "device lost" crashes. Windows SmartScreen may warn about the unsigned exe
+(analysis and next steps in `docs/DEVLOG.sk.md`, section "Finálny build v0.8.1"); rare "device lost" crashes. Windows SmartScreen may warn about the unsigned exe
 (More info → Run anyway); some antivirus products dislike emulators that map large memory regions – add
 an exception if needed.
 
@@ -132,7 +131,7 @@ shaderov), potom beží plynulo.
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
 **Známe problémy (v0.8.1):** občasné čierne stĺpce dlaždíc v prestrihoch s dynamickým rozlíšením
-(rozbor v `docs/DEVLOG.sk.md`), netextúrované biele svietiace tyče divákov, zriedkavé pády „device lost“.
+(rozbor v `docs/DEVLOG.sk.md`), zriedkavé pády „device lost“.
 
 **Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,
 skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Build: `tools\build_nhlport.ps1`,
