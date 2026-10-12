@@ -6,10 +6,11 @@ that extracts the game from your own PKG and starts it. No console, no CPU emula
 code runs directly on your processor, the PS4 system libraries are replaced by native Windows
 implementations, and the GPU work goes through Vulkan.
 
-> Slovenská verzia je nižšie: [Slovensky](#slovensky).
+> Slovenská verzia je nižšie: [Slovensky](#slovensky). Video: https://youtu.be/eGo1-W3FaYw
 
 | | |
 |---|---|
+| Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
 | Current build | **v0.8.1** (2026-10-12), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG (base v01.00, optionally the update), a Vulkan 1.3 GPU |
@@ -119,6 +120,8 @@ launcher, ktorý hru rozbalí z vášho PKG a spustí. Kód hry (x86-64) beží 
 CPU; systémové knižnice PS4 sú nahradené natívnou implementáciou (HLE) a grafika ide cez Vulkan
 s prekladom shaderov GCN → SPIR-V.
 
+**Video:** https://youtu.be/eGo1-W3FaYw
+
 **Hranie:** stiahnite repozitár (Code → Download ZIP), skopírujte priečinok `release` niekam, kde
 môžete zapisovať, spustite `launcher.exe`, cez **Install PKG** vyberte PKG hry (najprv základná hra
 v01.00, potom prípadne update) – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**.
@@ -134,3 +137,11 @@ asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tie
 **Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,
 skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Build: `tools\build_nhlport.ps1`,
 `launcher\build_launcher.ps1`, balík: `tools\make_release.ps1`.
+
+---
+
+## Support / Podpora
+
+If this project is useful to you, you can support its development:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/E1E61VGHII)
