@@ -41,10 +41,17 @@ CPU directly, at native speed. What the emulator provides is everything around i
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
   fullscreen, vsync, sharpening, language, controls) and starts the game.
 
+## Support / Podpora
+
+If this project is useful to you, you can support its development:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/E1E61VGHII)
+
 ## Playing
 
-1. Download the repository (green **Code → Download ZIP**, or clone) and copy the `release` folder
-   anywhere you can write to, e.g. `D:\Games\NHL24-PC`. Keep its contents together.
+1. Download the repository (green **Code → Download ZIP**), unpack the ZIP and open its `release`
+   folder – everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
+   unpacked folder somewhere you can write to (not Program Files).
 2. Start `launcher.exe`. Click **Install PKG** and pick your NHL 24 package: the base game (v01.00) first,
    then, optionally, the update PKG. The launcher checks the title ID (CUSA37933) and the kind of package,
    shows size and version, and extracts into `game\` (update into `game-UPDATE\`) next to the launcher,
@@ -121,8 +128,8 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
-**Hranie:** stiahnite repozitár (Code → Download ZIP), skopírujte priečinok `release` niekam, kde
-môžete zapisovať, spustite `launcher.exe`, cez **Install PKG** vyberte PKG hry (najprv základná hra
+**Hranie:** stiahnite repozitár (Code → Download ZIP), rozbaľte ho a prejdite do priečinka `release`
+(všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG hry (najprv základná hra
 v01.00, potom prípadne update) – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**.
 Uložené pozície, profil a shader cache vznikajú v `user\`; prvé minúty sa hra zasekáva (kompilácia
 shaderov), potom beží plynulo.
@@ -136,11 +143,3 @@ asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tie
 **Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,
 skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Build: `tools\build_nhlport.ps1`,
 `launcher\build_launcher.ps1`, balík: `tools\make_release.ps1`.
-
----
-
-## Support / Podpora
-
-If this project is useful to you, you can support its development:
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/E1E61VGHII)
