@@ -4,8 +4,8 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\build_nhlport.ps1            # Release
 #   powershell ... -File tools\build_nhlport.ps1 -Config RelWithDebInfo -Clean
 param(
-    [string]$Source = (Join-Path $PSScriptRoot '..\nhlport'),
-    [string]$Build = (Join-Path $PSScriptRoot '..\nhlport\build'),
+    [string]$Source = (Join-Path $PSScriptRoot '..'),
+    [string]$Build = (Join-Path $PSScriptRoot '..\build'),
     [ValidateSet('Release', 'RelWithDebInfo', 'Debug')]
     [string]$Config = 'Release',
     [switch]$Clean,

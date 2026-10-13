@@ -12,7 +12,7 @@ implementations, and the GPU work goes through Vulkan.
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.8.1** (2026-10-12), Windows 10/11 x64 |
+| Current build | **v0.8.2** (2026-10-14), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG (base v01.00, optionally the update), a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -61,7 +61,7 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.8.1): occasional black tile columns in cutscenes that run at a dynamic resolution
+**Known issues** (v0.8.2): occasional black tile columns in cutscenes that run at a dynamic resolution
 (analysis and next steps in `docs/DEVLOG.sk.md`, section "Finálny build v0.8.1"); rare "device lost" crashes. Windows SmartScreen may warn about the unsigned exe
 (More info → Run anyway); some antivirus products dislike emulators that map large memory regions – add
 an exception if needed.
@@ -130,7 +130,7 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.8.1):** občasné čierne stĺpce dlaždíc v prestrihoch s dynamickým rozlíšením
+**Známe problémy (v0.8.2):** občasné čierne stĺpce dlaždíc v prestrihoch s dynamickým rozlíšením
 (rozbor v `docs/DEVLOG.sk.md`), zriedkavé pády „device lost“.
 
 **Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,

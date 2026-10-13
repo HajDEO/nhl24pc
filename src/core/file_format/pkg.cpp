@@ -195,7 +195,7 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
         }
 
         {
-            Common::FS::IOFile out(out_path, Common::FS::FileAccessMode::Write);
+            Common::FS::IOFile out(out_path, Common::FS::FileAccessMode::Create);
             if (!out.IsOpen()) {
                 failreason = "Cannot write " + out_path.string();
                 return false;
@@ -218,7 +218,7 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
             crypto.ivKeyHASH256(concatenated_ivkey_dk3_, ivKey);
             crypto.aesCbcCfb128Decrypt(ivKey, data, decNp);
             decNp.resize(rsize);
-            Common::FS::IOFile out(out_path, Common::FS::FileAccessMode::Write);
+            Common::FS::IOFile out(out_path, Common::FS::FileAccessMode::Create);
             out.Write(decNp);
         }
 
@@ -411,7 +411,7 @@ bool PKG::ExtractFiles(int index, std::string& failreason, const Progress& progr
     const auto out_path = extractPaths[inode_number];
     std::error_code ec;
     std::filesystem::create_directories(out_path.parent_path(), ec);
-    Common::FS::IOFile inflated(out_path, Common::FS::FileAccessMode::Write);
+    Common::FS::IOFile inflated(out_path, Common::FS::FileAccessMode::Create);
     if (!inflated.IsOpen()) {
         failreason = "Cannot write " + out_path.string();
         return false;
