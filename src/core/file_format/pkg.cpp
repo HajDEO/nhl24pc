@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <zlib.h>
+#include <fmt/format.h>
 #include "common/io_file.h"
 #include "core/file_format/pkg.h"
 #include "core/file_format/pkg_type.h"
@@ -278,13 +282,23 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
     std::vector<char> compressedData;
     std::vector<char> decompressedData(0x10000);
 
-    // Get iNodes and Dirents.
+    // Get iNodes and Dirents. The metadata (super block, inodes, dirents) sits in front of the
+    // file data, so the walk stops at the first block that belongs to a file, and never runs past
+    // the part of the cache that was actually read (the tail of `pfsc` is zero filled).
+    const u64 cached_valid = length - pfsc_offset;
+    u64 first_data_block = std::numeric_limits<u64>::max();
+    const bool trace = std::getenv("NHLPORT_PKG_TRACE") != nullptr;
     for (u64 i = 0; i < num_blocks; i++) {
+        if (i >= first_data_block) {
+            if (trace) {
+                std::fprintf(stderr, "pfs: stop at block %llu (first data block)\n", (unsigned long long)i);
+            }
+            break;
+        }
         const u64 sectorOffset = sectorMap[i];
         const u64 sectorSize = sectorMap[i + 1] - sectorOffset;
-        if (sectorOffset + sectorSize > pfsc.size()) {
-            failreason = "PFS sector map points outside the cached image";
-            return false;
+        if (sectorOffset + sectorSize > cached_valid) {
+            break;
         }
 
         compressedData.resize(sectorSize);
@@ -294,13 +308,25 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
             std::memcpy(decompressedData.data(), compressedData.data(), 0x10000);
         } else if (sectorSize < 0x10000) { // Compressed data
             if (!DecompressPFSC(compressedData, decompressedData)) {
-                failreason = "zlib failed on a PFS metadata block";
+                failreason = fmt::format(
+                    "zlib failed on a PFS metadata block (block {} of {}, offset {:#x} size {:#x}, "
+                    "cached {:#x} of which valid {:#x}, pfsc at {:#x}, inodes {} ({} read), dirents {}, "
+                    "first bytes {:02x} {:02x} {:02x} {:02x})",
+                    i, num_blocks, sectorOffset, sectorSize, pfsc.size(), length - pfsc_offset,
+                    pfsc_offset, ndinode, iNodeBuf.size(), fsTable.size(),
+                    u8(compressedData[0]), u8(compressedData[1]), u8(compressedData[2]),
+                    u8(compressedData[3]));
                 return false;
             }
         }
 
         if (i == 0) {
             std::memcpy(&ndinode, decompressedData.data() + 0x30, 4); // number of folders and files
+        }
+        if (trace) {
+            std::fprintf(stderr, "pfs: block %llu off %#llx size %#llx bytes@0x10 '%.15s' counter %d inodes %zu dirents %zu\n",
+                         (unsigned long long)i, (unsigned long long)sectorOffset, (unsigned long long)sectorSize,
+                         &decompressedData[0x10], ndinode_counter, iNodeBuf.size(), fsTable.size());
         }
 
         u64 occupied_blocks = (static_cast<u64>(ndinode) * 0xA8) / 0x10000;
@@ -331,16 +357,14 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
                 Dirent dirent;
                 std::memcpy(&dirent, &decompressedData[k], sizeof(dirent));
                 ent_size = dirent.entsize;
-                if (ent_size == 0) {
-                    break;
-                }
-                if (dirent.ino != 0) {
-                    ndinode_counter++;
-                } else {
+                // The root listing ends with a zeroed entry (ino 0, or no entsize at all): that
+                // entry maps the uroot folder onto the extraction folder and ends the root phase.
+                if (dirent.ino == 0 || ent_size == 0) {
                     extractPaths[ndinode_counter] = extract_path;
                     uroot_reached = false;
                     break;
                 }
+                ndinode_counter++;
             }
         }
 
@@ -365,6 +389,14 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
                 table.name = std::string(dirent.name, std::min<s32>(dirent.namelen, 511));
                 table.inode = dirent.ino;
                 table.type = dirent.type;
+                if (trace) {
+                    std::fprintf(stderr, "pfs:   dirent ino %u type %u '%s'%s\n", dirent.ino, dirent.type,
+                                 table.name.c_str(),
+                                 (table.inode < iNodeBuf.size())
+                                     ? fmt::format(" loc {} blocks {} size {}", iNodeBuf[table.inode].loc,
+                                                   iNodeBuf[table.inode].Blocks, iNodeBuf[table.inode].Size).c_str()
+                                     : "");
+                }
 
                 if (table.type == PFS_CURRENT_DIR) {
                     auto it = extractPaths.find(table.inode);
@@ -376,8 +408,12 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
                     if (table.type == PFS_DIR) {
                         std::filesystem::create_directories(extractPaths[table.inode], ec);
                     }
+                    if (table.type == PFS_FILE && table.inode < iNodeBuf.size() &&
+                        iNodeBuf[table.inode].Blocks != 0) {
+                        first_data_block = std::min(first_data_block, static_cast<u64>(iNodeBuf[table.inode].loc));
+                    }
                     ndinode_counter++;
-                    if ((ndinode_counter + 1) == static_cast<int>(ndinode)) { // 1 for the root
+                    if ((ndinode_counter + 1) >= static_cast<int>(ndinode)) { // 1 for the root
                         end_reached = true;
                     }
                 }
@@ -386,6 +422,10 @@ bool PKG::Extract(const std::filesystem::path& filepath, const std::filesystem::
                 break;
             }
         }
+    }
+    if (iNodeBuf.size() < ndinode) {
+        failreason = fmt::format("PFS metadata incomplete ({} of {} inodes read)", iNodeBuf.size(), ndinode);
+        return false;
     }
     return true;
 }
