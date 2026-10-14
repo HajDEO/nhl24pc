@@ -1,5 +1,59 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.8.3: ochrana red zone v launcheri (2026-10-14, issues #1 a #3)
+
+**Pád pri načítaní zápasu (0xc0000005 hneď po výbere tímov, v0.8.2, hra v01.00).** Všetky
+štyri nahlásené adresy (tri behy v issue #3, jeden v issue #1) sú ten istý offset v `eboot.bin`:
+báza modulu v logu reportéra je 0x5cc0000, pád na 0xc2ef83f, teda offset 0x662f83f (bázy sa
+líšia len o násobky 64 KB). Inštrukcia je `mov rbx,[rbx]` v listovej funkcii od 0x662f7a0
+(capstone cez SELF segment PT_LOAD[0] na file offsete 0x51400), ktorá si lokálne hodnoty drží
+v red zone pod RSP (`[rsp-0x28]` … `[rsp-0x8]`): na začiatku každej iterácie slučky načíta rbx
+z `[rsp-0x28]` a rdx z `[rsp-0x20]` a cez rbx hneď dereferencuje. Dump reportéra: RBX=0, RDX=0,
+presne tie dve hodnoty z red zone. Telo slučky zapisuje do bufferov (`mov word [..]`,
+`inc word [..]`, `vmovss [..]`; vyzerá to ako Frostbite job, ktorý skladá bucketované u16 index
+listy s počítadlami a min hĺbkou), teda do pamäte, ktorú buffer cache stráži cez page protection
+(`src/video_core/page_manager.cpp`, `GuestFaultSignalHandler`). Prvý CPU zápis do chránenej
+stránky vyvolá access violation; Windows kernel pri dispatchi výnimky zapíše CONTEXT a
+EXCEPTION_RECORD pod RSP (Win64 ABI red zone nemá), čím `[rsp-0x28]` prepíše; handler stránku
+odomkne a pokračuje, ďalšia iterácia načíta 0 a padne. Preto je to u reportérov 100 %
+reprodukovateľné na jednom mieste a u nás nie (či je stránka práve chránená, závisí od GPU,
+ovládača a časovania). Hlášky tesne pred pádom (ResolveOverlap Bc5/Bc3, depth-recreate
+ping-pong 512x256 R16/D16, chýbajúce `.lreq` v `/download0`) sú identické s funkčným behom,
+verzia hry je rovnaká (01.00) a v logu reportéra nechýba žiadny súbor oproti nášmu, takže
+PKG extrakcia z v0.8.2 príčinou nie je.
+
+**Riešenie.** Upstream shadPS4 má presne na toto opt-in „Windows static guest red-zone
+protection" (commit dff1aad0, PR #4802, august 2026): `src/core/cpu_patches.cpp`, namespace
+`WindowsGuestRedZoneProtection`, analyzuje funkcie podľa EH dát (eboot má `PT_GNU_EH_FRAME`,
+`src/core/module.cpp`) a inštrukcie, ktoré môžu vyvolať page fault, presmeruje cez trampolíny,
+ktoré najprv posunú RSP pod red zone. Zapína ju kľúč `General.redzone_patches` v
+`user\config.json` (`src/core/emulator_settings.h`, predvolene `false`), vyhodnocuje sa pri
+štarte v `src/emulator.cpp` (len Windows, vyžaduje reštart hry). V emulátore sa nič nemenilo.
+Launcher (`launcher/Launcher.cs`, Rýchle nastavenia pod jazykom) dostal prepínač **Ochrana red
+zone (Windows)** s popisom; zapisuje len `General.redzone_patches`, ostatné kľúče sekcie
+`General` necháva tak (`GeneralValue` / `ToBool`), v súhrne dole pribudne „Red zone ✓". Predvolene
+vypnuté, shipnutý `release/user/config.json` ostáva `false`. README (EN aj SK, známe problémy)
+a README.txt balíka (bod 4) hovoria, kedy to zapnúť.
+
+**Overenie (lokálne, RTX 5060):** s `redzone_patches = true` hra nabootovala (prvý frame po 64 s),
+prešla cez miesto pádu (v `shad_log.txt` idú za sebou `loadingstrings.lreq` → depth-recreate
+512x256 → `overlays_20.big`; v logu reportéra `overlays_20.big` už neprišiel) a CPU vs CPU zápas
+bežal až do zatvorenia okna (193 s, 4533 snímok, žiadny `Failed to patch`, žiadne `<Critical>`).
+FPS v hre 41–47 (medián 16,6–16,9 ms) oproti 45–57 (medián 16,6–17,0 ms) v behu z 12. 10., teda
+bez zjavného spomalenia v 60 s vzorke (nie je to presné meranie, iná fáza zápasu). Logy:
+`logs/redzone-20261014-230731.*`. Priebeh testu: `build\nhl24.exe` s `NHLPORT_DIAG=1`, klávesy
+n, n, n, c (+40/+50/+60/+66 s od prvého framu) cez `keybd_event`, čakanie na prvé
+`-> 2048x1024` v `nhl24_diag.log`, 60 s hry, `CloseMainWindow`; `build\user\config.json` sa po
+teste vrátil na `false`. Skripty `tools\measure_nhl24.ps1` a `tools\run_nhl24.ps1` rátajú
+s umiestnením v `NHL_PC\tools` (cesty `..\nhlport\build`), po presune do repa ich treba
+opraviť alebo volať s parametrami.
+
+**Verzia 0.8.3** (`src/common/port_version.h`, `launcher/Launcher.cs` FallbackVersion, README). README
+(EN aj SK), README.txt balíka a hint pri „Install from PKG" v launcheri navyše upozorňujú, že sa má
+inštalovať len základná hra v01.00 a žiadny update: s update 1.6 hra zamrzne pri prvom vhadzovaní
+(issue #1; nerozoberané). `tools/make_release.ps1` dostal UTF-8 BOM: Windows PowerShell ho bez BOM čítal
+v ANSI kódovaní a slovenský text v README.txt balíka bol od v0.8.1 rozbitý (zĂˇkladnej).
+
 ## Diagnostický log (build 62, 2026-10-12)
 
 Každý beh `nhl24.exe` zapisuje popri `shad_log.txt` do `nhlport\build\user\log\` tri súbory
