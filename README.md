@@ -12,7 +12,7 @@ implementations, and the GPU work goes through Vulkan.
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.8.2** (2026-10-14), Windows 10/11 x64 |
+| Current build | **v0.8.3** (2026-10-14), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG (base v01.00, optionally the update), a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -39,7 +39,7 @@ CPU directly, at native speed. What the emulator provides is everything around i
 - **Launcher** (`launcher/`, C# WinForms, needs only the .NET Framework 4 that ships with Windows):
   extracts the base/update PKG with shadPS4's PKG/PFS code built into `nhl24.exe`
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
-  fullscreen, vsync, sharpening, language, controls) and starts the game.
+  fullscreen, vsync, sharpening, language, controls, the Windows red-zone protection) and starts the game.
 
 ## Support / Podpora
 
@@ -52,10 +52,10 @@ If this project is useful to you, you can support its development:
 1. Download the repository (green **Code → Download ZIP**), unpack the ZIP and open its `release`
    folder – everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
-2. Start `launcher.exe`. Click **Install PKG** and pick your NHL 24 package: the base game (v01.00) first,
-   then, optionally, the update PKG. The launcher checks the title ID (CUSA37933) and the kind of package,
-   shows size and version, and extracts into `game\` (update into `game-UPDATE\`) next to the launcher,
-   with progress.
+2. Start `launcher.exe`. Click **Install PKG** and pick your NHL 24 **base game** package (v01.00).
+   **Do not install the update PKG**: the port needs game version 1.00; with the 1.6 update the game
+   freezes at the first puck drop (issue #1). The launcher checks the title ID (CUSA37933) and the kind
+   of package, shows size and version, and extracts into `game\` next to the launcher, with progress.
 3. Press **PLAY**. Simple view = the settings most people touch; Advanced = everything, including the
    keyboard mapping and the game folder.
 
@@ -68,8 +68,12 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.8.2): occasional black tile columns in cutscenes that run at a dynamic resolution
-(analysis and next steps in `docs/DEVLOG.sk.md`, section "Finálny build v0.8.1"); rare "device lost" crashes. Windows SmartScreen may warn about the unsigned exe
+**Known issues** (v0.8.3): the 1.6 update freezes at the first puck drop (use the base game v01.00 only);
+occasional black tile columns in cutscenes that run at a dynamic resolution
+(analysis and next steps in `docs/DEVLOG.sk.md`, section "Finálny build v0.8.1"); rare "device lost" crashes. If the game
+crashes while a match loads (right after team selection, error 0xc0000005, issues #1/#3), turn on **Red zone
+protection (Windows)** in the launcher's quick settings (off by default, experimental; see `docs/DEVLOG.sk.md`,
+section "v0.8.3: ochrana red zone"). Windows SmartScreen may warn about the unsigned exe
 (More info → Run anyway); some antivirus products dislike emulators that map large memory regions – add
 an exception if needed.
 
@@ -129,16 +133,20 @@ s prekladom shaderov GCN → SPIR-V.
 **Video:** https://youtu.be/eGo1-W3FaYw
 
 **Hranie:** stiahnite repozitár (Code → Download ZIP), rozbaľte ho a prejdite do priečinka `release`
-(všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG hry (najprv základná hra
-v01.00, potom prípadne update) – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**.
+(všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
+– hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. **Update (patch) neinštalujte**: port potrebuje
+verziu hry 1.00, s update 1.6 hra zamrzne pri prvom vhadzovaní (issue #1).
 Uložené pozície, profil a shader cache vznikajú v `user\`; prvé minúty sa hra zasekáva (kompilácia
 shaderov), potom beží plynulo.
 
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.8.2):** občasné čierne stĺpce dlaždíc v prestrihoch s dynamickým rozlíšením
-(rozbor v `docs/DEVLOG.sk.md`), zriedkavé pády „device lost“.
+**Známe problémy (v0.8.3):** update 1.6 zamrzne pri prvom vhadzovaní (používajte len základnú hru v01.00);
+občasné čierne stĺpce dlaždíc v prestrihoch s dynamickým rozlíšením
+(rozbor v `docs/DEVLOG.sk.md`), zriedkavé pády „device lost“. Ak hra padá pri načítaní zápasu (hneď po
+výbere tímov, chyba 0xc0000005), zapnite v launcheri **Ochrana red zone (Windows)** (predvolene vypnuté,
+experimentálne; rozbor v `docs/DEVLOG.sk.md`, sekcia „v0.8.3: ochrana red zone“).
 
 **Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,
 skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Build: `tools\build_nhlport.ps1`,

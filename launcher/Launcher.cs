@@ -5,6 +5,7 @@
 //   Advanced – keyboard bindings over a DualShock 4 picture and the full display settings
 // Writes the port's own files:
 //   user\config.json              (GPU section: window size, fullscreen, present mode, FSR/RCAS;
+//                                  General section: redzone_patches (Windows red-zone protection);
 //                                  Launcher section: language)
 //   user\input_config\default.ini (keyboard bindings; controller bindings stay 1:1)
 //   user\game_path.txt            (eboot.bin of a game folder other than game\ next to the exe)
@@ -49,8 +50,8 @@ namespace NhlPort
             { "game_folder", new[] { "Priečinok hry", "Game folder" } },
             { "browse", new[] { "Prehľadávať…", "Browse…" } },
             { "install_pkg", new[] { "Inštalovať z PKG…", "Install from PKG…" } },
-            { "pkg_req", new[] { "Vyžaduje PKG hry NHL 24 (title ID CUSA37933): základná hra v01.00 ide do priečinka hry, aktualizácia (patch) do {0}-UPDATE.",
-                                  "Requires an NHL 24 package (title ID CUSA37933): the base game v01.00 goes into the game folder, an update (patch) into {0}-UPDATE." } },
+            { "pkg_req", new[] { "Potrebuje PKG základnej hry NHL 24 v01.00 (CUSA37933). Update neinštaluj: s v1.6 hra zamrzne pri prvom vhadzovaní.",
+                                  "Needs the NHL 24 base game PKG v01.00 (CUSA37933). Do not install the update: v1.6 freezes at the first puck drop." } },
             { "output", new[] { "Výstup", "Output" } },
             { "display_mode", new[] { "Režim zobrazenia", "Display mode" } },
             { "windowed", new[] { "Okno", "Windowed" } },
@@ -63,6 +64,10 @@ namespace NhlPort
             { "sharpness", new[] { "Zaostrenie", "Sharpness" } },
             { "vsync", new[] { "VSync", "VSync" } },
             { "vsync_desc", new[] { "Synchronizácia s obnovovacou frekvenciou (bez trhania, mierne vyššia odozva).", "Synchronises with the refresh rate (no tearing, slightly more input lag)." } },
+            { "redzone", new[] { "Ochrana red zone (Windows)", "Red zone protection (Windows)" } },
+            { "redzone_desc", new[] { "Experimentálna oprava pádu pri načítaní zápasu (chyba 0xc0000005 hneď po výbere tímov). Zapni, ak ti hra takto padá; môže mierne znížiť výkon. Platí od ďalšieho spustenia.",
+                                      "Experimental fix for the crash while a match loads (error 0xc0000005 right after team selection). Turn it on if the game crashes like that; may cost a little performance. Takes effect on the next start." } },
+            { "redzone_short", new[] { "Red zone ✓", "Red zone ✓" } },
             { "lang", new[] { "Jazyk launchera", "Launcher language" } },
             { "play", new[] { "HRAŤ", "PLAY" } },
             { "save", new[] { "Uložiť", "Save" } },
@@ -457,7 +462,7 @@ namespace NhlPort
     // ------------------------------------------------------------------ the form
     public class LauncherForm : Form
     {
-        const string FallbackVersion = "0.8.2";
+        const string FallbackVersion = "0.8.3";
         string PortVersion = FallbackVersion; // taken from the version resource of nhl24.exe when present
         const string TitleId = "CUSA37933";
         readonly string baseDir;
@@ -484,6 +489,7 @@ namespace NhlPort
         GlassSlider sharpBar;
         TransparentLabel sharpValue, pkgReqLabel, summaryLabel, versionLabel, gameVersionLabel, statusLabel;
         CheckBox vsyncQuick;
+        CheckBox redzoneQuick;
         ImageButton playButton;
         FlatButton simpleBtn, advancedBtn;
         // pkg progress
@@ -840,10 +846,13 @@ namespace NhlPort
                 config["GPU"] = new Dictionary<string, object>();
             if (!config.ContainsKey("Launcher") || !(config["Launcher"] is Dictionary<string, object>))
                 config["Launcher"] = new Dictionary<string, object>();
+            if (!config.ContainsKey("General") || !(config["General"] is Dictionary<string, object>))
+                config["General"] = new Dictionary<string, object>();
         }
 
         Dictionary<string, object> Gpu { get { return (Dictionary<string, object>)config["GPU"]; } }
         Dictionary<string, object> Launcher { get { return (Dictionary<string, object>)config["Launcher"]; } }
+        Dictionary<string, object> General { get { return (Dictionary<string, object>)config["General"]; } }
 
         object GpuValue(string key, object fallback)
         {
@@ -855,6 +864,22 @@ namespace NhlPort
         {
             object v;
             return Launcher.TryGetValue(key, out v) ? v : fallback;
+        }
+
+        // General section of the emulator: only redzone_patches is edited, the other keys are kept as they are
+        object GeneralValue(string key, object fallback)
+        {
+            object v;
+            return General.TryGetValue(key, out v) ? v : fallback;
+        }
+
+        static bool ToBool(object value, bool fallback)
+        {
+            if (value == null) return fallback;
+            if (value is bool) return (bool)value;
+            bool b;
+            if (bool.TryParse(Convert.ToString(value), out b)) return b;
+            return fallback;
         }
 
         void SaveConfig()
@@ -879,6 +904,9 @@ namespace NhlPort
             Gpu["rcas_attenuation"] = sharpnessBar.Value;
             Gpu["vblank_frequency"] = 60;
             Launcher["language"] = Loc.Lang;
+            // Windows static guest red-zone protection of the emulator (src/core/cpu_patches.cpp): fixes the
+            // crash while a match loads when a page-protection fault clobbers the red zone of a leaf function.
+            General["redzone_patches"] = redzoneQuick.Checked;
             var ser = new JavaScriptSerializer();
             Directory.CreateDirectory(Path.GetDirectoryName(configPath));
             File.WriteAllText(configPath, PrettyJson(ser.Serialize(config)), new UTF8Encoding(false));
@@ -1046,6 +1074,12 @@ namespace NhlPort
                 Checked = Convert.ToString(GpuValue("present_mode", "Mailbox")) == "Fifo" };
             quickPanel.Controls.Add(vsyncQuick);
             quickPanel.Controls.Add(new TransparentLabel { Left = c2, Top = y + 28, Width = cw, Height = 40, Font = Theme.Small, ForeColor = Color.FromArgb(200, 210, 225), Text = Loc.T("vsync_desc") });
+            y += 70;
+            redzoneQuick = new CheckBox { Left = c1, Top = y, Width = 600, Height = 24, Font = Theme.Body, ForeColor = Color.White, BackColor = Color.Transparent, Text = Loc.T("redzone"),
+                Checked = ToBool(GeneralValue("redzone_patches", false), false) };
+            quickPanel.Controls.Add(redzoneQuick);
+            quickPanel.Controls.Add(new TransparentLabel { Left = c1, Top = y + 26, Width = 600, Height = 44, Font = Theme.Small, ForeColor = Color.FromArgb(200, 210, 225), Text = Loc.T("redzone_desc") });
+            redzoneQuick.CheckedChanged += delegate { RefreshSummary(); };
 
             // the quick controls mirror the advanced ones
             outputBox.TextChanged += delegate { resolutionBox.Text = outputBox.Text; RefreshSummary(); };
@@ -1225,6 +1259,7 @@ namespace NhlPort
             parts.Add(displayModeBox.SelectedIndex >= 0 ? (string)displayModeBox.Items[displayModeBox.SelectedIndex] : "");
             parts.Add(upscalerBox.SelectedIndex >= 0 ? (string)upscalerBox.Items[upscalerBox.SelectedIndex] : "");
             parts.Add(Loc.T("vsync") + (vsyncQuick.Checked ? " ✓" : " ✗"));
+            if (redzoneQuick != null && redzoneQuick.Checked) parts.Add(Loc.T("redzone_short"));
             summaryLabel.Text = string.Join("   •   ", parts.ToArray()).ToUpperInvariant();
         }
 
