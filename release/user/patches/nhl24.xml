@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  NHL 24 (CUSA37933, APP_VER 01.00) - nhlport game patches, loaded by shadPS4's MemoryPatcher
+  NHL 24 (CUSA37933 / CUSA37934, APP_VER 01.00) - nhlport game patches, loaded by shadPS4's MemoryPatcher
   (run with  shadPS4.exe -p nhl24.xml ; the file is looked up in <user>/patches/).
 
   Addresses are eboot.bin virtual addresses with the 0x400000 base the patch repository uses,
