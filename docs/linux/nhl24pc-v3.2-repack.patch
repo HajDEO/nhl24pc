@@ -1,0 +1,4070 @@
+diff --git a/src/common/assert.cpp b/src/common/assert.cpp
+index a2b941a..1b2597f 100644
+--- a/src/common/assert.cpp
++++ b/src/common/assert.cpp
+@@ -1,10 +1,48 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include "common/arch.h"
+ #include "common/assert.h"
+ #include "core/signals.h"
+ #include "emulator.h"
++#include "common/logging/log.h"
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <cstring>
++#include <windows.h>
++
++// nhlport: write the call stack of a failed assertion to the log as module+offset pairs, so a
++// crash report can be symbolized against nhl24.pdb (llvm-symbolizer) without a debugger.
++static void LogAssertBacktrace() {
++    void* frames[48];
++    const USHORT n = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
++    for (USHORT i = 0; i < n; ++i) {
++        HMODULE mod = nullptr;
++        char name[MAX_PATH] = "?";
++        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                               static_cast<LPCSTR>(frames[i]), &mod) &&
++            mod) {
++            char path[MAX_PATH];
++            if (GetModuleFileNameA(mod, path, MAX_PATH)) {
++                const char* base = strrchr(path, '\\');
++                strncpy_s(name, base ? base + 1 : path, _TRUNCATE);
++            }
++        }
++        const auto rva = reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(mod);
++        LOG_CRITICAL(Debug, "  backtrace #{:02} {}+{:#x}", i, name, rva);
++    }
++}
++#else
++static void LogAssertBacktrace() {}
++#endif
+ 
+ #if defined(ARCH_X86_64)
+ #define Crash() __asm__ __volatile__("int $3")
+@@ -14,7 +52,36 @@
+ #error "Missing Crash() implementation for target CPU architecture."
+ #endif
+ 
++namespace Common {
++// nhlport: set by the renderer (GPU hang locator); runs once before the process stops.
++void (*fatal_hook)() = nullptr;
++}
++
+ void assert_fail_impl() {
++#ifdef _WIN32
++    // nhlport: Shutdown() can wait forever on a lost GPU (the game froze instead of closing);
++    // end the process a few seconds later in any case.
++    static std::atomic<bool> watchdog_started{false};
++    if (!watchdog_started.exchange(true)) {
++        if (HANDLE thread = CreateThread(
++                nullptr, 0,
++                [](LPVOID) -> DWORD {
++                    Sleep(5000);
++                    Common::Log::Flush();
++                    TerminateProcess(GetCurrentProcess(), 0xDEAD);
++                    return 0;
++                },
++                nullptr, 0, nullptr)) {
++            CloseHandle(thread);
++        }
++    }
++#endif
++    if (auto hook = Common::fatal_hook) {
++        Common::fatal_hook = nullptr;
++        hook();
++    }
++    LogAssertBacktrace();
++    Common::Log::Flush();
+     Core::Signals::Instance()->RemoveHandlers();
+     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+     Crash();
+diff --git a/src/core/cpu_patches.cpp b/src/core/cpu_patches.cpp
+index 605fcf3..e0602eb 100644
+--- a/src/core/cpu_patches.cpp
++++ b/src/core/cpu_patches.cpp
+@@ -12,6 +12,7 @@
+ #include <mutex>
+ #include <optional>
+ #include <set>
++#include <string_view>
+ #include <unordered_set>
+ #include <vector>
+ #include <Zydis/Zydis.h>
+@@ -1798,13 +1799,49 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
+ 
+ using AddressRanges = std::vector<std::pair<uintptr_t, uintptr_t>>;
+ 
++// NHL24 PC: a few hot leaf functions keep values in the red zone while reading memory the
++// buffer cache may have protected. On Windows the exception frame of that fault overwrites
++// the red zone and the function later dereferences a zeroed pointer. Protecting just these
++// functions fixes the crash without the cost of protecting the whole executable.
++// Each signature is unique in eboot 1.00 and 1.60; every red-zone function that starts within
++// the window before a hit (the hit's function and its sibling instantiations) is protected.
++struct HotRedZoneSignature {
++    std::string_view bytes;
++    uintptr_t window_before;
++    uintptr_t window_after;
++};
++static constexpr std::array HotRedZoneSignatures{
++    HotRedZoneSignature{
++        "\x48\x8b\x5c\x24\xd8\x48\x8b\x74\x24\xe8\x48\x8b\x54\x24\xe0\x48\x8b\x1b\x48\x8b\x76\x28"
++        "\x48\x8b\x52\x08\x42\x0f\xb6\x1c\x33",
++        0x700, 0x10},
++};
++
++static std::vector<std::pair<uintptr_t, uintptr_t>> FindHotRedZoneWindows(uintptr_t start,
++                                                                         uintptr_t end) {
++    std::vector<std::pair<uintptr_t, uintptr_t>> windows;
++    const std::string_view segment{reinterpret_cast<const char*>(start), end - start};
++    for (const auto& signature : HotRedZoneSignatures) {
++        for (size_t pos = segment.find(signature.bytes); pos != std::string_view::npos;
++             pos = segment.find(signature.bytes, pos + 1)) {
++            const uintptr_t hit = start + pos;
++            windows.emplace_back(hit > start + signature.window_before
++                                     ? hit - signature.window_before
++                                     : start,
++                                 hit + signature.window_after);
++        }
++    }
++    return windows;
++}
++
+ /// Applies the CPU patches to every function of the segment. If red_zone_protection is true,
+ /// the red-zone accesses of those functions are protected as well. If covered_ranges is not
+ /// null, it receives the sorted address ranges of the decoded instructions.
+ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_size,
+                                                  std::span<const uintptr_t> function_starts,
+                                                  bool red_zone_protection,
+-                                                 AddressRanges* covered_ranges) {
++                                                 AddressRanges* covered_ranges,
++                                                 bool hot_only = false) {
+     RedZonePatchResult result{};
+     auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+     if (module == nullptr || function_starts.empty()) {
+@@ -1823,6 +1860,11 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
+     const auto unique_end = std::ranges::unique(starts).begin();
+     starts.erase(unique_end, starts.end());
+ 
++    const auto hot_windows = red_zone_protection
++                                 ? std::vector<std::pair<uintptr_t, uintptr_t>>{}
++                                 : FindHotRedZoneWindows(segment_addr, segment_end);
++    size_t hot_functions = 0;
++
+     std::unique_lock lock{module->mutex};
+     for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
+         const uintptr_t function_start = starts[function_index];
+@@ -1832,10 +1874,23 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
+             continue;
+         }
+ 
++        bool protect_function = red_zone_protection;
++        for (const auto& [window_start, window_end] : hot_windows) {
++            if (function_end > window_start && function_start < window_end) {
++                protect_function = true;
++            }
++        }
++        if (hot_only && !protect_function) {
++            continue;
++        }
++
+         ++result.function_count;
+         auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+-        if (red_zone_protection) {
++        if (protect_function) {
+             AnalyzeRedZoneLiveness(function);
++            if (!red_zone_protection && function.uses_red_zone) {
++                ++hot_functions;
++            }
+         }
+         result.instruction_count += function.instructions.size();
+         if (covered_ranges != nullptr) {
+@@ -1872,7 +1927,7 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
+             }
+         }
+ 
+-        if (red_zone_protection && function.uses_red_zone) {
++        if (protect_function && function.uses_red_zone) {
+             ++result.red_zone_function_count;
+             result.indirect_red_zone_function_count += function.has_indirect_branch;
+             for (const auto& [address, decoded] : function.instructions) {
+@@ -2335,6 +2390,10 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
+             patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
+         }
+     }
++    if (!hot_windows.empty()) {
++        LOG_INFO(Core, "red zone: protected {} hot functions ({} signature hits)", hot_functions,
++                 hot_windows.size());
++    }
+     return result;
+ }
+ 
+@@ -2400,6 +2459,12 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
+     return PatchSegmentStatically(segment_addr, segment_size, function_starts, true, nullptr);
+ }
+ 
++RedZonePatchResult PatchHotRedZoneFunctions(u64 segment_addr, u64 segment_size,
++                                            std::span<const uintptr_t> function_starts) {
++    return PatchSegmentStatically(segment_addr, segment_size, function_starts, false, nullptr,
++                                  true);
++}
++
+ RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_size,
+                                                   std::span<const uintptr_t> function_starts) {
+     AddressRanges covered_ranges;
+diff --git a/src/core/cpu_patches.h b/src/core/cpu_patches.h
+index 1af2eab..62e07b7 100644
+--- a/src/core/cpu_patches.h
++++ b/src/core/cpu_patches.h
+@@ -90,4 +90,9 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
+ RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_size,
+                                                   std::span<const uintptr_t> function_starts);
+ 
++/// nhlport: protects only the known crash-prone red-zone functions (see HotRedZoneSignatures),
++/// used on Windows when full red-zone protection is off.
++RedZonePatchResult PatchHotRedZoneFunctions(u64 segment_addr, u64 segment_size,
++                                            std::span<const uintptr_t> function_starts);
++
+ } // namespace Core
+diff --git a/src/core/libraries/ajm/ajm_context.cpp b/src/core/libraries/ajm/ajm_context.cpp
+index 12e25ca..dc68b56 100644
+--- a/src/core/libraries/ajm/ajm_context.cpp
++++ b/src/core/libraries/ajm/ajm_context.cpp
+@@ -7,6 +7,7 @@
+ #include "core/libraries/ajm/ajm.h"
+ #include "core/libraries/ajm/ajm_at9.h"
+ #include "core/libraries/ajm/ajm_context.h"
++#include "core/libraries/ajm/ajm_result.h"
+ #include "core/libraries/ajm/ajm_error.h"
+ #include "core/libraries/ajm/ajm_instance.h"
+ #include "core/libraries/ajm/ajm_instance_statistics.h"
+@@ -92,6 +93,18 @@ void AjmContext::ProcessBatch(u32 id, std::span<AjmJob> jobs) {
+                     // taking the whole emulator down.
+                     LOG_WARNING(Lib_Ajm, "Batch {} references destroyed instance {}, job skipped",
+                                 id, job.instance_id);
++                    // nhlport: report the job as failed instead of leaving the game's result and
++                    // stream sidebands untouched. With stale values the game can keep waiting
++                    // for audio that will never be decoded (Be a Pro interview stuck after
++                    // answers were picked quickly).
++                    if (job.output.p_result) {
++                        job.output.p_result->result = ORBIS_AJM_RESULT_FATAL;
++                        job.output.p_result->internal_result = 0;
++                    }
++                    if (job.output.p_stream) {
++                        job.output.p_stream->input_consumed = 0;
++                        job.output.p_stream->output_written = 0;
++                    }
+                     continue;
+                 }
+                 instance = *p_instance;
+diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
+index 69ebb6f..e7c2935 100644
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+ #include <thread>
+@@ -677,6 +678,17 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
+     });
+ }
+ 
++int FlipRateMode() {
++    static const int mode = [] {
++        const char* env = std::getenv("NHLPORT_IGNORE_FLIP_RATE");
++        if (!env || env[0] == '0' || env[0] == 0) {
++            return 0;
++        }
++        return env[0] == '2' ? 2 : 1;
++    }();
++    return mode;
++}
++
+ void VideoOutDriver::PresentThread(std::stop_token token) {
+     const std::chrono::nanoseconds vblank_period(1000000000 /
+                                                  EmulatorSettings.GetVblankFrequency());
+@@ -697,6 +709,21 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+     };
+ 
+     u32 trigger_poll = 0;
++    // nhlport auto flip rate (NHLPORT_IGNORE_FLIP_RATE=2). When the title asks for a lower rate
++    // (menus, cutscenes) flip on every vblank, but if frames keep missing vblanks the rate jumps
++    // between full and half (8 / 17 / 25 ms frames) and feels like heavy lag; then fall back to
++    // the title's own rate. While locked, look at the vblanks in between: if a new frame is
++    // almost always ready there, the PC has headroom again and full rate comes back.
++    const bool auto_rate = FlipRateMode() == 2;
++    bool auto_locked = false;
++    u64 last_flip_vblank = 0;
++    u32 win_flips = 0, win_misses = 0, win_between = 0, win_ready = 0;
++    // Back-off: a scene that is just over the limit would flip between full and half rate every
++    // couple of seconds. Each quick relock doubles how long the next headroom check runs.
++    constexpr u32 BaseHold = 120, MaxHold = 1920; // skipped vblanks: ~2 s .. ~32 s at 120 Hz
++    u32 hold_between = BaseHold;
++    u64 unlock_vblank = 0;
++    bool unlocked_once = false;
+     while (!token.stop_requested()) {
+         timer.Start();
+ 
+@@ -713,7 +740,43 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+ 
+         // Check if it's time to take a request.
+         auto& vblank_status = main_port.vblank_status;
+-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
++        int flip_rate = main_port.flip_rate;
++        if (auto_rate) {
++            const int requested = main_port.requested_flip_rate;
++            if (requested <= 0) {
++                if (auto_locked) {
++                    auto_locked = false;
++                    Diag::Eventf("videoout", "auto flip rate: title back to full rate");
++                }
++                win_flips = win_misses = win_between = win_ready = 0;
++                hold_between = BaseHold;
++                unlocked_once = false;
++            } else {
++                flip_rate = auto_locked ? requested : 0;
++            }
++        }
++        if (vblank_status.count % (flip_rate + 1) != 0 && auto_rate && auto_locked) {
++            // A vblank we skip because of the title's rate: would a frame have been ready?
++            bool ready;
++            {
++                std::scoped_lock lk{mutex};
++                ready = !requests.empty();
++            }
++            ++win_between;
++            win_ready += ready ? 1 : 0;
++            if (win_between >= hold_between) {
++                if (win_ready * 100 >= win_between * 95) {
++                    auto_locked = false;
++                    unlock_vblank = vblank_status.count;
++                    unlocked_once = true;
++                    LOG_INFO(Lib_VideoOut, "auto flip rate: headroom, back to full rate");
++                    Diag::Eventf("videoout", "auto flip rate: headroom ({}/{} ready), full rate",
++                                 win_ready, win_between);
++                }
++                win_flips = win_misses = win_between = win_ready = 0;
++            }
++        }
++        if (vblank_status.count % (flip_rate + 1) == 0) {
+             const auto request = receive_request();
+             if (!request) {
+                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+@@ -727,6 +790,32 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
+             } else {
+                 Flip(request);
+                 FRAME_END;
++                if (auto_rate && !auto_locked && main_port.requested_flip_rate > 0) {
++                    const u64 interval = vblank_status.count - last_flip_vblank;
++                    ++win_flips;
++                    win_misses += interval > 1 ? 1 : 0;
++                    if (win_flips >= 60) {
++                        if (win_misses * 100 >= win_flips * 20) {
++                            auto_locked = true;
++                            // Relocked within ~5 s of the last unlock: wait longer next time.
++                            if (unlocked_once && vblank_status.count - unlock_vblank < 600) {
++                                hold_between = std::min(hold_between * 2, MaxHold);
++                            } else {
++                                hold_between = BaseHold;
++                            }
++                            LOG_INFO(Lib_VideoOut,
++                                     "auto flip rate: {}/{} frames missed a vblank, using the "
++                                     "title's rate {}",
++                                     win_misses, win_flips, main_port.requested_flip_rate);
++                            Diag::Eventf("videoout",
++                                         "auto flip rate: {}/{} frames missed a vblank, title "
++                                         "rate {}",
++                                         win_misses, win_flips, main_port.requested_flip_rate);
++                        }
++                        win_flips = win_misses = win_between = win_ready = 0;
++                    }
++                }
++                last_flip_vblank = vblank_status.count;
+             }
+         }
+ 
+diff --git a/src/core/libraries/videoout/driver.h b/src/core/libraries/videoout/driver.h
+index ca2b645..aa638f7 100644
+--- a/src/core/libraries/videoout/driver.h
++++ b/src/core/libraries/videoout/driver.h
+@@ -32,6 +32,7 @@ struct VideoOutPort {
+     std::condition_variable vo_cv;
+     std::condition_variable vblank_cv;
+     int flip_rate = 0;
++    int requested_flip_rate = 0; ///< nhlport: rate the title asked for (auto mode)
+     int prev_index = -1;
+     bool is_open = false;
+     bool is_hdr = false;
+@@ -117,4 +118,7 @@ private:
+     std::queue<Request> requests;
+ };
+ 
++/// nhlport: NHLPORT_IGNORE_FLIP_RATE mode: 0 = title's flip rate, 1 = always full, 2 = auto.
++int FlipRateMode();
++
+ } // namespace Libraries::VideoOut
+diff --git a/src/core/libraries/videoout/video_out.cpp b/src/core/libraries/videoout/video_out.cpp
+index 9730052..f2c820c 100644
+--- a/src/core/libraries/videoout/video_out.cpp
++++ b/src/core/libraries/videoout/video_out.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include "common/diag_log.h"
+ #include "common/assert.h"
+ #include "common/elf_info.h"
+@@ -139,10 +140,17 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
+     return driver->RegisterBuffers(port, startIndex, addresses, bufferNum, attribute);
+ }
+ 
++// nhlport: NHLPORT_IGNORE_FLIP_RATE controls the reduced flip rate NHL 24 asks for in menus and
++// cutscenes. 0 = honour it (console), 1 = always flip on every vblank, 2 = auto: every vblank
++// while the PC keeps up, the title's rate when it does not (see VideoOutDriver::PresentThread).
+ s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
+     LOG_TRACE(Lib_VideoOut, "called");
+-    Diag::Eventf("videoout", "sceVideoOutSetFlipRate {} (0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz)", rate);
+-    driver->GetPort(handle)->flip_rate = rate;
++    const int mode = FlipRateMode();
++    Diag::Eventf("videoout", "sceVideoOutSetFlipRate {} (0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz){}", rate,
++                 mode == 1 ? " ignored" : (mode == 2 ? " auto" : ""));
++    auto* port = driver->GetPort(handle);
++    port->requested_flip_rate = rate;
++    port->flip_rate = mode == 0 ? rate : 0;
+     return ORBIS_OK;
+ }
+ 
+diff --git a/src/core/module.cpp b/src/core/module.cpp
+index db0a50d..1e81554 100644
+--- a/src/core/module.cpp
++++ b/src/core/module.cpp
+@@ -185,8 +185,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
+     // patches, but now used on all OSes to patch 4-byte instructions
+ #if defined(_WIN32)
+     const bool use_static_patching = WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
++    // nhlport: without full protection, still protect the known crash-prone red-zone functions.
++    const bool collect_hot_red_zone = !use_static_patching;
+ #else
+     constexpr bool use_static_patching = true;
++    constexpr bool collect_hot_red_zone = false;
+ #endif
+     std::vector<std::pair<VAddr, u64>> executable_segments;
+     std::vector<uintptr_t> function_starts;
+@@ -215,7 +218,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
+ #ifdef ARCH_X86_64
+             if (elf_pheader[i].p_flags & PF_EXEC) {
+                 PrePatchInstructions(segment_addr, segment_file_size);
+-                if (use_static_patching) {
++                if (use_static_patching || collect_hot_red_zone) {
+                     executable_segments.emplace_back(segment_addr, segment_file_size);
+                 }
+             }
+@@ -261,7 +264,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
+             Dwarf::EHHeaderInfo hdr_info;
+             if (Dwarf::DecodeEHHdr(eh_hdr_start, eh_hdr_end, hdr_info)) {
+ #ifdef ARCH_X86_64
+-                if (use_static_patching &&
++                if ((use_static_patching || collect_hot_red_zone) &&
+                     !Dwarf::DecodeEHHdrTable(hdr_info, eh_hdr_end, function_starts)) {
+                     LOG_ERROR(Core_Linker, "Failed to decode EH frame search table for {}", name);
+                 }
+@@ -299,6 +302,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
+ #ifdef ARCH_X86_64
+     // The game's memory patches are applied first, so that the code decoded here is the code
+     // that executes.
++    if (collect_hot_red_zone) {
++        for (const auto& [segment_addr, segment_size] : executable_segments) {
++            PatchHotRedZoneFunctions(segment_addr, segment_size, function_starts);
++        }
++    }
+     if (use_static_patching) {
+         const bool red_zone_protection = WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+         RedZonePatchResult total{};
+diff --git a/src/core/nhl_teams_patch.h b/src/core/nhl_teams_patch.h
+new file mode 100644
+index 0000000..2c8b1d4
+--- /dev/null
++++ b/src/core/nhl_teams_patch.h
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// nhlport: hidden national teams. NHL 24 ships Russia and Belarus in its team database
++// (database/t3db/nhl_game.db, "International" league) with the team table's "active" field
++// set to 0. With NHLPORT_TEAMS=1 a background thread finds the game's team tables in guest
++// memory once the database is loaded (by the layout of the field list, so it works for 1.00,
++// 1.60 and saved rosters) and sets "active" for those two teams. No game file is changed.
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <set>
++#include <string_view>
++#include <thread>
++#include "common/logging/log.h"
++#include "common/types.h"
++#include "core/memory.h"
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#endif
++
++namespace Core::NhlTeams {
++
++#ifdef _WIN32
++struct TableView {
++    u8* fields;      // first field definition (16 bytes each: type, bit offset, name, bit length)
++    u32 num_fields;
++    u32 record_len;  // bytes
++    u32 count;
++    u8* records;
++};
++
++inline bool IsName(const u8* p) {
++    for (int i = 0; i < 4; ++i) {
++        const u8 c = p[i];
++        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
++            return false;
++        }
++    }
++    return true;
++}
++
++inline bool Readable(const void* p, size_t n, bool write = false) {
++    MEMORY_BASIC_INFORMATION mbi{};
++    const u8* a = static_cast<const u8*>(p);
++    const u8* end = a + n;
++    while (a < end) {
++        if (!VirtualQuery(a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
++            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
++            return false;
++        }
++        const DWORD ok = write ? (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
++                               : (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
++                                  PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY);
++        if (!(mbi.Protect & ok)) {
++            return false;
++        }
++        a = static_cast<const u8*>(mbi.BaseAddress) + mbi.RegionSize;
++    }
++    return true;
++}
++
++// p points at the "kKYN" (active) field definition name; walk back to the first field and read
++// the 40-byte table header in front of it.
++inline bool ParseTable(u8* name, u8* region_begin, TableView& t) {
++    u8* f = name - 8;
++    u8* first = f;
++    while (first - 16 >= region_begin + 40 && IsName(first - 16 + 8) &&
++           *reinterpret_cast<u32*>(first - 16) <= 4) {
++        first -= 16;
++    }
++    for (int back = 0; back < 400 && first >= region_begin + 40; ++back) {
++        u8* hdr = first - 40;
++        const u32 reclen = *reinterpret_cast<u32*>(hdr + 8);
++        const u32 lenbits = *reinterpret_cast<u32*>(hdr + 12);
++        const u16 cap = *reinterpret_cast<u16*>(hdr + 20);
++        const u16 cnt = *reinterpret_cast<u16*>(hdr + 22);
++        const u8 nf = hdr[28];
++        if (nf > 0 && reclen > 0 && reclen < 8192 && (lenbits + 7) / 8 <= reclen && cnt <= cap &&
++            cap < 8192 && first + 16 * nf > f) {
++            t = {first, nf, reclen, cnt, first + 16u * nf};
++            return true;
++        }
++        first += 16;  // the backward walk overshot into the previous table: step forward again
++        if (first > f) {
++            break;
++        }
++    }
++    return false;
++}
++
++inline bool FindField(const TableView& t, const char* name, u32& type, u32& bitoff, u32& bits) {
++    for (u32 i = 0; i < t.num_fields; ++i) {
++        const u8* e = t.fields + 16 * i;
++        if (std::memcmp(e + 8, name, 4) == 0) {
++            type = *reinterpret_cast<const u32*>(e);
++            bitoff = *reinterpret_cast<const u32*>(e + 4);
++            bits = *reinterpret_cast<const u32*>(e + 12);
++            return true;
++        }
++    }
++    return false;
++}
++
++inline u32 GetBits(const u8* rec, u32 off, u32 bits) {
++    u32 v = 0;
++    for (u32 k = 0; k < bits; ++k) {
++        const u32 bit = off + k;
++        v |= ((rec[bit / 8] >> (bit % 8)) & 1u) << k;
++    }
++    return v;
++}
++
++// Returns the number of teams switched on in this table.
++inline int PatchTable(const TableView& t) {
++    u32 ta, oa, ba, tn, on, bn, tl, ol, bl;
++    if (!FindField(t, "kKYN", ta, oa, ba) || ba != 1 || !FindField(t, "AUsv", tn, on, bn) ||
++        tn != 0 || !FindField(t, "xMjj", tl, ol, bl)) {
++        return 0;
++    }
++    if (!Readable(t.records, size_t(t.record_len) * t.count)) {
++        return 0;
++    }
++    int changed = 0;
++    for (u32 r = 0; r < t.count; ++r) {
++        u8* rec = t.records + size_t(r) * t.record_len;
++        if (GetBits(rec, ol, bl) != 10) {  // league 10 = "International"
++            continue;
++        }
++        const char* name = reinterpret_cast<const char*>(rec + on / 8);
++        const bool target = std::strncmp(name, "Russia", bn / 8) == 0 ||
++                            std::strncmp(name, "Belarus", bn / 8) == 0;
++        if (!target || GetBits(rec, oa, 1)) {
++            continue;
++        }
++        if (!Readable(rec + oa / 8, 1, true)) {
++            continue;
++        }
++        rec[oa / 8] |= u8(1u << (oa % 8));
++        LOG_INFO(Core, "teams: {} switched on (table at {})", name, fmt::ptr(t.fields));
++        ++changed;
++    }
++    return changed;
++}
++
++inline int ScanOnce(int* found_out = nullptr) {
++    int found = 0;
++    static constexpr char Needle[8] = {'k', 'K', 'Y', 'N', 1, 0, 0, 0};
++    const std::string_view needle{Needle, 8};
++    auto& as = Core::Memory::Instance()->GetAddressSpace();
++    const std::pair<const u8*, u64> ranges[] = {
++        {reinterpret_cast<const u8*>(as.SystemManagedVirtualBase()), as.SystemManagedVirtualSize()},
++        {reinterpret_cast<const u8*>(as.SystemReservedVirtualBase()), as.SystemReservedVirtualSize()},
++        {reinterpret_cast<const u8*>(as.UserVirtualBase()), as.UserVirtualSize()},
++    };
++    int changed = 0;
++    for (const auto& [base, size] : ranges) {
++        if (!base || !size) {
++            continue;
++        }
++        const u8* a = base;
++        const u8* end = base + size;
++        MEMORY_BASIC_INFORMATION mbi{};
++        while (a < end && VirtualQuery(a, &mbi, sizeof(mbi))) {
++            u8* rb = static_cast<u8*>(mbi.BaseAddress);
++            const size_t rs = mbi.RegionSize;
++            a = rb + rs;
++            if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
++                !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
++                continue;
++            }
++            const std::string_view hay{reinterpret_cast<const char*>(rb), rs};
++            for (size_t pos = hay.find(needle); pos != std::string_view::npos;
++                 pos = hay.find(needle, pos + 1)) {
++                TableView t{};
++                if (ParseTable(rb + pos, rb, t)) {
++                    ++found;
++                    changed += PatchTable(t);
++                }
++            }
++        }
++    }
++    if (found_out) {
++        *found_out = found;
++    }
++    return changed;
++}
++#endif
++
++inline void Start() {
++#ifdef _WIN32
++    const char* env = std::getenv("NHLPORT_TEAMS");
++    if (!env || env[0] != '1') {
++        return;
++    }
++    LOG_INFO(Core, "teams: Russia / Belarus switch-on is enabled");
++    std::thread([] {
++        const auto t0 = std::chrono::steady_clock::now();
++        int last_found = -1;
++        bool first = true;
++        for (;;) {
++            int found = 0;
++            const auto s0 = std::chrono::steady_clock::now();
++            try {
++                ScanOnce(&found);
++            } catch (...) {
++            }
++            const auto now = std::chrono::steady_clock::now();
++            const auto el = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
++            if (first) {
++                LOG_INFO(Core, "teams: first scan took {} ms",
++                         std::chrono::duration_cast<std::chrono::milliseconds>(now - s0).count());
++                first = false;
++            }
++            if (found != last_found) {
++                LOG_INFO(Core, "teams: {} team table(s) in memory at {} ms", found, el);
++                last_found = found;
++            }
++            std::this_thread::sleep_for(found == 0 && el < 120000 ? std::chrono::milliseconds(50)
++                                        : el < 300000            ? std::chrono::seconds(2)
++                                                                 : std::chrono::seconds(20));
++        }
++    }).detach();
++#endif
++}
++
++} // namespace Core::NhlTeams
+diff --git a/src/core/signals.cpp b/src/core/signals.cpp
+index a75b502..2c1331a 100644
+--- a/src/core/signals.cpp
++++ b/src/core/signals.cpp
+@@ -179,6 +179,24 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
+     if (report_unhandled) {
+         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
++        // nhlport: the crash dump doesn't hold guest stacks; log the registers and the top of
++        // the stack so a crash in game code can be traced back to its caller.
++        if (const CONTEXT* c = pExp->ContextRecord) {
++            LOG_CRITICAL(Debug,
++                         "regs: rip {:#x} rsp {:#x} rbp {:#x} rax {:#x} rbx {:#x} rcx {:#x} "
++                         "rdx {:#x} rsi {:#x} rdi {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
++                         c->Rip, c->Rsp, c->Rbp, c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi,
++                         c->R12, c->R13, c->R14, c->R15);
++            u64 words[48]{};
++            SIZE_T got = 0;
++            if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c->Rsp),
++                                  words, sizeof(words), &got)) {
++                for (size_t i = 0; i < got / sizeof(u64); i += 4) {
++                    LOG_CRITICAL(Debug, "stack +{:#05x}: {:#018x} {:#018x} {:#018x} {:#018x}",
++                                 i * 8, words[i], words[i + 1], words[i + 2], words[i + 3]);
++                }
++            }
++        }
+         WriteCrashDump(pExp);
+         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+     }
+diff --git a/src/imgui/renderer/imgui_impl_vulkan.cpp b/src/imgui/renderer/imgui_impl_vulkan.cpp
+index d8a8fc2..3593b1a 100644
+--- a/src/imgui/renderer/imgui_impl_vulkan.cpp
++++ b/src/imgui/renderer/imgui_impl_vulkan.cpp
+@@ -275,6 +275,11 @@ void UploadTextureData::Destroy() {
+ }
+ 
+ // Register a texture
++// nhlport (Vulkan validation, UNASSIGNED-Threading-MultipleThreads-Write): the GPU thread
++// (frame recreation) and the present thread both add and remove ImGui textures, and a descriptor
++// pool must not be used from two threads at once.
++static std::mutex g_descriptor_pool_mutex;
++
+ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
+                        vk::Sampler sampler) {
+     VkData* bd = GetBackendData();
+@@ -287,6 +292,7 @@ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
+     // Create Descriptor Set:
+     vk::DescriptorSet descriptor_set;
+     {
++        std::scoped_lock pool_lock{g_descriptor_pool_mutex};
+         vk::DescriptorSetAllocateInfo alloc_info{
+             .descriptorPool = bd->descriptor_pool,
+             .descriptorSetCount = 1,
+@@ -481,7 +487,10 @@ void RemoveTexture(ImTextureID texture) {
+     IM_ASSERT(texture != nullptr);
+     VkData* bd = GetBackendData();
+     const InitInfo& v = bd->init_info;
+-    CheckVkErr(v.device.freeDescriptorSets(bd->descriptor_pool, {texture->descriptor_set}));
++    {
++        std::scoped_lock pool_lock{g_descriptor_pool_mutex};
++        CheckVkErr(v.device.freeDescriptorSets(bd->descriptor_pool, {texture->descriptor_set}));
++    }
+     delete texture;
+ }
+ 
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 12bf8de..fd14570 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -3,13 +3,18 @@
+ 
+ #include <mutex>
+ #include <span>
++#include <cstdlib>
++#include <string>
++#include <string_view>
+ #include <type_traits>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ #include <magic_enum/magic_enum.hpp>
+ 
+ #include "common/assert.h"
+ #include "common/func_traits.h"
++#include "common/logging/log.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv.h"
+ #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+ #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+@@ -152,8 +157,68 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
+     }
+ }
+ 
++// nhlport: loop fuse. Shaders that can spin forever on some GPUs get a budget of loop iterations
++// per invocation: one counter (Private, i.e. per invocation) shared by all loops is bumped on every
++// back edge and never reset; once it is spent every loop is left at its next back edge. A per-loop
++// cap did not stop the hang of NHL 24's face compressor on a GTX 1070 (its loops are nested three
++// deep, so per-loop caps multiply); this is an experiment, see Checkpoints::Gtx10Mode.
++// NHLPORT_FUSE_CS = comma separated hex hashes (as in "Compiling cs shader 0x...") that get the
++// fuse on any GPU, for shaders found hanging in a GPU-debug report. Shaders already in the
++// cache keep their old code: clear user\cache after changing it.
++static const std::vector<u64>& LoopFuseExtra() {
++    static const std::vector<u64> list = [] {
++        std::vector<u64> v;
++        if (const char* env = std::getenv("NHLPORT_FUSE_CS"); env && env[0]) {
++            std::string_view rest{env};
++            while (!rest.empty()) {
++                const size_t comma = rest.find(',');
++                const std::string item{rest.substr(0, comma)};
++                if (!item.empty()) {
++                    v.push_back(std::strtoull(item.c_str(), nullptr, 16));
++                }
++                if (comma == std::string_view::npos) {
++                    break;
++                }
++                rest.remove_prefix(comma + 1);
++            }
++        }
++        return v;
++    }();
++    return list;
++}
++
++static bool LoopFuseWanted(const EmitContext& ctx) {
++    for (const u64 h : LoopFuseExtra()) {
++        if (h == ctx.info.pgm_hash) {
++            return true;
++        }
++    }
++    if (!ctx.profile.nhl_loop_fuse) {
++        return false;
++    }
++    switch (ctx.info.pgm_hash) {
++    case 0x96470850ull:
++        return true;
++    default:
++        return false;
++    }
++}
++static constexpr u32 LoopFuseCap = 65536;   // back edges per invocation, all loops together
++
+ void Traverse(EmitContext& ctx, const IR::Program& program) {
+     IR::Block* current_block{};
++    std::unordered_map<const IR::Block*, Id> fuse;   // loop merge block -> shared budget counter
++    if (LoopFuseWanted(ctx)) {
++        const Id budget{ctx.DefineVariable(ctx.U32[1], std::nullopt, spv::StorageClass::Private,
++                                           ctx.u32_zero_value)};
++        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
++            if (node.type == IR::AbstractSyntaxNode::Type::Loop) {
++                fuse.emplace(node.data.loop.merge, budget);
++            }
++        }
++        LOG_INFO(Render_Recompiler, "Shader {:#x}: loop fuse on {} loops (cap {})",
++                 ctx.info.pgm_hash, fuse.size(), LoopFuseCap);
++    }
+     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+         switch (node.type) {
+         case IR::AbstractSyntaxNode::Type::Block: {
+@@ -188,7 +253,8 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
+         case IR::AbstractSyntaxNode::Type::Break: {
+             const Id break_label{node.data.break_node.merge->Definition<Id>()};
+             const Id skip_label{node.data.break_node.skip->Definition<Id>()};
+-            ctx.OpBranchConditional(ctx.Def(node.data.break_node.cond), break_label, skip_label);
++            const Id cond{ctx.Def(node.data.break_node.cond)};
++            ctx.OpBranchConditional(cond, break_label, skip_label);
+             break;
+         }
+         case IR::AbstractSyntaxNode::Type::EndIf:
+@@ -200,6 +266,13 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
+             Id cond{ctx.Def(node.data.repeat.cond)};
+             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
+             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
++            if (const auto it = fuse.find(node.data.repeat.merge); it != fuse.end()) {
++                const Id count{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], it->second),
++                                          ctx.u32_one_value)};
++                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
++                                        ctx.OpULessThan(ctx.U1[1], count, ctx.ConstU32(LoopFuseCap)));
++                ctx.OpStore(it->second, count);
++            }
+             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
+             break;
+         }
+diff --git a/src/shader_recompiler/frontend/control_flow_graph.cpp b/src/shader_recompiler/frontend/control_flow_graph.cpp
+index f38f077..8dc15b8 100644
+--- a/src/shader_recompiler/frontend/control_flow_graph.cpp
++++ b/src/shader_recompiler/frontend/control_flow_graph.cpp
+@@ -2,6 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <deque>
++#include <string>
++#include <magic_enum/magic_enum.hpp>
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+ #include "shader_recompiler/frontend/control_flow_graph.h"
+@@ -68,43 +71,395 @@ static bool IgnoresExecMask(const GcnInst& inst) {
+     return false;
+ }
+ 
+-static std::optional<u32> ResolveSetPcTarget(std::span<const GcnInst> list, u32 setpc_index,
+-                                             std::span<const u32> pc_map) {
+-    if (setpc_index < 3) {
++static std::optional<u32> ConstOperandValue(const InstOperand& op) {
++    switch (op.field) {
++    case OperandField::LiteralConst:
++        return op.code;
++    case OperandField::ConstZero:
++        return 0u;
++    case OperandField::SignedConstIntPos:
++        return static_cast<u32>(op.code - SignedConstIntPosMin + 1);
++    case OperandField::SignedConstIntNeg:
++        return static_cast<u32>(-static_cast<s32>(op.code) + SignedConstIntNegMin - 1);
++    default:
+         return std::nullopt;
+     }
++}
+ 
+-    const auto& getpc = list[setpc_index - 3];
+-    const auto& arith = list[setpc_index - 2];
+-    const auto& setpc = list[setpc_index];
++// nhlport: value of a register pair that holds a pc computed from s_getpc_b64 (plus constant
++// adds), as seen right before instruction `before`. Walks backwards tracking the low dword;
++// writes to the high dword are ignored (s_getpc puts 0 there and pcs are 32-bit).
++static std::optional<u32> ResolvePcValue(std::span<const GcnInst> list, u32 before, u32 reg,
++                                         std::span<const u32> pc_map) {
++    u32 offset = 0;
++    constexpr u32 MaxLookback = 48;
++    for (u32 n = 1; n <= MaxLookback && n <= before; ++n) {
++        const u32 idx = before - n;
++        const auto& inst = list[idx];
++        if (inst.opcode == Opcode::S_SWAPPC_B64 || inst.IsTerminateInstruction()) {
++            return std::nullopt; // control flow in between: not a straight-line computation
++        }
++        if (inst.dst_count == 0 || inst.dst[0].field != OperandField::ScalarGPR) {
++            continue;
++        }
++        const u32 d = inst.dst[0].code;
++        switch (inst.opcode) {
++        case Opcode::S_GETPC_B64:
++            if (d == reg) {
++                return pc_map[idx] + inst.length + offset;
++            }
++            if (d + 1 == reg || d == reg + 1) {
++                return std::nullopt;
++            }
++            continue;
++        case Opcode::S_MOV_B64:
++            if (d == reg) {
++                if (inst.src[0].field != OperandField::ScalarGPR) {
++                    return std::nullopt;
++                }
++                reg = inst.src[0].code;
++                continue;
++            }
++            if (d + 1 == reg || d == reg + 1) {
++                return std::nullopt;
++            }
++            continue;
++        case Opcode::S_ADD_U32:
++        case Opcode::S_ADD_I32:
++        case Opcode::S_SUB_U32:
++        case Opcode::S_SUB_I32:
++            if (d == reg && inst.src_count >= 2) {
++                const bool sub =
++                    inst.opcode == Opcode::S_SUB_U32 || inst.opcode == Opcode::S_SUB_I32;
++                std::optional<u32> c;
++                if (inst.src[0].field == OperandField::ScalarGPR && inst.src[0].code == reg) {
++                    c = ConstOperandValue(inst.src[1]);
++                } else if (!sub && inst.src[1].field == OperandField::ScalarGPR &&
++                           inst.src[1].code == reg) {
++                    c = ConstOperandValue(inst.src[0]);
++                }
++                if (!c) {
++                    return std::nullopt;
++                }
++                offset += sub ? (0u - *c) : *c;
++                continue;
++            }
++            break;
++        default:
++            break;
++        }
++        if (d == reg) {
++            return std::nullopt; // something else overwrites the low dword
++        }
++        if (d + 1 == reg && magic_enum::enum_name(inst.opcode).ends_with("B64")) {
++            return std::nullopt; // 64-bit write that covers the low dword
++        }
++    }
++    return std::nullopt;
++}
+ 
+-    if (getpc.opcode != Opcode::S_GETPC_B64 ||
+-        !(arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_SUB_U32) ||
+-        setpc.opcode != Opcode::S_SETPC_B64)
++// nhlport: resolves "s_setpc_b64 s[N:N+1]" whose target is getpc + constant. Upstream only
++// accepted the exact sequence getpc / add lo / (any) / setpc.
++static std::optional<u32> ResolveSetPcTarget(std::span<const GcnInst> list, u32 setpc_index,
++                                             std::span<const u32> pc_map) {
++    const auto& setpc = list[setpc_index];
++    if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src_count < 1 ||
++        setpc.src[0].field != OperandField::ScalarGPR) {
+         return std::nullopt;
+-
+-    if (getpc.dst[0].code != setpc.src[0].code || arith.dst[0].code != setpc.src[0].code)
++    }
++    const auto v = ResolvePcValue(list, setpc_index, setpc.src[0].code, pc_map);
++    if (!v) {
+         return std::nullopt;
++    }
++    LOG_DEBUG(Render_Recompiler, "SetPC target: {:#x}", *v);
++    return *v & ~0x3u;
++}
+ 
+-    if (arith.src_count < 2 || arith.src[1].field != OperandField::LiteralConst)
+-        return std::nullopt;
++static bool WritesSgpr(const GcnInst& inst, u32 reg) {
++    if (inst.dst_count == 0 || inst.dst[0].field != OperandField::ScalarGPR) {
++        return false;
++    }
++    const u32 d = inst.dst[0].code;
++    if (d == reg) {
++        return true;
++    }
++    // Multi-dword writes (64-bit ops, scalar loads) also cover the next registers.
++    u32 width = 1;
++    if (inst.category == InstCategory::ScalarMemory) {
++        width = std::max<u32>(1, inst.control.smrd.count);
++    } else if (magic_enum::enum_name(inst.opcode).ends_with("B64")) {
++        width = 2;
++    }
++    return reg > d && reg < d + width;
++}
+ 
+-    const u32 imm = arith.src[1].code;
++// nhlport: does `inst` write the scalar operand `op` (an SGPR or VCC_LO)?
++static bool WritesScalarOperand(const GcnInst& inst, const InstOperand& op) {
++    if (op.field == OperandField::ScalarGPR) {
++        return WritesSgpr(inst, op.code);
++    }
++    if (op.field != OperandField::VccLo) {
++        return true; // unknown kind: assume it changes
++    }
++    for (u32 k = 0; k < inst.dst_count; ++k) {
++        if (inst.dst[k].field == OperandField::VccLo || inst.dst[k].field == OperandField::VccHi) {
++            return true;
++        }
++    }
++    if (inst.encoding == InstEncoding::VOPC) {
++        return true; // vector compares write VCC implicitly
++    }
++    const auto name = magic_enum::enum_name(inst.opcode);
++    for (const std::string_view carry : {"V_ADD_I32", "V_SUB_I32", "V_SUBREV_I32", "V_ADDC_U32",
++                                         "V_SUBB_U32", "V_SUBBREV_U32", "V_DIV_SCALE"}) {
++        if (name.starts_with(carry)) {
++            return true; // carry / scale out goes to VCC
++        }
++    }
++    return false;
++}
+ 
+-    const s32 signed_offset =
+-        (arith.opcode == Opcode::S_ADD_U32) ? static_cast<s32>(imm) : -static_cast<s32>(imm);
++static int FindLastWriter(std::span<const GcnInst> list, u32 before, u32 reg, u32 lookback) {
++    for (u32 n = 1; n <= lookback && n <= before; ++n) {
++        const u32 idx = before - n;
++        const auto& inst = list[idx];
++        if (inst.opcode == Opcode::S_SWAPPC_B64 || inst.IsTerminateInstruction()) {
++            return -1;
++        }
++        if (WritesSgpr(inst, reg)) {
++            return static_cast<int>(idx);
++        }
++    }
++    return -1;
++}
++
++static void MakeNop(GcnInst& inst) {
++    const u32 length = inst.length;
++    inst = GcnInst{};
++    inst.opcode = Opcode::S_NOP;
++    inst.encoding = InstEncoding::SOPP;
++    inst.category = InstCategory::FlowControl;
++    inst.length = length;
++    inst.src_count = 0;
++    inst.dst_count = 0;
++}
+ 
+-    const u32 base_pc = pc_map[setpc_index - 3] + getpc.length;
++std::vector<JumpTable> LowerJumpTables(std::vector<GcnInst>& insts, std::span<const u32> code) {
++    std::vector<JumpTable> tables;
++    std::vector<u32> pc_map(insts.size() + 1);
++    u32 pc = 0;
++    for (size_t i = 0; i < insts.size(); ++i) {
++        pc_map[i] = pc;
++        pc += insts[i].length;
++    }
++    pc_map[insts.size()] = pc;
++    const u32 code_bytes = static_cast<u32>(code.size_bytes());
+ 
+-    const u32 result_pc = static_cast<u32>(static_cast<s32>(base_pc) + signed_offset);
+-    LOG_DEBUG(Render_Recompiler, "SetPC target: {} + {} = {}", base_pc, signed_offset, result_pc);
+-    return result_pc & ~0x3u;
++    for (u32 i = 0; i < insts.size(); ++i) {
++        const auto& setpc = insts[i];
++        if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src[0].field != OperandField::ScalarGPR ||
++            ResolveSetPcTarget(insts, i, pc_map)) {
++            continue;
++        }
++        // Expected shape (NHL 24, switch statements in shaders):
++        //   s_min_u32  sI, x, N-1 ; s_lshl_b32 sI, sI, log2(stride)
++        //   s_getpc_b64 s[T]      ; s_add_u32 sT, lit ; s_addc_u32 sT+1  -> table address
++        //   s_load_dwordx2 s[B], s[T], sI                               -> table entry
++        //   s_getpc_b64 s[A]      ; s_add_u32 sA, sA, sB ; s_addc_u32 ... ; s_setpc_b64 s[A]
++        const u32 a = setpc.src[0].code;
++        const int add_idx = FindLastWriter(insts, i, a, 8);
++        if (add_idx < 0) {
++            continue;
++        }
++        const auto& add = insts[add_idx];
++        if (add.opcode != Opcode::S_ADD_U32 || add.src_count < 2) {
++            continue;
++        }
++        u32 b;
++        if (add.src[0].field == OperandField::ScalarGPR && add.src[0].code == a &&
++            add.src[1].field == OperandField::ScalarGPR) {
++            b = add.src[1].code;
++        } else if (add.src[1].field == OperandField::ScalarGPR && add.src[1].code == a &&
++                   add.src[0].field == OperandField::ScalarGPR) {
++            b = add.src[0].code;
++        } else {
++            continue;
++        }
++        const int getpc_idx = FindLastWriter(insts, add_idx, a, 8);
++        if (getpc_idx < 0 || insts[getpc_idx].opcode != Opcode::S_GETPC_B64 ||
++            insts[getpc_idx].dst[0].code != a) {
++            continue;
++        }
++        const u32 base_pc = pc_map[getpc_idx] + insts[getpc_idx].length;
++        // Everything between the add and setpc may only touch the high dword.
++        bool clean = true;
++        for (int k = add_idx + 1; k < static_cast<int>(i); ++k) {
++            if (WritesSgpr(insts[k], a)) {
++                clean = false;
++            }
++        }
++        const int load_idx = FindLastWriter(insts, getpc_idx, b, 24);
++        if (!clean || load_idx < 0) {
++            continue;
++        }
++        const auto& load = insts[load_idx];
++        if ((load.opcode != Opcode::S_LOAD_DWORDX2 && load.opcode != Opcode::S_LOAD_DWORD) ||
++            load.dst[0].code != b || load.control.smrd.imm != 0 ||
++            load.src[1].field != OperandField::ScalarGPR) {
++            continue;
++        }
++        const u32 index_reg = load.src[1].code;
++        const auto table_pc = ResolvePcValue(insts, load_idx, load.src[0].code * 2, pc_map);
++        if (!table_pc) {
++            continue;
++        }
++        // The index (a byte offset into the table) must stay unchanged until setpc - unless it
++        // can be recomputed from the clamp's source (see below).
++        bool index_reused = false;
++        for (u32 k = load_idx + 1; k < i; ++k) {
++            if (WritesSgpr(insts[k], index_reg)) {
++                index_reused = true;
++            }
++        }
++        for (int k = load_idx + 1; k < add_idx; ++k) {
++            if (WritesSgpr(insts[k], b)) {
++                clean = false;
++            }
++        }
++        if (!clean) {
++            continue;
++        }
++        // Index shape: s_min_u32 sI, x, N-1 ; [s_lshl_b32 sI, sI, k] ; [s_add_u32 sI, sI, base]
++        // (the base appears when two switches share one table).
++        u32 stride = 1;
++        u32 base_offset = 0;
++        int w = FindLastWriter(insts, load_idx, index_reg, 16);
++        while (w >= 0 &&
++               (insts[w].opcode == Opcode::S_ADD_U32 || insts[w].opcode == Opcode::S_ADD_I32) &&
++               insts[w].src[0].field == OperandField::ScalarGPR &&
++               insts[w].src[0].code == index_reg) {
++            const auto c = ConstOperandValue(insts[w].src[1]);
++            if (!c) {
++                break;
++            }
++            base_offset += *c;
++            w = FindLastWriter(insts, w, index_reg, 16);
++        }
++        if (w >= 0 && insts[w].opcode == Opcode::S_LSHL_B32 &&
++            insts[w].src[0].field == OperandField::ScalarGPR && insts[w].src[0].code == index_reg) {
++            const auto sh = ConstOperandValue(insts[w].src[1]);
++            if (!sh || *sh > 4) {
++                continue;
++            }
++            stride = 1u << *sh;
++            w = FindLastWriter(insts, w, index_reg, 16);
++        }
++        if (w < 0 || insts[w].opcode != Opcode::S_MIN_U32) {
++            continue;
++        }
++        std::optional<u32> max_index = ConstOperandValue(insts[w].src[1]);
++        if (!max_index) {
++            max_index = ConstOperandValue(insts[w].src[0]);
++        }
++        if (!max_index || *max_index > 255) {
++            continue;
++        }
++        const u32 count = *max_index + 1;
++
++        JumpTable table{.setpc_index = i, .index_reg = index_reg};
++        if (index_reused) {
++            // e.g. NHL 24 create-zone shader: s_load_dwordx2 s[68:69], s[66:67], s64 followed by
++            // s_buffer_load_dwordx4 s[64:67] before the setpc. Compare the clamp's source instead.
++            const GcnInst& min = insts[w];
++            InstOperand src{};
++            if (ConstOperandValue(min.src[1])) {
++                src = min.src[0];
++            } else if (ConstOperandValue(min.src[0])) {
++                src = min.src[1];
++            }
++            bool usable = base_offset == 0 && (src.field == OperandField::ScalarGPR ||
++                                               src.field == OperandField::VccLo);
++            for (u32 k = static_cast<u32>(w) + 1; usable && k < i; ++k) {
++                if (WritesScalarOperand(insts[k], src)) {
++                    usable = false;
++                }
++            }
++            if (!usable) {
++                continue;
++            }
++            table.index_op = src;
++            table.clamped_last = true;
++        }
++        // The table usually sits after the code covered by the shader header, but the shader
++        // itself reads it at this address at run time, so the memory is valid guest memory.
++        bool ok = true;
++        std::string dump;
++        for (u32 k = 0; k < count; ++k) {
++            const u32 entry_addr = *table_pc + base_offset + k * stride;
++            if ((entry_addr & 3) != 0 || entry_addr > code_bytes + 0x10000) {
++                dump += fmt::format(" [{}] bad address {:#x}", k, entry_addr);
++                ok = false;
++                break;
++            }
++            const u32 entry = code.data()[entry_addr / 4];
++            const u32 target = (base_pc + entry) & ~0x3u;
++            const bool valid = target < pc_map[insts.size()] &&
++                               std::ranges::binary_search(pc_map, target);
++            dump += fmt::format(" [{}] {:#x}->{:#x}{}", k, entry, target, valid ? "" : "!");
++            ok = ok && valid;
++            table.values.push_back(table.clamped_last ? k : base_offset + k * stride);
++            table.targets.push_back(target);
++        }
++        if (!ok) {
++            LOG_ERROR(Render_Recompiler,
++                      "Jump table at {:#x} for S_SETPC_B64 at {:#x} is invalid (code {:#x} "
++                      "bytes, base {:#x}):{}",
++                      *table_pc, pc_map[i], code_bytes, base_pc, dump);
++            continue;
++        }
++        LOG_INFO(Render_Recompiler,
++                 "Lowered shader jump table: S_SETPC_B64 at {:#x}, {} cases, index s{}{}",
++                 pc_map[i], count, index_reg,
++                 table.clamped_last ? " (compared through the clamp source)" : "");
++        // The table read and the computed target are replaced by a compare chain in the CFG.
++        MakeNop(insts[load_idx]);
++        MakeNop(insts[add_idx]); // s_add_u32 sA, sA, sB
++        for (int k = add_idx + 1; k < static_cast<int>(i); ++k) {
++            if (insts[k].opcode == Opcode::S_ADDC_U32 && WritesSgpr(insts[k], a + 1)) {
++                MakeNop(insts[k]); // high dword of the computed target
++            }
++        }
++        tables.push_back(std::move(table));
++    }
++    return tables;
++}
++
++static void LogUnresolvedSetPc(std::span<const GcnInst> list, u32 setpc_index, u32 pc) {
++    LOG_ERROR(Render_Recompiler,
++              "S_SETPC_B64 without a resolvable target at PC {:#x} (index {}); treating it as "
++              "the end of the shader. Preceding instructions:",
++              pc, setpc_index);
++    const u32 first = setpc_index > 12 ? setpc_index - 12 : 0;
++    for (u32 i = first; i <= setpc_index; ++i) {
++        const auto& inst = list[i];
++        std::string ops;
++        for (u32 j = 0; j < inst.dst_count && j < 2; ++j) {
++            ops += fmt::format(" d{}={}:{:#x}", j, static_cast<u32>(inst.dst[j].field),
++                               inst.dst[j].code);
++        }
++        for (u32 j = 0; j < inst.src_count && j < 3; ++j) {
++            ops += fmt::format(" s{}={}:{:#x}", j, static_cast<u32>(inst.src[j].field),
++                               inst.src[j].code);
++        }
++        LOG_ERROR(Render_Recompiler, "  [{}] {}{}", i, magic_enum::enum_name(inst.opcode), ops);
++    }
+ }
+ 
+ static constexpr size_t LabelReserveSize = 32;
+ 
+-CFG::CFG(Common::ObjectPool<Block>& block_pool_, std::span<const GcnInst> inst_list_)
+-    : block_pool{block_pool_}, inst_list{inst_list_} {
++CFG::CFG(Common::ObjectPool<Block>& block_pool_, std::span<const GcnInst> inst_list_,
++         std::span<const JumpTable> jump_tables_)
++    : block_pool{block_pool_}, inst_list{inst_list_}, jump_tables{jump_tables_} {
+     index_to_pc.resize(inst_list.size() + 1);
+     labels.reserve(LabelReserveSize);
+     EmitLabels();
+@@ -126,14 +481,23 @@ void CFG::EmitLabels() {
+         if (inst.IsUnconditionalBranch()) {
+             u32 target = inst.BranchTarget(pc);
+             if (inst.opcode == Opcode::S_SETPC_B64) {
++                if (const JumpTable* table = FindJumpTable(i)) {
++                    for (const u32 t : table->targets) {
++                        AddLabel(t);
++                    }
++                    AddLabel(pc + inst.length);
++                    pc += inst.length;
++                    continue;
++                }
+                 if (auto t = ResolveSetPcTarget(inst_list, i, index_to_pc)) {
+                     target = *t;
+                 } else {
+-                    ASSERT_MSG(
+-                        false,
+-                        "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
+-                        "instructions not recognized or invalid pattern",
+-                        pc, i);
++                    // nhlport: do not abort the whole game over one shader. The jump is
++                    // treated like s_endpgm (see LinkBlocks); at worst one effect draws wrong.
++                    LogUnresolvedSetPc(inst_list, i, pc);
++                    AddLabel(pc + inst.length);
++                    pc += inst.length;
++                    continue;
+                 }
+             }
+             AddLabel(target);
+@@ -184,6 +548,9 @@ void CFG::SplitDivergenceScopes() {
+     };
+ 
+     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
++        if (blk->synth_inst) {
++            continue;
++        }
+         auto next_blk = std::next(blk);
+         s32 curr_begin = -1;
+         for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
+@@ -308,6 +675,109 @@ void CFG::EmitBlocks() {
+     }
+ }
+ 
++const JumpTable* CFG::FindJumpTable(u32 setpc_index) const {
++    for (const auto& t : jump_tables) {
++        if (t.setpc_index == setpc_index) {
++            return &t;
++        }
++    }
++    return nullptr;
++}
++
++// nhlport: a switch through a jump table becomes a chain of "s_cmp_eq_u32 sI, value" blocks,
++// each branching to its case on SCC=1 and to the next compare otherwise. The last case is the
++// fallback: the shader clamps the index with s_min_u32, so it is never out of range.
++template <typename GetBlock>
++void CFG::LinkJumpTable(Block& block, const JumpTable& table, GetBlock&& get_block) {
++    const auto make_synth = [this, &block](const GcnInst& inst) {
++        Block* c = block_pool.Create();
++        c->begin = next_synth_pc;
++        c->end = next_synth_pc + 4;
++        next_synth_pc += 4;
++        c->begin_index = block.end_index;
++        c->end_index = block.end_index;
++        c->synth_inst = &inst;
++        c->end_class = EndClass::Branch;
++        c->num_predecessors = 1;
++        blocks.insert(*c);
++        return c;
++    };
++    // Every edge into a case goes through its own empty block. Without it a case target that
++    // is also the switch's merge point leaves the structurizer an empty "if" body.
++    const auto trampoline = [&](u32 target_pc) {
++        GcnInst& nop = synth_insts.emplace_back();
++        nop.opcode = Opcode::S_NOP;
++        nop.encoding = InstEncoding::SOPP;
++        nop.category = InstCategory::FlowControl;
++        nop.length = 4;
++        Block* t = make_synth(nop);
++        t->end_inst = nop;
++        t->end_inst.opcode = Opcode::S_BRANCH;
++        t->cond = IR::Condition::True;
++        Block* target = get_block(target_pc);
++        t->branch_true = target;
++        target->num_predecessors++;
++        return t;
++    };
++
++    // Any case can be the "else" of the chain since the index is clamped to the table. Use the
++    // highest target: when a case jumps straight to the code after the switch (an empty case),
++    // that is the highest one, and making it the fallback keeps the structurizer from seeing a
++    // conditional jump to the switch's own merge point.
++    const size_t count = table.targets.size();
++    const u32 fallback = *std::ranges::max_element(table.targets);
++    Block* prev = &block;
++    block.end_class = EndClass::Branch;
++    block.cond = IR::Condition::True;
++    block.branch_false = nullptr;
++    for (size_t k = 0; k < count; ++k) {
++        if (table.targets[k] == fallback) {
++            continue; // handled by the fallback edge
++        }
++        // With a compare against the clamp's source, the last case takes every larger value too.
++        const bool at_least = table.clamped_last && k + 1 == count;
++        GcnInst& cmp = synth_insts.emplace_back();
++        cmp.opcode = at_least ? Opcode::S_CMP_GE_U32 : Opcode::S_CMP_EQ_U32;
++        cmp.encoding = InstEncoding::SOPC;
++        cmp.category = InstCategory::ScalarALU;
++        cmp.length = 4;
++        cmp.src_count = 2;
++        cmp.dst_count = 0;
++        cmp.src[0].field = OperandField::ScalarGPR;
++        cmp.src[0].type = ScalarType::Uint32;
++        cmp.src[0].code = table.index_reg;
++        if (table.clamped_last) {
++            cmp.src[0].field = table.index_op.field;
++            cmp.src[0].code = table.index_op.code;
++        }
++        cmp.src[1].field = OperandField::LiteralConst;
++        cmp.src[1].type = ScalarType::Uint32;
++        cmp.src[1].code = table.values[k];
++
++        Block* c = make_synth(cmp);
++        c->end_inst = cmp;
++        c->end_inst.opcode = Opcode::S_CBRANCH_SCC1;
++        c->end_inst.category = InstCategory::FlowControl;
++        c->cond = IR::Condition::Scc1;
++
++        // The parent block enters the chain unconditionally; each compare falls through
++        // (SCC=0) to the next compare.
++        if (prev == &block) {
++            block.branch_true = c;
++        } else {
++            prev->branch_false = c;
++        }
++        c->branch_true = trampoline(table.targets[k]);
++        prev = c;
++    }
++    Block* last = trampoline(fallback);
++    if (prev == &block) {
++        block.branch_true = last;
++    } else {
++        prev->branch_false = last;
++    }
++}
++
+ void CFG::LinkBlocks() {
+     const auto get_block = [this](u32 address) {
+         auto it = blocks.find(address, Compare{});
+@@ -317,6 +787,9 @@ void CFG::LinkBlocks() {
+ 
+     for (auto it = blocks.begin(); it != blocks.end(); it++) {
+         auto& block = *it;
++        if (block.synth_inst) {
++            continue; // compare blocks of a lowered jump table, already linked
++        }
+         const auto end_inst{block.end_inst};
+ 
+         // If the block doesn't end with a branch we simply
+@@ -334,11 +807,15 @@ void CFG::LinkBlocks() {
+         const u32 branch_pc = block.end - end_inst.length;
+         u32 target_pc = 0;
+         if (end_inst.opcode == Opcode::S_SETPC_B64) {
++            if (const JumpTable* table = FindJumpTable(block.end_index)) {
++                LinkJumpTable(block, *table, get_block);
++                continue;
++            }
+             auto tgt = ResolveSetPcTarget(inst_list, block.end_index, index_to_pc);
+-            ASSERT_MSG(tgt,
+-                       "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
+-                       "instructions not recognized or invalid pattern",
+-                       branch_pc, block.end_index);
++            if (!tgt) {
++                block.end_class = EndClass::Exit; // unresolved computed jump, see EmitLabels
++                continue;
++            }
+             target_pc = *tgt;
+         } else {
+             target_pc = end_inst.BranchTarget(branch_pc);
+diff --git a/src/shader_recompiler/frontend/control_flow_graph.h b/src/shader_recompiler/frontend/control_flow_graph.h
+index f7b44eb..9f497fa 100644
+--- a/src/shader_recompiler/frontend/control_flow_graph.h
++++ b/src/shader_recompiler/frontend/control_flow_graph.h
+@@ -4,6 +4,8 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <deque>
++#include <vector>
+ #include <span>
+ #include <string>
+ #include <boost/container/small_vector.hpp>
+@@ -49,15 +51,34 @@ struct Block : Hook {
+     Block* branch_false{};
+     IR::Block* ir_block{};
+     bool is_dummy{};
++    /// nhlport: compare block of a lowered jump table; translated from this instruction only.
++    const GcnInst* synth_inst{};
+ };
+ 
++/// nhlport: a shader switch implemented as s_setpc_b64 through a table in the shader code.
++struct JumpTable {
++    u32 setpc_index;
++    u32 index_reg;            ///< SGPR holding the byte offset into the table
++    std::vector<u32> values;  ///< index_reg value for each case
++    std::vector<u32> targets; ///< case pc for each value
++    /// nhlport: when the index register is reused before s_setpc, the chain compares the source
++    /// of the clamp (s_min_u32) instead: values are then case numbers and the last case takes
++    /// every value >= its number, exactly like the clamp did.
++    InstOperand index_op{};
++    bool clamped_last = false;
++};
++
++/// Finds jump tables, reads their entries from `code` and removes the table read from `insts`.
++std::vector<JumpTable> LowerJumpTables(std::vector<GcnInst>& insts, std::span<const u32> code);
++
+ class CFG {
+     using Label = u32;
+     using BlockList = boost::intrusive::set<Block>;
+     using iterator = BlockList::iterator;
+ 
+ public:
+-    explicit CFG(Common::ObjectPool<Block>& block_pool, std::span<const GcnInst> inst_list);
++    explicit CFG(Common::ObjectPool<Block>& block_pool, std::span<const GcnInst> inst_list,
++                 std::span<const JumpTable> jump_tables = {});
+ 
+     [[nodiscard]] iterator begin() {
+         return blocks.begin();
+@@ -74,6 +95,9 @@ private:
+     void LinkBlocks();
+     void SplitDivergenceScopes();
+     void RemoveUnreachableBlocks();
++    const JumpTable* FindJumpTable(u32 setpc_index) const;
++    template <typename GetBlock>
++    void LinkJumpTable(Block& block, const JumpTable& table, GetBlock&& get_block);
+ 
+     void AddLabel(Label address) {
+         const auto it = std::ranges::find(labels, address);
+@@ -97,6 +121,9 @@ public:
+     std::vector<u32> index_to_pc;
+     boost::container::small_vector<Label, 16> labels;
+     BlockList blocks;
++    std::span<const JumpTable> jump_tables;
++    std::deque<GcnInst> synth_insts;
++    u32 next_synth_pc = 0x7ff00000u;
+ };
+ 
+ } // namespace Shader::Gcn
+diff --git a/src/shader_recompiler/info.h b/src/shader_recompiler/info.h
+index 75dcac5..515d1d9 100644
+--- a/src/shader_recompiler/info.h
++++ b/src/shader_recompiler/info.h
+@@ -161,7 +161,14 @@ struct Info : InfoPersistent {
+ 
+     void AddBindings(Backend::Bindings& bnd) const {
+         bnd.buffer += buffers.size();
+-        bnd.unified += buffers.size() + images.size() + samplers.size();
++        // nhlport: an image with the dynamic-index mip fallback takes one binding per mip (see
++        // DefineImagesAndSamplers / BuildDescSetLayout); counting it as one shifted every binding
++        // of the next stage when a cached permutation was reused.
++        u32 image_bindings = 0;
++        for (const auto& image : images) {
++            image_bindings += image.NumBindings(*this);
++        }
++        bnd.unified += buffers.size() + image_bindings + samplers.size();
+     }
+ 
+     void RefreshFlatBuf() {
+diff --git a/src/shader_recompiler/ir/passes/resource_patching_pass.cpp b/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+index 9cb37c8..655d9a9 100644
+--- a/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+@@ -113,7 +113,10 @@ public:
+ 
+     u32 Add(const ImageResource& desc) {
+         const u32 index{Add(image_resources, desc, [&desc](const auto& existing) {
++            // nhlport (Be a Pro fork, R10): a colour sample and a depth comparison need different
++            // SPIR-V image declarations and host formats even when their guest T# is identical.
+             return desc.sharp_fetch == existing.sharp_fetch && desc.is_array == existing.is_array &&
++                   desc.is_depth == existing.is_depth &&
+                    desc.mip_fallback_mode == existing.mip_fallback_mode &&
+                    desc.constant_mip_index == existing.constant_mip_index &&
+                    desc.post_op == existing.post_op;
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index b8af3b7..f3733d8 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -52,6 +52,8 @@ struct Profile {
+     bool needs_unorm_fixup{};
+     bool needs_clip_distance_emulation{};
+     bool supports_shader_stencil_export{};
++    /// nhlport: cap the loop iterations of the shaders listed in emit_spirv.cpp (GTX 10xx fix)
++    bool nhl_loop_fuse{};
+ 
+     bool operator==(const Profile&) const = default;
+ };
+diff --git a/src/shader_recompiler/recompiler.cpp b/src/shader_recompiler/recompiler.cpp
+index a6d8549..2474eb4 100644
+--- a/src/shader_recompiler/recompiler.cpp
++++ b/src/shader_recompiler/recompiler.cpp
+@@ -40,8 +40,13 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
+         auto* ir_block = pools.block_pool.Create(pools.inst_pool);
+         ir_block->cfg_block = &block;
+         block.ir_block = ir_block;
+-        translator.Translate(ir_block, block.begin, block.cond,
+-                             std::span{program.ins_list}.subspan(start, size));
++        if (block.synth_inst) {
++            translator.Translate(ir_block, block.begin, block.cond,
++                                 std::span{block.synth_inst, 1});
++        } else {
++            translator.Translate(ir_block, block.begin, block.cond,
++                                 std::span{program.ins_list}.subspan(start, size));
++        }
+         program.blocks.push_back(ir_block);
+     }
+     translator.EmitPrologue(program.blocks.front());
+@@ -83,7 +88,8 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
+ 
+     // Create control flow graph
+     Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
+-    Gcn::CFG cfg{gcn_block_pool, program.ins_list};
++    const auto jump_tables = Gcn::LowerJumpTables(program.ins_list, code);
++    Gcn::CFG cfg{gcn_block_pool, program.ins_list, jump_tables};
+     EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
+ 
+     // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index a951a10..c231822 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -167,6 +167,12 @@ void Liverpool::ProcessCommands() {
+ 
+ void Liverpool::Process(std::stop_token stoken) {
+     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
++    // nhlport: this thread turns the guest's GPU packets into Vulkan work and is the CPU bottleneck
++    // on 6-core CPUs. Run it above the game's job threads so Windows does not park it behind them
++    // (or on an E-core). NHLPORT_GPU_PRIORITY=0 keeps the normal priority.
++    if (const char* env = std::getenv("NHLPORT_GPU_PRIORITY"); !(env && env[0] == '0')) {
++        Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
++    }
+     gpu_id = std::this_thread::get_id();
+ #ifdef __linux__
+     gpu_tid = gettid();
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index a808248..0c0eb25 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
+@@ -107,6 +108,36 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
+         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
+                        reqs.memoryTypeBits)
+             .value();
++    // nhlport: memory types to fall back to when the preferred one is out of memory: other
++    // device-local types first, then the rest (system memory reached over PCIe).
++    {
++        const auto& props = instance.GetMemoryProperties();
++        for (const bool want_local : {true, false}) {
++            for (u32 i = 0; i < props.memoryTypeCount; ++i) {
++                if (i == arena_memory_type_index || ((reqs.memoryTypeBits >> i) & 1) == 0) {
++                    continue;
++                }
++                const bool local = static_cast<bool>(props.memoryTypes[i].propertyFlags &
++                                                     vk::MemoryPropertyFlagBits::eDeviceLocal);
++                if (local == want_local) {
++                    arena_fallback_types.push_back(i);
++                }
++            }
++        }
++        std::string types;
++        for (const u32 t : arena_fallback_types) {
++            types += fmt::format(" {}({})", t,
++                                 vk::to_string(props.memoryTypes[t].propertyFlags));
++        }
++        LOG_INFO(Render, "buffer arena memory: type {} ({}), fallback:{}", arena_memory_type_index,
++                 vk::to_string(props.memoryTypes[arena_memory_type_index].propertyFlags),
++                 types.empty() ? " none" : types);
++        if (const char* env = std::getenv("NHLPORT_ARENA_VRAM_LIMIT_MB")) {
++            arena_device_limit = std::strtoull(env, nullptr, 10) * 1_MB;
++            LOG_INFO(Render, "buffer arena: VRAM limited to {} MB (NHLPORT_ARENA_VRAM_LIMIT_MB)",
++                     arena_device_limit / 1_MB);
++        }
++    }
+ 
+     const u64 bda_pagetable_size =
+         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
+@@ -504,15 +535,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+         return;
+     }
+ 
+-    const vk::MemoryAllocateFlagsInfo alloc_flags = {
+-        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+-    };
+-    const vk::MemoryAllocateInfo alloc_info = {
+-        .pNext = &alloc_flags,
+-        .allocationSize = resident_blocks << block_shift,
+-        .memoryTypeIndex = arena_memory_type_index,
+-    };
+-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
++    const auto device_memory = AllocateArenaMemory(u64(resident_blocks) << block_shift);
+ 
+     boost::container::small_vector<vk::BufferCopy, 8> copies;
+     const auto staging =
+@@ -552,6 +575,71 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+ }
+ 
++vk::DeviceMemory BufferCache::AllocateArenaMemory(u64 size) {
++    const auto device = instance.GetDevice();
++    const vk::MemoryAllocateFlagsInfo alloc_flags = {
++        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
++    };
++    vk::Result last_result = vk::Result::eErrorOutOfDeviceMemory;
++    const auto try_type = [&](u32 type) -> vk::DeviceMemory {
++        const vk::MemoryAllocateInfo alloc_info = {
++            .pNext = &alloc_flags,
++            .allocationSize = size,
++            .memoryTypeIndex = type,
++        };
++        auto [result, memory] = device.allocateMemory(alloc_info);
++        last_result = result;
++        return result == vk::Result::eSuccess ? memory : vk::DeviceMemory{};
++    };
++
++    const bool over_test_limit =
++        arena_device_limit != 0 && arena_device_bytes + size > arena_device_limit;
++    // After VRAM ran out, only every 32nd allocation tries it again (failing allocations
++    // can be slow while the driver looks for memory to evict).
++    const bool try_device = !over_test_limit && (arena_device_skips == 0 || --arena_device_skips == 0);
++    if (try_device) {
++        if (const auto memory = try_type(arena_memory_type_index)) {
++            arena_device_bytes += size;
++            return memory;
++        }
++        // Out of VRAM: drop the images parked for reuse and try again.
++        TrimImagePool();
++        if (const auto memory = try_type(arena_memory_type_index)) {
++            arena_device_bytes += size;
++            return memory;
++        }
++        arena_device_skips = 32;
++    }
++    for (const u32 type : arena_fallback_types) {
++        const bool local =
++            static_cast<bool>(instance.GetMemoryProperties().memoryTypes[type].propertyFlags &
++                              vk::MemoryPropertyFlagBits::eDeviceLocal);
++        if (local && !try_device) {
++            continue;
++        }
++        if (const auto memory = try_type(type)) {
++            u64& bytes = local ? arena_device_bytes : arena_host_bytes;
++            const bool crossed = (bytes >> 28) != ((bytes + size) >> 28); // every 256 MB
++            bytes += size;
++            static u32 logged = 0;
++            if (logged < 3 || crossed) {
++                ++logged;
++                LOG_WARNING(Render,
++                            "buffer arena: out of VRAM, {} KB placed in memory type {} "
++                            "({} MB on GPU, {} MB in system memory)",
++                            size >> 10, type, arena_device_bytes >> 20, arena_host_bytes >> 20);
++            }
++            return memory;
++        }
++    }
++    ASSERT_MSG(false,
++               "Out of video memory for game buffers: {} ({} MB on GPU, {} MB in system "
++               "memory, request {} KB)",
++               vk::to_string(last_result), arena_device_bytes >> 20, arena_host_bytes >> 20,
++               size >> 10);
++    return {};
++}
++
+ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
+                                     bool is_written, bool is_texel_buffer) {
+     boost::container::small_vector<vk::BufferCopy, 4> copies;
+@@ -600,13 +688,22 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
+             // of the HTile case above.
+             const bool cleared = texture_cache.IsMetaCleared(device_addr, 0);
+             const u32 cmask_fill = cleared ? 0u : 0xffffffffu;
+-            runtime.FillBuffer(arena, arena->Offset(device_addr), size, cmask_fill);
++            // nhlport: the shader's buffer can extend past the CMASK of a small target (UI
++            // strips such as 832x112 / 2944x180); filling all of it overwrote neighbouring GPU
++            // data and hung the GPU. Fill at most the CMASK that covers the owner image.
++            u32 fill_size = size;
++            if (const u64 bound = texture_cache.CmaskUpperBound(device_addr);
++                bound != 0 && fill_size > bound) {
++                fill_size = static_cast<u32>(bound);
++            }
++            runtime.FillBuffer(arena, arena->Offset(device_addr), fill_size, cmask_fill);
+             // The game then treats every 4x4 block of the target as drawn (NHL 24 UI coverage
+             // mask); remembered for the diagnostic log.
+             if (!texture_cache.IsMetaShaderRead(device_addr)) {
+                 texture_cache.MarkMetaShaderRead(device_addr);
+-                LOG_INFO(Render_Vulkan, "CMASK {:#x} ({}) is read by a shader", device_addr,
+-                         texture_cache.DescribeMeta(device_addr));
++                LOG_INFO(Render_Vulkan,
++                         "CMASK {:#x} ({}) is read by a shader: buffer {} bytes, filled {}",
++                         device_addr, texture_cache.DescribeMeta(device_addr), size, fill_size);
+             }
+             return true;
+         } else {
+@@ -618,10 +715,26 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
+         return false;
+     }
+     Image& image = texture_cache.GetImage(image_id);
+-    ASSERT_MSG(device_addr == image.info.guest_address,
+-               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
+-               image.info.guest_address);
+-    const u64 arena_offset = arena->Offset(device_addr);
++    // nhlport: NHL 24 sometimes reads a GPU-written surface as a texel buffer that starts a few
++    // bytes inside it (seen: image + 0x10, when the second match of a session loads). Upstream
++    // asserted here and the game crashed before the opening face-off. The arena maps guest
++    // memory 1:1, so write the whole image back at its own address; the buffer view then reads
++    // the right bytes at its offset.
++    if (device_addr != image.info.guest_address) {
++        static std::atomic<u32> logged{0};
++        const bool in_arena = arena->IsInBounds(image.info.guest_address, image.info.guest_size);
++        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
++            LOG_WARNING(Render_Vulkan,
++                        "Texel buffer {:#x} starts inside image {:#x} ({}x{} {}): {}", device_addr,
++                        image.info.guest_address, image.info.size.width, image.info.size.height,
++                        vk::to_string(image.info.pixel_format),
++                        in_arena ? "syncing the whole image" : "image outside the arena, skipped");
++        }
++        if (!in_arena) {
++            return false;
++        }
++    }
++    const u64 arena_offset = arena->Offset(image.info.guest_address);
+     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
+         const auto& mip_info = image.info.mips_layout[mip];
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index d641230..f92e2c7 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -124,6 +124,10 @@ private:
+ 
+     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
+ 
++    /// nhlport: allocates backing memory for guest buffers, falling back to system memory
++    /// when the card is out of VRAM (4 GB cards used to crash with ErrorOutOfDeviceMemory).
++    vk::DeviceMemory AllocateArenaMemory(u64 size);
++
+     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+ 
+     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
+@@ -175,6 +179,11 @@ private:
+     IntervalList<Backing> resident_ranges;
+ 
+     u32 arena_memory_type_index{};
++    boost::container::small_vector<u32, 8> arena_fallback_types;
++    u64 arena_device_bytes{};
++    u64 arena_host_bytes{};
++    u32 arena_device_skips{};
++    u64 arena_device_limit{}; ///< NHLPORT_ARENA_VRAM_LIMIT_MB (testing the fallback)
+     u32 block_size{};
+     u32 block_shift{};
+     u32 blocks_per_arena_page{};
+diff --git a/src/video_core/renderer_vulkan/nhl_checkpoints.h b/src/video_core/renderer_vulkan/nhl_checkpoints.h
+new file mode 100644
+index 0000000..abc8dd5
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/nhl_checkpoints.h
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// nhlport: GPU hang locator for NVIDIA cards (VK_NV_device_diagnostic_checkpoints).
++// NHLPORT_GPU_CHECKPOINTS=1 enables it: every draw / dispatch / depth-colour copy gets a
++// checkpoint with a sequence number, and a description of it is kept in a ring buffer. When the
++// device is lost, the driver reports the last checkpoint each pipeline stage reached; those are
++// written to the log ("gpu checkpoint ..."), naming the shader the GPU stopped on.
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <string_view>
++#include <vector>
++#include "common/logging/log.h"
++#include "common/types.h"
++#include "video_core/renderer_vulkan/vk_common.h"
++
++namespace Common {
++extern void (*fatal_hook)();   // defined in common/assert.cpp, called once on a failed assert
++}
++
++namespace Vulkan::Checkpoints {
++
++inline bool Requested() {
++    static const bool requested = [] {
++        const char* env = std::getenv("NHLPORT_GPU_CHECKPOINTS");
++        return env && env[0] == '1';
++    }();
++    return requested;
++}
++
++inline std::atomic<bool> enabled{false};
++inline vk::Queue queue{};
++
++struct Entry {
++    std::atomic<u64> seq{0};
++    char text[112]{};
++};
++inline constexpr size_t RingSize = 16384;
++inline std::array<Entry, RingSize> ring{};
++inline std::atomic<u64> next_seq{1};
++
++inline void Mark(vk::CommandBuffer cmdbuf, const char* fmt, ...) {
++    if (!enabled.load(std::memory_order_relaxed)) {
++        return;
++    }
++    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
++    Entry& e = ring[seq % RingSize];
++    va_list args;
++    va_start(args, fmt);
++    std::vsnprintf(e.text, sizeof(e.text), fmt, args);
++    va_end(args);
++    e.seq.store(seq, std::memory_order_release);
++    cmdbuf.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(seq)));
++}
++
++inline const char* Describe(u64 seq) {
++    const Entry& e = ring[seq % RingSize];
++    return e.seq.load(std::memory_order_acquire) == seq ? e.text : "(overwritten)";
++}
++
++inline void Dump() {
++    if (!enabled.load(std::memory_order_relaxed) || !queue) {
++        return;
++    }
++    static std::atomic<bool> once{false};
++    if (once.exchange(true)) {
++        return;
++    }
++    std::vector<vk::CheckpointDataNV> data;
++    try {
++        data = queue.getCheckpointDataNV();
++    } catch (...) {
++        LOG_CRITICAL(Render_Vulkan, "gpu checkpoints: query failed");
++    }
++    const auto count = data.size();
++    LOG_CRITICAL(Render_Vulkan, "gpu checkpoints: {} reported by the driver (last issued #{})",
++                 count, next_seq.load() - 1);
++    u64 reached = 0;
++    for (size_t i = 0; i < count; ++i) {
++        const u64 seq = reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker);
++        reached = std::max(reached, seq);
++        LOG_CRITICAL(Render_Vulkan, "gpu checkpoint stage {}: #{} {}",
++                     vk::to_string(data[i].stage), seq, Describe(seq));
++    }
++    const u64 last = next_seq.load() - 1;
++    // The command that broke the GPU is usually just after the last one it reached.
++    if (reached && reached < last) {
++        const u64 end = std::min(last, reached + 24);
++        LOG_CRITICAL(Render_Vulkan, "gpu checkpoints after the last reached one (#{}..#{}):",
++                     reached + 1, end);
++        for (u64 s = reached + 1; s <= end; ++s) {
++            LOG_CRITICAL(Render_Vulkan, "gpu checkpoint next #{} {}", s, Describe(s));
++        }
++    }
++    for (u64 s = last > 12 ? last - 12 : 1; s <= last; ++s) {
++        LOG_CRITICAL(Render_Vulkan, "gpu checkpoint issued #{} {}", s, Describe(s));
++    }
++}
++
++
++// GPU stuck without the driver reporting a lost device (a compute shader looping forever can be
++// preempted, so Windows never resets the card): log the last commands handed to the GPU. The
++// driver is not asked for its checkpoints here - that query is only valid on a lost device.
++inline void DumpIssued(const char* why) {
++    if (!enabled.load(std::memory_order_relaxed)) {
++        LOG_CRITICAL(Render_Vulkan, "{} (turn on Diagnostics to log the last GPU commands)", why);
++        return;
++    }
++    const u64 last = next_seq.load() - 1;
++    LOG_CRITICAL(Render_Vulkan, "{}: last {} GPU commands issued:", why, last > 24 ? 24 : last);
++    for (u64 s = last > 24 ? last - 24 : 1; s <= last; ++s) {
++        LOG_CRITICAL(Render_Vulkan, "gpu checkpoint issued #{} {}", s, Describe(s));
++    }
++}
++
++// nhlport: NVIDIA Pascal (GTX 10xx, MX1xx/2xx, TITAN X, Quadro P), set by the Scheduler.
++inline std::atomic<bool> pascal_gpu{false};
++
++inline bool IsPascalName(std::string_view name) {
++    for (const std::string_view key : {"GTX 10", "GT 10", "MX1", "MX 1", "MX2", "MX 2", "TITAN X",
++                                       "Quadro P", "Tesla P"}) {
++        if (name.find(key) != std::string_view::npos) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// GTX 10xx fix mode, NHLPORT_GTX10_FIX = skip | fuse | off. Default: "skip" on Pascal, "off"
++// elsewhere. skip: the texture compressor 0x96470850 (faces, helmets) does not run at all (no hang,
++// black faces); fuse: EXPERIMENT - it runs with a cap on the total loop iterations per invocation
++// (a per-loop cap did not help on a GTX 1070); off: unchanged (hangs on Pascal).
++inline std::string_view Gtx10Mode(bool is_pascal) {
++    const char* env = std::getenv("NHLPORT_GTX10_FIX");
++    if (env && env[0]) {
++        const std::string_view v{env};
++        if (v == "fuse" || v == "skip" || v == "off") {
++            return v;
++        }
++    }
++    return is_pascal ? "skip" : "off";
++}
++
++// Compute shaders not run at all. NHLPORT_SKIP_CS = comma separated hex hashes (as in "Compiling cs
++// shader 0x...") replaces the default, "none" turns it off. Default on Pascal: the texture
++// compressor 0x96470850 that never finishes there and hangs the GPU (start-up, match loading).
++inline bool SkipComputeShader(u64 hash) {
++    static const std::vector<u64> list = [] {
++        std::vector<u64> v;
++        const char* env = std::getenv("NHLPORT_SKIP_CS");
++        if (env && env[0]) {
++            std::string_view rest{env};
++            while (!rest.empty()) {
++                const size_t comma = rest.find(',');
++                std::string item{rest.substr(0, comma)};
++                if (!item.empty() && item != "none") {
++                    v.push_back(std::strtoull(item.c_str(), nullptr, 16));
++                }
++                if (comma == std::string_view::npos) {
++                    break;
++                }
++                rest.remove_prefix(comma + 1);
++            }
++        } else if (Gtx10Mode(pascal_gpu.load()) == "skip") {
++            v.push_back(0x96470850ull);
++        }
++        for (const u64 h : v) {
++            LOG_INFO(Render_Vulkan, "compute shader {:#x} will be skipped", h);
++        }
++        return v;
++    }();
++    for (const u64 h : list) {
++        if (h == hash) {
++            static std::atomic<u64> n{0};
++            const u64 k = n.fetch_add(1, std::memory_order_relaxed);
++            if (k < 10 || k % 1000 == 0) {
++                LOG_INFO(Render_Vulkan, "skipped compute shader {:#x} (#{})", hash, k);
++            }
++            return true;
++        }
++    }
++    return false;
++}
++
++// Called from Scheduler once the device and its graphics queue exist.
++inline void Init(vk::Queue graphics_queue, bool extension_enabled) {
++    if (!extension_enabled) {
++        return;
++    }
++    queue = graphics_queue;
++    enabled.store(true);
++    Common::fatal_hook = &Dump;
++    LOG_INFO(Render_Vulkan, "gpu checkpoints: on");
++}
++
++} // namespace Vulkan::Checkpoints
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index fcf70a1..2104e66 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <boost/container/static_vector.hpp>
+ #include <fmt/format.h>
+ #include <fmt/ranges.h>
+@@ -14,6 +15,7 @@
+ #include "sdl_window.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ 
+ #include <vk_mem_alloc.h>
+@@ -203,6 +205,9 @@ std::string Instance::GetDriverVersionName() {
+     return GetReadableVersion(version);
+ }
+ 
++// nhlport: VK_EXT_pageable_device_local_memory enabled (see CreateDevice)
++static bool nhl_vram_paging = false;
++
+ bool Instance::CreateDevice() {
+     const vk::StructureChain feature_chain = physical_device.getFeatures2<
+         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+@@ -212,7 +217,9 @@ bool Instance::CreateDevice() {
+         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
+         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
+         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
++        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
++        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT,
++        vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+     features = feature_chain.get().features;
+ 
+     const vk::StructureChain properties_chain = physical_device.getProperties2<
+@@ -349,12 +356,31 @@ bool Instance::CreateDevice() {
+     }
+     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
++    // nhlport: pageable device-local memory. When video memory runs out the driver moves
++    // allocations to system RAM (slower) instead of failing with ErrorOutOfDeviceMemory, which
++    // crashed 4-6 GB cards. Needs VK_EXT_memory_priority. NHLPORT_VRAM_PAGING=0 turns it off.
++    // (Idea from the NHL24 Be a Pro fork, launcher/arena_memory_fix.c.)
++    {
++        const char* env = std::getenv("NHLPORT_VRAM_PAGING");
++        const bool wanted = !(env && env[0] == '0');
++        const bool paging_supported =
++            feature_chain.get<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>()
++                .pageableDeviceLocalMemory &&
++            feature_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority;
++        nhl_vram_paging = wanted && paging_supported &&
++                          add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) &&
++                          add_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
++        LOG_INFO(Render_Vulkan, "VRAM paging (pageable device-local memory): {}",
++                 nhl_vram_paging ? "on" : (paging_supported ? "off" : "not supported"));
++    }
+     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+     if (shader_clock) {
+         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
+                  shader_clock_features.shaderSubgroupClock);
+     }
++    nv_checkpoints = Checkpoints::Requested() &&
++                     add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+     const bool calibrated_timestamps =
+         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+ 
+@@ -432,6 +458,9 @@ bool Instance::CreateDevice() {
+         },
+         vk::PhysicalDeviceVulkan11Features{
+             .storageBuffer16BitAccess = vk11_features.storageBuffer16BitAccess,
++            // nhlport: shaders use 16-bit values in uniform blocks too (Vulkan validation
++            // VUID-RuntimeSpirv-uniformAndStorageBuffer16BitAccess-06332; Be a Pro fork R7)
++            .uniformAndStorageBuffer16BitAccess = vk11_features.uniformAndStorageBuffer16BitAccess,
+             .shaderDrawParameters = vk11_features.shaderDrawParameters,
+         },
+         vk::PhysicalDeviceVulkan12Features{
+@@ -532,6 +561,12 @@ bool Instance::CreateDevice() {
+         vk::PhysicalDeviceShaderClockFeaturesKHR{
+             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
+         },
++        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
++            .pageableDeviceLocalMemory = true,
++        },
++        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
++            .memoryPriority = true,
++        },
+     };
+ 
+     if (!custom_border_color) {
+@@ -583,6 +618,10 @@ bool Instance::CreateDevice() {
+     if (!shader_clock) {
+         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+     }
++    if (!nhl_vram_paging) {
++        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
++        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
++    }
+ 
+     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+     if (device_result != vk::Result::eSuccess) {
+@@ -643,7 +682,8 @@ void Instance::CreateAllocator() {
+     };
+ 
+     const VmaAllocatorCreateInfo allocator_info = {
+-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
++        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
++                 (nhl_vram_paging ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0u),
+         .physicalDevice = physical_device,
+         .device = *device,
+         .pVulkanFunctions = &functions,
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index 289653f..ed7239e 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -130,6 +130,11 @@ public:
+         return maintenance_8;
+     }
+ 
++    /// nhlport: VK_NV_device_diagnostic_checkpoints enabled (NHLPORT_GPU_CHECKPOINTS=1).
++    bool IsNvCheckpointsEnabled() const {
++        return nv_checkpoints;
++    }
++
+     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
+     bool IsAttachmentFeedbackLoopLayoutSupported() const {
+         return attachment_feedback_loop;
+@@ -545,6 +550,7 @@ private:
+     bool workgroup_memory_explicit_layout{};
+     bool maintenance_5{};
+     bool maintenance_8{};
++    bool nv_checkpoints{};
+     bool attachment_feedback_loop{};
+     bool image_2d_view_of_3d{};
+     bool image_view_min_lod{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 79209b5..fea1133 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -18,6 +18,7 @@
+ #include "video_core/cache_storage.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
+@@ -342,6 +343,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
+         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+     };
++    {
++        // nhlport: GTX 10xx fix (see Checkpoints::Gtx10Mode)
++        const bool is_pascal = instance.GetVendorID() == 0x10DE &&
++                            Checkpoints::IsPascalName(instance.GetModelName());
++        const std::string_view mode = Checkpoints::Gtx10Mode(is_pascal);
++        profile.nhl_loop_fuse = mode == "fuse";
++        LOG_INFO(Render_Vulkan, "GTX 10xx fix: {} (Pascal GPU: {})", mode, is_pascal);
++    }
+     WarmUp();
+ 
+     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+@@ -730,23 +739,43 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
+ 
+     vk::ShaderModule module{};
+ 
++    const Shader::Info* perm_info = &info;
+     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+     if (it == program->modules.end()) {
+-        auto new_info = Shader::Info(hw_stage, sw_stage, params);
+-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+-
+-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+-        program->AddPermut(module, std::move(spec));
++        auto new_info = std::make_shared<Shader::Info>(hw_stage, sw_stage, params);
++        module = CompileModule(*new_info, runtime_info, params.code, perm_idx, binding);
++        new_info->RefreshFlatBuf();
++        if (new_info->buffers.size() != info.buffers.size() ||
++            new_info->images.size() != info.images.size() ||
++            new_info->samplers.size() != info.samplers.size()) {
++            LOG_WARNING(Render_Vulkan,
++                        "{} shader {:#x} permutation {} has its own resources (buffers {}/{}, "
++                        "images {}/{}, samplers {}/{})",
++                        hw_stage, params.hash, perm_idx, new_info->buffers.size(),
++                        info.buffers.size(), new_info->images.size(), info.images.size(),
++                        new_info->samplers.size(), info.samplers.size());
++        }
++
++        RegisterShaderMeta(*new_info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
++        perm_info = new_info.get();
++        program->AddPermut(module, std::move(spec), std::move(new_info));
+     } else {
+-        info.AddBindings(binding);
+-        module = it->module;
+         perm_idx = std::distance(program->modules.begin(), it);
+         perm_hash = HashCombine(params.hash, perm_idx);
++        auto& own = program->InfoFor(perm_idx);
++        if (&own != &info) {
++            own.pgm_base = params.Base();
++            own.user_data = params.user_data;
++            own.RefreshFlatBuf();
++        }
++        own.AddBindings(binding);
++        perm_info = &own;
++        module = it->module;
+     }
+     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+         fetch_shader = &fetch;
+     }
+-    return std::make_tuple(&program->info, module, perm_hash);
++    return std::make_tuple(perm_info, module, perm_hash);
+ }
+ 
+ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index b684357..81256ce 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include <variant>
+ #include <tsl/robin_map.h>
+ #include "shader_recompiler/profile.h"
+@@ -46,6 +47,12 @@ struct Program {
+     struct Module {
+         vk::ShaderModule module;
+         Shader::StageSpecialization spec;
++        // nhlport: a permutation is translated again from scratch, and with different sharps it
++        // can end up with a different resource list than the program's first translation. The
++        // pipeline layout and the descriptor updates must use the same list the module was
++        // compiled with, or the shader reads the wrong descriptors (Vulkan validation:
++        // VUID-VkGraphicsPipelineCreateInfo-layout-07990, VUID-vkCmdDraw*-viewType-07752).
++        std::shared_ptr<Shader::Info> own_info{};
+     };
+     static constexpr size_t MaxPermutations = 8;
+     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
+@@ -57,14 +64,26 @@ struct Program {
+     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
+         : info{stage, l_stage, params} {}
+ 
+-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+-        modules.emplace_back(module, std::move(spec));
++    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
++                   std::shared_ptr<Shader::Info> own_info = {}) {
++        modules.emplace_back(module, std::move(spec), std::move(own_info));
+     }
+ 
+     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
+-                      size_t perm_idx) {
++                      size_t perm_idx, std::shared_ptr<Shader::Info> own_info = {}) {
+         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
+-        modules[perm_idx] = {module, std::move(spec)};
++        auto& slot = modules[perm_idx];
++        if (slot.module) {
++            // Already loaded by another pipeline: pipelines built before point at this slot's
++            // info, so it must stay alive and unchanged.
++            own_info = slot.own_info;
++        }
++        slot = {module, std::move(spec), std::move(own_info)};
++    }
++
++    Shader::Info& InfoFor(size_t perm_idx) {
++        auto& own = modules[perm_idx].own_info;
++        return own ? *own : info;
+     }
+ };
+ 
+@@ -85,6 +104,7 @@ public:
+     bool LoadComputePipeline(Serialization::Archive& ar);
+     bool LoadGraphicsPipeline(Serialization::Archive& ar);
+     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
++    void ResetPreloadState();
+ 
+     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+ 
+@@ -139,6 +159,9 @@ private:
+     std::array<const Shader::Info*, MaxShaderStages> infos{};
+     std::array<vk::ShaderModule, MaxShaderStages> modules{};
+     Shader::Gcn::FetchShaderData* fetch_shader{};
++    std::array<Shader::Backend::Bindings, MaxShaderStages> preload_starts{};
++    std::array<Shader::RuntimeInfo, MaxShaderStages> preload_runtime{};
++    u32 preload_binding_mismatches{};
+     GraphicsPipelineKey graphics_key{};
+     ComputePipelineKey compute_key{};
+     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index 7485d73..d9e8d74 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -12,8 +12,8 @@
+ 
+ namespace Serialization {
+ /* You should increment versions below once corresponding serialization scheme is changed. */
+-static constexpr u32 ShaderBinaryVersion = 7u;
+-static constexpr u32 ShaderMetaVersion = 6u;
++static constexpr u32 ShaderBinaryVersion = 9u; // nhlport V3.1.1: loop fuse budget, depth/colour split
++static constexpr u32 ShaderMetaVersion = 8u; // nhlport V3.1.1: drop caches with broken preloads
+ static constexpr u32 PipelineKeyVersion = 3u;
+ } // namespace Serialization
+ 
+@@ -138,6 +138,7 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive&
+ }
+ 
+ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
++    ResetPreloadState();
+     compute_key.Deserialize(ar);
+ 
+     ComputePipeline::SerializationSupport sdata{};
+@@ -205,7 +206,23 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
+     return true;
+ }
+ 
++// nhlport (Vulkan validation, VUID-VkGraphicsPipelineCreateInfo-layout-07988/07990 and
++// VUID-RuntimeSpirv-OpEntryPoint-08743): a pipeline whose load failed half way used to leave its
++// stage infos/modules behind, and the next preloaded pipeline picked them up as extra stages (a
++// stray tessellation or fragment stage, every binding shifted). Such pipelines read the wrong
++// descriptors on the GPU. Start every load from a clean state.
++void PipelineCache::ResetPreloadState() {
++    infos.fill(nullptr);
++    modules.fill(nullptr);
++    fetch_shader = nullptr;
++    preload_starts.fill({});
++    for (auto& rt : preload_runtime) {
++        rt.Initialize(Shader::HwStage::Vertex, Shader::SwStage::Vertex);
++    }
++}
++
+ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
++    ResetPreloadState();
+     graphics_key.Deserialize(ar);
+ 
+     GraphicsPipeline::SerializationSupport sdata{};
+@@ -227,6 +244,51 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+         Serialization::Archive meta_ar{std::move(meta_blob)};
+ 
+         if (!LoadPipelineStage(meta_ar, stage_idx)) {
++            ResetPreloadState();
++            return false;
++        }
++    }
++
++    // nhlport: each stage's module has its descriptor bindings baked in, starting where the
++    // previous stage ended when it was compiled. The layout built below numbers them again from
++    // these infos; if a cached permutation was compiled next to a different stage the two
++    // disagree and the shader reads the wrong resources. Leave such a pipeline to the runtime.
++    Shader::Backend::Bindings expected{};
++    for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
++        const auto* stage_info = infos[stage_idx];
++        if (!stage_info) {
++            continue;
++        }
++        if (preload_starts[stage_idx] != expected) {
++            ++preload_binding_mismatches;
++            ResetPreloadState();
++            return false;
++        }
++        stage_info->AddBindings(expected);
++    }
++
++    // nhlport (Vulkan validation, VUID-RuntimeSpirv-OpEntryPoint-08743): with tessellation the
++    // vertex (LS) outputs and the hull inputs are sized from the LS stride the modules were
++    // compiled with, and the hull outputs / domain inputs from the control point stride. A cached
++    // combination where they differ makes the next stage read vertices that were never written
++    // (torn geometry). Leave it to the runtime.
++    {
++        constexpr auto vs = static_cast<u32>(Shader::SwStage::Vertex);
++        constexpr auto tcs = static_cast<u32>(Shader::SwStage::TessellationControl);
++        constexpr auto tes = static_cast<u32>(Shader::SwStage::TessellationEval);
++        bool tess_ok = true;
++        if (infos[tcs] && infos[vs]) {
++            tess_ok &= preload_runtime[vs].hw_stage == Shader::HwStage::Local &&
++                       preload_runtime[vs].hw.ls.ls_stride ==
++                           preload_runtime[tcs].sw.tcs.ls_stride;
++        }
++        if (infos[tcs] && infos[tes]) {
++            tess_ok &= preload_runtime[tes].sw.tes.hs_output_cp_stride ==
++                       preload_runtime[tcs].sw.tcs.hs_output_cp_stride;
++        }
++        if (!tess_ok) {
++            ++preload_binding_mismatches;
++            ResetPreloadState();
+             return false;
+         }
+     }
+@@ -287,12 +349,31 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage)
+             }
+             module = it->module;
+         } else {
++            // nhlport: the slot of this index already holds another permutation (entries from
++            // different cache generations). Replacing it would pull its info from under the
++            // pipelines already built on it, so leave this pipeline to the runtime.
++            const auto& mods = it_pgm.value()->modules;
++            if (perm_idx < mods.size() && mods[perm_idx].module) {
++                LOG_WARNING(Render_Vulkan,
++                            "Cached permutation {} of {}_{:x} is taken by another one, skipping "
++                            "preload",
++                            perm_idx, program->info.hw_stage, program->info.pgm_hash);
++                return false;
++            }
+             module = CompileSPV(spv, instance.GetDevice());
+         }
+     }
+-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
++    preload_starts[stage] = spec.start;
++    preload_runtime[stage] = spec.runtime_info;
++    // nhlport: the meta holds this permutation's own translation; keep it with the permutation
++    // (the first one loaded also becomes the program's info, as before).
++    std::shared_ptr<Shader::Info> own_info{};
++    if (!new_program) {
++        own_info = std::make_shared<Shader::Info>(std::move(program->info));
++    }
++    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx, std::move(own_info));
+ 
+-    infos[stage] = &it_pgm.value()->info;
++    infos[stage] = &it_pgm.value()->InfoFor(perm_idx);
+     modules[stage] = module;
+     if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+         fetch_shader = &fetch;
+@@ -369,6 +450,11 @@ void PipelineCache::WarmUp() {
+         });
+ 
+     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
++    if (preload_binding_mismatches) {
++        LOG_WARNING(Render, "{} cached pipelines skipped (stages don't match)",
++                    preload_binding_mismatches);
++    }
++    ResetPreloadState();
+     if (num_total_pipelines > num_pipelines) {
+         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
+                     num_total_pipelines - num_pipelines);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 2591bc0..aefd6c9 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -18,7 +18,9 @@
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+ #include <cstdlib>
+ #include "video_core/perf_counters.h"
++#include <cstdio>
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
+@@ -27,6 +29,25 @@
+ 
+ namespace Vulkan {
+ 
++// nhlport: GPU hang locator (see nhl_checkpoints.h); "s<stage>=<shader hash>" as in the
++// "Compiling .. shader 0x.." log lines.
++static void MarkCheckpoint(vk::CommandBuffer cmdbuf, const char* kind, const Pipeline* pipeline) {
++    if (!Checkpoints::enabled.load(std::memory_order_relaxed)) {
++        return;
++    }
++    char text[96];
++    int len = std::snprintf(text, sizeof(text), "%s", kind);
++    u32 index = 0;
++    for (const Shader::Info* info : pipeline->GetStages()) {
++        if (info && len > 0 && len < int(sizeof(text))) {
++            len += std::snprintf(text + len, sizeof(text) - len, " s%u=%llx", index,
++                                 static_cast<unsigned long long>(info->pgm_hash));
++        }
++        ++index;
++    }
++    Checkpoints::Mark(cmdbuf, "%s", text);
++}
++
+ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
+     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
+     // is encountered and implemented in the recompiler.
+@@ -255,6 +276,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
++    MarkCheckpoint(cmdbuf, "draw", pipeline);
+ 
+     if (is_indexed) {
+         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+@@ -330,6 +352,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
++    MarkCheckpoint(cmdbuf, "draw", pipeline);
+ 
+     if (is_indexed) {
+         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
+@@ -394,6 +417,7 @@ void Rasterizer::DispatchDirect() {
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    MarkCheckpoint(cmdbuf, "dispatch", pipeline);
+     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+     DebugState.IncDispatch();
+ 
+@@ -416,6 +440,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+         VideoCore::Perf::draw_skip_pipeline.fetch_add(1, std::memory_order_relaxed);
+         return;
+     }
++    if (Checkpoints::SkipComputeShader(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash)) {
++        return;
++    }
+ 
+     if (!BindResources(pipeline)) {
+         return;
+@@ -447,6 +474,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    MarkCheckpoint(cmdbuf, "dispatch", pipeline);
+     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+     DebugState.IncDispatch();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_runtime.cpp b/src/video_core/renderer_vulkan/vk_runtime.cpp
+index 6c12daf..09369e7 100644
+--- a/src/video_core/renderer_vulkan/vk_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_runtime.cpp
+@@ -1,12 +1,16 @@
+ // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
++#include <mutex>
++#include <string_view>
+ #include <boost/container/small_vector.hpp>
+ #include "common/alignment.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/texture_cache/blit_helper.h"
+ #include "video_core/texture_cache/image.h"
+@@ -468,10 +472,43 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
+     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+ }
+ 
++// nhlport: NVIDIA Pascal (GTX 10xx) advertises VK_KHR_maintenance8 but the direct depth <-> colour
++// image copy hangs the GPU there (NHL 24 swaps a shadow map between D32 and A2B10G10R10 every
++// pass; GTX 1070 / 1080 lose the device right after these copies). Go through a buffer instead,
++// as on GPUs without maintenance8. NHLPORT_DEPTH_COPY_BUFFER=1 / 0 forces it on / off.
++static bool DepthColorCopyViaBuffer(const Instance& instance) {
++    static const bool enabled = [&] {
++        if (const char* env = std::getenv("NHLPORT_DEPTH_COPY_BUFFER"); env && env[0]) {
++            return env[0] == '1';
++        }
++        if (instance.GetVendorID() != 0x10DE) {
++            return false;
++        }
++        const std::string_view name = instance.GetModelName();
++        for (const std::string_view key : {"GTX 10", "GT 10", "MX1", "MX 1", "MX2", "MX 2",
++                                           "TITAN X", "Quadro P", "Tesla P"}) {
++            if (name.find(key) != std::string_view::npos) {
++                return true;
++            }
++        }
++        return false;
++    }();
++    static std::once_flag logged;
++    std::call_once(logged, [] {
++        LOG_INFO(Render_Vulkan, "depth/colour copies via buffer: {}", enabled ? "on" : "off");
++    });
++    return enabled;
++}
++
+ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
++    Checkpoints::Mark(scheduler.CommandBuffer(), "depth/colour copy %s -> %s %ux%u",
++                      vk::to_string(src->info.pixel_format).c_str(),
++                      vk::to_string(dst->info.pixel_format).c_str(), dst->info.size.width,
++                      dst->info.size.height);
+     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
+-        if ((instance.IsMaintenance8Supported() ||
+-             src->info.props.is_depth == dst->info.props.is_depth) &&
++        const bool direct_mixed =
++            instance.IsMaintenance8Supported() && !DepthColorCopyViaBuffer(instance);
++        if ((direct_mixed || src->info.props.is_depth == dst->info.props.is_depth) &&
+             src->aspect_mask == dst->aspect_mask) {
+             CopyImage(src, dst);
+         } else {
+@@ -773,6 +810,28 @@ void Runtime::FlushBarriers() {
+ 
+     scheduler.EndRendering();
+     const auto cmdbuf = scheduler.CommandBuffer();
++    // nhlport (from the Be a Pro fork, R8): a depth attachment that is also sampled still does its
++    // attachment store at EndRendering, after resource binding may have recorded ShaderRead only.
++    // Include that store in the source scope of the transitions (Vulkan validation:
++    // SYNC-HAZARD-WRITE-AFTER-WRITE on D32SfloatS8Uint attachments).
++    for (auto& barrier : image_barriers) {
++        if ((barrier.subresourceRange.aspectMask &
++             (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil)) &&
++            barrier.oldLayout != vk::ImageLayout::eUndefined &&
++            barrier.srcQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED &&
++            barrier.dstQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED) {
++            barrier.srcStageMask |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
++                                    vk::PipelineStageFlagBits2::eLateFragmentTests;
++            barrier.srcAccessMask |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
++            // nhlport (Vulkan validation, SYNC-HAZARD-READ-AFTER-WRITE at vkCmdBeginRendering):
++            // the same depth image is then often loaded as the attachment without another
++            // transition, so the transition must also be visible to the attachment load.
++            barrier.dstStageMask |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
++                                    vk::PipelineStageFlagBits2::eLateFragmentTests;
++            barrier.dstAccessMask |= vk::AccessFlagBits2::eDepthStencilAttachmentRead |
++                                     vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
++        }
++    }
+     cmdbuf.pipelineBarrier2(dep_info);
+ 
+     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index e5536f9..ab23ed5 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -13,6 +13,7 @@
+ #include "video_core/perf_counters.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ 
+ namespace Vulkan {
+ 
+@@ -23,6 +24,9 @@ Scheduler::Scheduler(const Instance& instance)
+ #if TRACY_GPU_ENABLED
+     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
+ #endif
++    Checkpoints::pascal_gpu = instance.GetVendorID() == 0x10DE &&
++                              Checkpoints::IsPascalName(instance.GetModelName());
++    Checkpoints::Init(instance.GetGraphicsQueue(), instance.IsNvCheckpointsEnabled());
+     BeginSession();
+     priority_pending_ops_thread =
+         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+diff --git a/src/video_core/renderer_vulkan/vk_semaphore.cpp b/src/video_core/renderer_vulkan/vk_semaphore.cpp
+index f71d74a..4b72597 100644
+--- a/src/video_core/renderer_vulkan/vk_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_semaphore.cpp
+@@ -4,6 +4,7 @@
+ #include <limits>
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_semaphore.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ 
+ #include "common/assert.h"
+ #include "common/diag_log.h"
+@@ -83,6 +84,14 @@ void Semaphore::Wait(u64 tick) {
+         Refresh();
+         LOG_WARNING(Render_Vulkan, "timeline wait {}s: tick {} known {} current {} thread {}",
+                     waited_s, tick, KnownGpuTick(), CurrentTick(), Common::GetCurrentThreadName());
++        // nhlport: 30 s of GPU work that never finishes and no device lost - the GPU is spinning
++        // in a shader that Windows does not reset. Name the last commands and end the game with
++        // a crash report instead of freezing forever.
++        if (waited_s >= 30) {
++            Checkpoints::DumpIssued("GPU hang without device lost (30 s)");
++            Common::fatal_hook = nullptr;
++            ASSERT_MSG(false, "GPU hang: tick {} not finished after {} s", tick, waited_s);
++        }
+     }
+     Refresh();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_shader_hle.cpp b/src/video_core/renderer_vulkan/vk_shader_hle.cpp
+index 4999349..fa8d9a3 100644
+--- a/src/video_core/renderer_vulkan/vk_shader_hle.cpp
++++ b/src/video_core/renderer_vulkan/vk_shader_hle.cpp
+@@ -5,6 +5,7 @@
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_shader_hle.h"
++#include "video_core/renderer_vulkan/nhl_checkpoints.h"
+ 
+ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+ 
+@@ -104,6 +105,9 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
+ 
+ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
+                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
++    if (Checkpoints::SkipComputeShader(info.pgm_hash)) {
++        return true;
++    }
+     switch (info.pgm_hash) {
+     case COPY_SHADER_HASH:
+         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+diff --git a/src/video_core/renderer_vulkan/vk_shader_util.cpp b/src/video_core/renderer_vulkan/vk_shader_util.cpp
+index b272941..4f9d54f 100644
+--- a/src/video_core/renderer_vulkan/vk_shader_util.cpp
++++ b/src/video_core/renderer_vulkan/vk_shader_util.cpp
+@@ -3,16 +3,36 @@
+ 
+ #include "common/assert.h"
+ #include "video_core/renderer_vulkan/vk_shader_util.h"
++#include "video_core/renderer_vulkan/wave64_scratch.h"
+ 
+ namespace Vulkan {
+ 
+ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
++    // nhlport (from the Be a Pro fork, R11): repair two shared-memory races Vulkan GPU-assisted
++    // validation found in the wave64 lowering (wave64_scratch.h). Applied when the module is
++    // created, so it also covers shaders loaded from the cache; unrecognised code is unchanged.
++    size_t repaired_size{};
++    uint32_t repaired_stores{};
++    uint32_t* repaired = nhl_wave64_scratch_atomic(code.data(), code.size(), &repaired_size,
++                                                   &repaired_stores);
++    if (repaired) {
++        code = {repaired, repaired_size};
++    }
++    size_t ordered_size{};
++    uint32_t ordered_barriers{};
++    uint32_t* ordered = nhl_shared_read_write_barriers(code.data(), code.size(), &ordered_size,
++                                                       &ordered_barriers);
++    if (ordered) {
++        code = {ordered, ordered_size};
++    }
+     const vk::ShaderModuleCreateInfo shader_info = {
+         .codeSize = code.size() * sizeof(u32),
+         .pCode = code.data(),
+     };
+ 
+     auto [module_result, module] = device.createShaderModule(shader_info);
++    free(repaired);
++    free(ordered);
+     ASSERT_MSG(module_result == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}",
+                vk::to_string(module_result));
+     return module;
+diff --git a/src/video_core/renderer_vulkan/wave64_scratch.h b/src/video_core/renderer_vulkan/wave64_scratch.h
+new file mode 100644
+index 0000000..16af882
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/wave64_scratch.h
+@@ -0,0 +1,243 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Portable SPIR-V repair for subgroup-uniform wave64 scratch stores.
++// nhlport: taken unchanged from the NHL24 Be a Pro fork (github.com/torpedatorpeda/NHL24-Be-a-Pro, R11).
++// The existing workgroup barriers remain in place; no shader hashes are used.
++#ifndef NHL_WAVE64_SCRATCH_H
++#define NHL_WAVE64_SCRATCH_H
++#include <stdint.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef struct { const uint32_t *words; uint16_t opcode, count; } NhlSpvDef;
++typedef struct { const NhlSpvDef *defs; uint32_t bound, local_index; } NhlSpvModule;
++
++static uint32_t nhl_spv_constant(const NhlSpvModule *m, uint32_t id, uint32_t fallback) {
++    if (id >= m->bound) return fallback;
++    const NhlSpvDef d = m->defs[id];
++    if (d.opcode != 43 || d.count != 4) return fallback;
++    return d.words[3];
++}
++
++static int nhl_spv_uniform(const NhlSpvModule *m, uint32_t id, unsigned depth) {
++    if (id >= m->bound || depth > 24) return 0;
++    const NhlSpvDef d = m->defs[id];
++    const uint32_t *w = d.words;
++    if (!w) return 0;
++    if (d.opcode == 43 || d.opcode == 46) return 1; // Constant / ConstantNull
++    if (d.opcode == 337 || d.opcode == 338 || d.opcode == 339)
++        return d.count >= 5 && nhl_spv_constant(m, w[3], 0) == 3;
++    if (d.opcode == 124 || d.opcode == 81) // Bitcast / CompositeExtract
++        return d.count >= 4 && nhl_spv_uniform(m, w[3], depth+1);
++    if (d.opcode == 79) // VectorShuffle: both vectors must be uniform
++        return d.count >= 6 && nhl_spv_uniform(m, w[3], depth+1) &&
++               nhl_spv_uniform(m, w[4], depth+1);
++    return 0;
++}
++
++static int nhl_spv_half_index(const NhlSpvModule *m, uint32_t id) {
++    if (id >= m->bound) return 0;
++    NhlSpvDef d = m->defs[id];
++    if (d.opcode != 194 || d.count != 5 || nhl_spv_constant(m, d.words[4], 0) != 5)
++        return 0;
++    id = d.words[3];
++    if (id >= m->bound) return 0;
++    d = m->defs[id];
++    return d.opcode == 61 && d.count >= 4 && d.words[3] == m->local_index;
++}
++
++static int nhl_spv_half_byte_offset(const NhlSpvModule *m, uint32_t id) {
++    if (id >= m->bound) return 0;
++    const NhlSpvDef d = m->defs[id];
++    return d.opcode == 196 && d.count == 5 &&
++           nhl_spv_constant(m, d.words[4], 0) == 2 && nhl_spv_half_index(m, d.words[3]);
++}
++
++static int nhl_spv_scratch_index(const NhlSpvModule *m, uint32_t id) {
++    if (nhl_spv_half_index(m, id)) return 1;
++    if (id >= m->bound) return 0;
++    NhlSpvDef d = m->defs[id];
++    if (d.opcode != 194 || d.count != 5 || nhl_spv_constant(m, d.words[4], 0) != 2)
++        return 0;
++    id = d.words[3];
++    if (nhl_spv_half_byte_offset(m, id)) return 1;
++    if (id >= m->bound) return 0;
++    d = m->defs[id];
++    if (d.opcode != 128 || d.count != 5) return 0;
++    uint32_t a = nhl_spv_constant(m, d.words[3], UINT32_MAX);
++    uint32_t b = nhl_spv_constant(m, d.words[4], UINT32_MAX);
++    return (a != UINT32_MAX && !(a & 7) && nhl_spv_half_byte_offset(m, d.words[4])) ||
++           (b != UINT32_MAX && !(b & 7) && nhl_spv_half_byte_offset(m, d.words[3]));
++}
++
++static uint32_t nhl_spv_scratch_store(const NhlSpvModule *m, const uint32_t *w,
++                                     const uint32_t *next, const uint32_t *end) {
++    if ((w[0] >> 16) != 3 || w[1] >= m->bound || !nhl_spv_uniform(m, w[2], 0)) return 0;
++    const NhlSpvDef ptr = m->defs[w[1]];
++    if (ptr.opcode != 65 || ptr.count != 5 || !nhl_spv_scratch_index(m, ptr.words[4])) return 0;
++    if (ptr.words[1] >= m->bound || ptr.words[3] >= m->bound) return 0;
++    const NhlSpvDef type = m->defs[ptr.words[1]], variable = m->defs[ptr.words[3]];
++    if (type.opcode != 32 || type.count != 4 || type.words[2] != 4 ||
++        variable.opcode != 59 || variable.count < 4 || variable.words[3] != 4) return 0;
++    const uint32_t value_type = type.words[3];
++    if (value_type >= m->bound) return 0;
++    const NhlSpvDef integer = m->defs[value_type];
++    if (integer.opcode != 21 || integer.count != 4 || integer.words[2] != 32 || integer.words[3]) return 0;
++    // Only the lowering's store immediately followed by its full workgroup barrier.
++    if (end-next < 4 || (next[0] & 65535) != 224 || (next[0] >> 16) != 4 ||
++        nhl_spv_constant(m, next[1], 0) != 2 || nhl_spv_constant(m, next[2], 0) != 2 ||
++        nhl_spv_constant(m, next[3], 0) != 0x108) return 0;
++    return value_type;
++}
++
++// NULL means no recognized repair (or invalid/unsupported input): forward unchanged.
++// Caller owns the returned array. Inputs and cached SPIR-V are never modified.
++static uint32_t *nhl_wave64_scratch_atomic(const uint32_t *code, size_t words,
++                                          size_t *output_words, uint32_t *store_count) {
++    *output_words = words;
++    *store_count = 0;
++    if (!code || words < 5 || words > 1048576 || code[0] != 0x07230203 ||
++        !code[3] || code[3] > 65536) return NULL;
++    NhlSpvDef *defs = (NhlSpvDef *)calloc(code[3], sizeof(*defs));
++    if (!defs) return NULL;
++    NhlSpvModule module = {defs, code[3], 0};
++    const uint32_t *end = code+words;
++    int compute = 0, malformed = 0;
++    for (const uint32_t *w = code+5; w < end;) {
++        uint32_t n = w[0] >> 16, op = w[0] & 65535, id = 0;
++        if (!n || n > (size_t)(end-w)) { malformed = 1; break; }
++        if (op == 15 && n >= 4 && w[1] == 5) compute = 1;
++        if (op == 71 && n == 4 && w[2] == 11 && w[3] == 29) module.local_index = w[1];
++        if ((op == 21 || op == 32) && n >= 2) id = w[1];
++        if ((op == 43 || op == 46 || op == 59 || op == 61 || op == 65 ||
++             op == 79 || op == 81 || op == 124 || op == 128 || op == 194 ||
++             op == 196 || op == 337 || op == 338 || op == 339) && n >= 3) id = w[2];
++        if (id && id < module.bound) { defs[id].words = w; defs[id].opcode = (uint16_t)op; defs[id].count = (uint16_t)n; }
++        w += n;
++    }
++    if (malformed || !compute || !module.local_index) { free(defs); return NULL; }
++    uint32_t repairs = 0, zero = 0, scope = 0;
++    for (const uint32_t *w = code+5; w < end; w += w[0] >> 16) {
++        if ((w[0] & 65535) != 62) continue;
++        uint32_t type = nhl_spv_scratch_store(&module, w, w+(w[0] >> 16), end);
++        if (!type) continue;
++        // All recognized stores must use one unsigned 32-bit type.
++        uint32_t z = 0, s = 0;
++        for (uint32_t i = 1; i < module.bound; ++i) {
++            if (defs[i].opcode != 43 || defs[i].count != 4 || defs[i].words[1] != type) continue;
++            if (defs[i].words[3] == 0) z = i;
++            if (defs[i].words[3] == 2) s = i;
++        }
++        if (!z || !s || (repairs && (z != zero || s != scope))) { free(defs); return NULL; }
++        zero = z; scope = s; ++repairs;
++    }
++    if (!repairs || repairs > 4096 || module.bound > UINT32_MAX-repairs) { free(defs); return NULL; }
++    uint32_t *out = (uint32_t *)malloc((words+4*(size_t)repairs)*sizeof(uint32_t));
++    if (!out) { free(defs); return NULL; }
++    memcpy(out, code, 5*sizeof(uint32_t));
++    out[3] += repairs;
++    size_t at = 5;
++    uint32_t result_id = module.bound;
++    for (const uint32_t *w = code+5; w < end; w += w[0] >> 16) {
++        uint32_t n = w[0] >> 16;
++        uint32_t type = (w[0] & 65535) == 62 ? nhl_spv_scratch_store(&module, w, w+n, end) : 0;
++        if (type) {
++            out[at++] = (7u << 16) | 229u; // OpAtomicExchange
++            out[at++] = type; out[at++] = result_id++;
++            out[at++] = w[1]; out[at++] = scope; out[at++] = zero; out[at++] = w[2];
++        } else { memcpy(out+at, w, n*sizeof(uint32_t)); at += n; }
++    }
++    free(defs);
++    *output_words = at; *store_count = repairs;
++    return out;
++}
++
++static int nhl_spv_workgroup_pointer(const NhlSpvModule *m, uint32_t id) {
++    if (id >= m->bound) return 0;
++    const NhlSpvDef d = m->defs[id];
++    if ((d.opcode != 65 && d.opcode != 59) || d.count < 4 || d.words[1] >= m->bound) return 0;
++    const NhlSpvDef type = m->defs[d.words[1]];
++    return type.opcode == 32 && type.count == 4 && type.words[2] == 4;
++}
++
++// A subgroup memory fence does not stop another invocation from starting a
++// shared-memory write. Promote the fence at a uniform selection header when
++// that block read shared data and the following selection writes shared data.
++// Never place an execution barrier inside the divergent selection itself.
++static uint32_t *nhl_shared_read_write_barriers(const uint32_t *code, size_t words,
++                                                size_t *output_words, uint32_t *barrier_count) {
++    *output_words = words; *barrier_count = 0;
++    if (!code || words < 5 || words > 1048576 || code[0] != 0x07230203 ||
++        !code[3] || code[3] > 65536) return NULL;
++    NhlSpvDef *defs = (NhlSpvDef *)calloc(code[3], sizeof(*defs));
++    unsigned char *patch = (unsigned char *)calloc(words, 1);
++    if (!defs || !patch) { free(defs); free(patch); return NULL; }
++    NhlSpvModule module = {defs, code[3], 0};
++    const uint32_t *end = code+words;
++    int compute = 0, malformed = 0; unsigned functions = 0;
++    for (const uint32_t *w = code+5; w < end;) {
++        uint32_t n = w[0] >> 16, op = w[0] & 65535, id = 0;
++        if (!n || n > (size_t)(end-w)) { malformed = 1; break; }
++        if (op == 15 && n >= 4 && w[1] == 5) compute = 1;
++        if (op == 54) ++functions;
++        // Loops, switches and terminating/discarding branches need a more
++        // complete convergence analysis; leave these modules unchanged.
++        if (op == 246 || op == 251 || op == 252 || op == 255 || op == 4416) malformed = 1;
++        if ((op == 21 || op == 32) && n >= 2) id = w[1];
++        if ((op == 43 || op == 59 || op == 65) && n >= 3) id = w[2];
++        if (id && id < module.bound) { defs[id].words=w; defs[id].opcode=(uint16_t)op; defs[id].count=(uint16_t)n; }
++        w += n;
++    }
++    if (malformed || !compute || functions != 1) { free(defs); free(patch); return NULL; }
++    uint32_t merges[64], pending_merge = 0, depth = 0, workgroup_scope = 0, repairs = 0;
++    int read_shared = 0;
++    for (const uint32_t *w = code+5; w < end; w += w[0] >> 16) {
++        uint32_t n = w[0] >> 16, op = w[0] & 65535;
++        if (op == 248 && n == 2) { // OpLabel
++            if (depth && merges[depth-1] == w[1]) --depth;
++            read_shared = 0;
++        }
++        if ((op == 253 || op == 254) && depth) { malformed = 1; break; }
++        if (op == 61 && n >= 4 && nhl_spv_workgroup_pointer(&module, w[3])) read_shared = 1;
++        if (op == 224) read_shared = 0;
++        if (op == 225 && n == 3 && !depth && read_shared &&
++            nhl_spv_constant(&module,w[1],0) == 3 && nhl_spv_constant(&module,w[2],0) == 0x108 &&
++            end-(w+n) >= 7 && ((w+n)[0] & 65535) == 247 && ((w+n)[0] >> 16) == 3 &&
++            ((w+n+3)[0] & 65535) == 250 && ((w+n+3)[0] >> 16) == 4) {
++            const uint32_t merge = (w+n)[1];
++            int writes_shared = 0, found_merge = 0;
++            for (const uint32_t *q = w+n+7; q < end; q += q[0] >> 16) {
++                uint32_t qn = q[0] >> 16, qo = q[0] & 65535;
++                if (qo == 248 && qn == 2 && q[1] == merge) { found_merge = 1; break; }
++                if (qo == 62 && qn >= 3 && nhl_spv_workgroup_pointer(&module,q[1])) writes_shared = 1;
++            }
++            if (found_merge && writes_shared) {
++                uint32_t scope_type = w[1] < module.bound && defs[w[1]].opcode == 43 ? defs[w[1]].words[1] : 0;
++                uint32_t scope = 0;
++                for (uint32_t i = 1; i < module.bound; ++i)
++                    if (defs[i].opcode == 43 && defs[i].count == 4 &&
++                        defs[i].words[1] == scope_type && defs[i].words[3] == 2) scope = i;
++                if (scope && (!workgroup_scope || scope == workgroup_scope)) {
++                    workgroup_scope = scope; patch[w-code] = 1; ++repairs; read_shared = 0;
++                }
++            }
++        }
++        if (op == 247 && n == 3) pending_merge = w[1];
++        if (op == 250) {
++            if (!pending_merge || depth == 64) { malformed = 1; break; }
++            merges[depth++] = pending_merge; pending_merge = 0;
++        }
++    }
++    if (malformed || depth || !repairs || repairs > 4096) { free(defs); free(patch); return NULL; }
++    uint32_t *out = (uint32_t *)malloc((words+repairs)*sizeof(uint32_t));
++    if (!out) { free(defs); free(patch); return NULL; }
++    memcpy(out,code,5*sizeof(uint32_t));size_t at=5;
++    for (const uint32_t *w=code+5;w<end;w+=w[0]>>16) {
++        uint32_t n=w[0]>>16;
++        if (patch[w-code]) {
++            out[at++]=(4u<<16)|224u;out[at++]=workgroup_scope;out[at++]=workgroup_scope;out[at++]=w[2];
++        } else { memcpy(out+at,w,n*sizeof(uint32_t));at+=n; }
++    }
++    free(defs);free(patch);*output_words=at;*barrier_count=repairs;return out;
++}
++#endif
+diff --git a/src/video_core/texture_cache/image.cpp b/src/video_core/texture_cache/image.cpp
+index 38f76d7..b7b6363 100644
+--- a/src/video_core/texture_cache/image.cpp
++++ b/src/video_core/texture_cache/image.cpp
+@@ -1,7 +1,12 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
++#include <algorithm>
++#include <cstdlib>
++#include <deque>
+ #include <memory>
++#include <mutex>
+ #include "common/assert.h"
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+@@ -86,23 +91,127 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
+     return feature_flags;
+ }
+ 
+-UniqueImage::~UniqueImage() {
+-    if (image) {
+-        vmaDestroyImage(allocator, image, allocation);
++// nhlport: NHL 24 reuses one block of memory as a depth buffer and as a colour target of the same
++// size every frame, so the texture cache recreates (and frees) a full-screen image ~140 times a
++// second. Each fresh dedicated allocation goes through the kernel driver and gets zeroed. Freed
++// texture cache images are parked here and handed out again for an identical create info.
++// NHLPORT_IMAGE_POOL=0 disables the pool.
++namespace {
++
++struct PooledImage {
++    vk::ImageCreateInfo ci;
++    VmaAllocator allocator;
++    VmaAllocation allocation;
++    vk::Image image;
++    vk::DeviceSize size;
++};
++
++struct ImagePool {
++    static constexpr size_t MaxImages = 48;
++    vk::DeviceSize max_bytes = 1024ull << 20;
++
++    std::mutex mutex;
++    std::deque<PooledImage> images;
++    vk::DeviceSize bytes{};
++    u64 reused{};
++    u64 created{};
++};
++
++ImagePool& Pool() {
++    // Never destroyed: at exit the allocator may already be gone.
++    static auto* pool = new ImagePool{};
++    return *pool;
++}
++
++bool PoolEnabled() {
++    static const bool enabled = [] {
++        const char* env = std::getenv("NHLPORT_IMAGE_POOL");
++        return !(env && env[0] == '0');
++    }();
++    return enabled;
++}
++
++bool SameCreateInfo(const vk::ImageCreateInfo& a, const vk::ImageCreateInfo& b) {
++    return a.pNext == nullptr && b.pNext == nullptr && a.flags == b.flags &&
++           a.imageType == b.imageType && a.format == b.format &&
++           a.extent.width == b.extent.width && a.extent.height == b.extent.height &&
++           a.extent.depth == b.extent.depth && a.mipLevels == b.mipLevels &&
++           a.arrayLayers == b.arrayLayers && a.samples == b.samples && a.tiling == b.tiling &&
++           a.usage == b.usage && a.sharingMode == b.sharingMode;
++}
++
++} // Anonymous namespace
++
++void SetImagePoolLimit(u64 vram_budget) {
++    // 4 GB card: ~256 MB parked at most; 8 GB: 512 MB; 16 GB and up: 1 GB.
++    auto& pool = Pool();
++    std::scoped_lock lk{pool.mutex};
++    pool.max_bytes = std::clamp<vk::DeviceSize>(vram_budget / 16, 64ull << 20, 1024ull << 20);
++}
++
++void TrimImagePool() {
++    auto& pool = Pool();
++    std::scoped_lock lk{pool.mutex};
++    for (const auto& p : pool.images) {
++        vmaDestroyImage(p.allocator, p.image, p.allocation);
+     }
++    pool.images.clear();
++    pool.bytes = 0;
+ }
+ 
+-void UniqueImage::Destroy() {
+-    if (image) {
++void UniqueImage::Release() {
++    if (!image) {
++        return;
++    }
++    if (recyclable && PoolEnabled()) {
++        auto& pool = Pool();
++        std::scoped_lock lk{pool.mutex};
++        pool.images.push_back({image_ci, allocator, allocation, image, size_bytes});
++        pool.bytes += size_bytes;
++        while (pool.images.size() > ImagePool::MaxImages || pool.bytes > pool.max_bytes) {
++            const auto& oldest = pool.images.front();
++            vmaDestroyImage(oldest.allocator, oldest.image, oldest.allocation);
++            pool.bytes -= oldest.size;
++            pool.images.pop_front();
++        }
++    } else {
+         vmaDestroyImage(allocator, image, allocation);
+-        image = vk::Image{};
+-        allocation = {};
+     }
++    image = vk::Image{};
++    allocation = {};
++}
++
++UniqueImage::~UniqueImage() {
++    Release();
++}
++
++void UniqueImage::Destroy() {
++    Release();
+ }
+ 
+ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+     this->image_ci = image_ci;
+     ASSERT(!image);
++    if (recyclable && PoolEnabled()) {
++        auto& pool = Pool();
++        std::scoped_lock lk{pool.mutex};
++        for (auto it = pool.images.rbegin(); it != pool.images.rend(); ++it) {
++            if (it->allocator != allocator || !SameCreateInfo(it->ci, image_ci)) {
++                continue;
++            }
++            image = it->image;
++            allocation = it->allocation;
++            size_bytes = it->size;
++            pool.bytes -= it->size;
++            pool.images.erase(std::next(it).base());
++            if (++pool.reused % 5000 == 1) {
++                LOG_INFO(Render_Vulkan, "image pool: {} images reused, {} allocated, {} parked",
++                         pool.reused, pool.created, pool.images.size());
++            }
++            return;
++        }
++        ++pool.created;
++    }
+     const VmaAllocationCreateInfo alloc_ci = {
+         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+@@ -117,6 +226,21 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+     VmaAllocationInfo alloc_info{};
+     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                                      &allocation, &alloc_info);
++    if (result != VK_SUCCESS) {
++        // nhlport: out of VRAM budget (4 GB cards). Free the parked images and allow the
++        // driver to place this one over budget (system memory) instead of crashing.
++        TrimImagePool();
++        VmaAllocationCreateInfo relaxed = alloc_ci;
++        relaxed.flags = 0;
++        result = vmaCreateImage(allocator, &image_ci_unsafe, &relaxed, &unsafe_image,
++                                &allocation, &alloc_info);
++        static std::atomic<u32> warned{0};
++        if (warned.fetch_add(1) < 5) {
++            LOG_WARNING(Render_Vulkan, "image allocation over VRAM budget ({}x{}), retried: {}",
++                        image_ci.extent.width, image_ci.extent.height,
++                        vk::to_string(vk::Result{result}));
++        }
++    }
+     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
+                vk::to_string(vk::Result{result}));
+     image = vk::Image{unsafe_image};
+@@ -192,6 +316,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
+     backing = &backing_images.emplace_back();
+     backing->num_samples = info.num_samples;
+     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
++    backing->image.recyclable = true;
+     backing->image.Create(image_ci);
+ 
+     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
+@@ -219,12 +344,33 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
+     return (*slot_image_views)[view_id];
+ }
+ 
++// nhlport (Vulkan validation, SYNC-HAZARD-WRITE-AFTER-WRITE): a fresh image (or a VkImage reused
++// from the image pool) starts with no tracked access, but the memory may still have a copy write
++// from its previous owner in flight. Make the first transition wait for any prior write.
++static vk::AccessFlags2 SrcAccessOrAny(vk::AccessFlags2 access) {
++    return access ? access : vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite};
++}
++
+ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                         vk::PipelineStageFlags2 dst_stage,
+                         std::optional<SubresourceRange> subres_range) {
+     auto& last_state = backing->state;
+     auto& subresource_states = backing->subresource_states;
+ 
++    // nhlport: the image may have fewer mips than a T# view asks for (ImageInfo::UpdateSize
++    // drops mips past the full chain), so keep the requested range inside the image.
++    if (subres_range) {
++        auto& r = *subres_range;
++        const u32 levels = std::max<u32>(info.resources.levels, 1u);
++        const u32 layers = std::max<u32>(info.resources.layers, 1u);
++        r.base.level = static_cast<u16>(std::min<u32>(r.base.level, levels - 1));
++        r.extent.levels =
++            static_cast<u16>(std::clamp<u32>(r.extent.levels, 1u, levels - r.base.level));
++        r.base.layer = static_cast<u16>(std::min<u32>(r.base.layer, layers - 1));
++        r.extent.layers =
++            static_cast<u16>(std::clamp<u32>(r.extent.layers, 1u, layers - r.base.layer));
++    }
++
+     const bool needs_partial_transition =
+         subres_range &&
+         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+@@ -262,7 +408,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+                 if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                     barriers.emplace_back(vk::ImageMemoryBarrier2{
+                         .srcStageMask = state.pl_stage,
+-                        .srcAccessMask = state.access_mask,
++                        .srcAccessMask = SrcAccessOrAny(state.access_mask),
+                         .dstStageMask = dst_stage,
+                         .dstAccessMask = dst_mask,
+                         .oldLayout = state.layout,
+@@ -298,7 +444,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
+         }
+         barriers.emplace_back(vk::ImageMemoryBarrier2{
+             .srcStageMask = last_state.pl_stage,
+-            .srcAccessMask = last_state.access_mask,
++            .srcAccessMask = SrcAccessOrAny(last_state.access_mask),
+             .dstStageMask = dst_stage,
+             .dstAccessMask = dst_mask,
+             .oldLayout = last_state.layout,
+diff --git a/src/video_core/texture_cache/image.h b/src/video_core/texture_cache/image.h
+index 47affd9..0aa618a 100644
+--- a/src/video_core/texture_cache/image.h
++++ b/src/video_core/texture_cache/image.h
+@@ -36,6 +36,11 @@ enum ImageFlagBits : u32 {
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+ 
++// nhlport: limit for images parked in the reuse pool, set from the VRAM budget; TrimImagePool
++// destroys every parked image (used when the texture cache is under memory pressure).
++void SetImagePoolLimit(u64 vram_budget);
++void TrimImagePool();
++
+ struct UniqueImage {
+     explicit UniqueImage() = default;
+     explicit UniqueImage(vk::Device device, VmaAllocator allocator)
+@@ -48,12 +53,15 @@ struct UniqueImage {
+     UniqueImage(UniqueImage&& other)
+         : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
+-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
++          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
++          size_bytes{other.size_bytes}, recyclable{other.recyclable} {}
+     UniqueImage& operator=(UniqueImage&& other) {
+         image = std::exchange(other.image, VK_NULL_HANDLE);
+         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
+         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+         image_ci = std::move(other.image_ci);
++        size_bytes = other.size_bytes;
++        recyclable = other.recyclable;
+         return *this;
+     }
+ 
+@@ -76,6 +84,12 @@ public:
+     vk::Image image{};
+     vk::ImageCreateInfo image_ci{};
+     vk::DeviceSize size_bytes{};
++    /// nhlport: texture cache images go back to a small pool on destruction and are handed out
++    /// again for an identical create info (the destruction is already deferred past GPU use).
++    bool recyclable{};
++
++private:
++    void Release();
+ };
+ 
+ struct Image : public Common::LRUNode<> {
+diff --git a/src/video_core/texture_cache/image_info.cpp b/src/video_core/texture_cache/image_info.cpp
+index b9dcfdc..373a280 100644
+--- a/src/video_core/texture_cache/image_info.cpp
++++ b/src/video_core/texture_cache/image_info.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <bit>
++
+ #include "common/assert.h"
+ #include "core/libraries/kernel/process.h"
+ #include "core/libraries/videoout/buffer.h"
+@@ -165,6 +168,16 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
+ }
+ 
+ void ImageInfo::UpdateSize() noexcept {
++    // nhlport (Vulkan validation, VUID-VkImageCreateInfo-mipLevels-00958): some T#s ask for one
++    // mip more than the full chain of their size (e.g. 10 levels on 256x256). Vulkan can't create
++    // such an image; the extra level would be smaller than 1x1 and is never sampled correctly.
++    {
++        const u32 max_dim = std::max({size.width, size.height, props.is_volume ? size.depth : 1u});
++        const u32 full_chain = std::max<u32>(std::bit_width(max_dim), 1u);
++        if (static_cast<u32>(resources.levels) > full_chain) {
++            resources.levels = static_cast<u16>(full_chain);
++        }
++    }
+     ASSERT_MSG(array_mode != AmdGpu::ArrayMode::ArrayLinearGeneral,
+                "Unhandled array mode: ArrayLinearGeneral");
+     if (std::has_single_bit(pitch) && pitch <= 1024 && pitch == size.height && size.depth == 1 &&
+diff --git a/src/video_core/texture_cache/image_view.cpp b/src/video_core/texture_cache/image_view.cpp
+index 95daedd..df04afa 100644
+--- a/src/video_core/texture_cache/image_view.cpp
++++ b/src/video_core/texture_cache/image_view.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <atomic>
++
+ #include "common/logging/log.h"
+ #include "shader_recompiler/resource.h"
+ #include "video_core/amdgpu/pixel_format.h"
+@@ -97,41 +100,92 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
+     if (!info.is_storage) {
+         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
+     }
++    // nhlport: the image may have fewer mips than the T# asks for (see ImageInfo::UpdateSize).
++    const u32 image_levels = std::max<u32>(image.info.resources.levels, 1u);
++    const u32 view_base_level = std::min<u32>(info.range.base.level, image_levels - 1);
++    const u32 view_levels =
++        std::max<u32>(std::min<u32>(info.range.extent.levels, image_levels - view_base_level), 1u);
+     vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
+     if (info.min_lod != 0 && instance.IsImageViewMinLodSupported()) {
+         const float last_level =
+-            static_cast<float>(info.range.base.level + info.range.extent.levels - 1);
++            static_cast<float>(view_base_level + view_levels - 1);
+         min_lod_ci.minLod = std::min(static_cast<float>(info.min_lod) / 256.f, last_level);
+         usage_ci.pNext = &min_lod_ci;
+     }
+     // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
+     vk::Format format = info.format;
+     vk::ImageAspectFlags aspect = image.aspect_mask;
++    bool depth_stencil_view = false;
+     if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
+         Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
+         format = image.info.pixel_format;
+         aspect = vk::ImageAspectFlagBits::eDepth;
++        depth_stencil_view = true;
+     }
+     if (image.aspect_mask & vk::ImageAspectFlagBits::eStencil &&
+         Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
+         format = image.info.pixel_format;
+         aspect = vk::ImageAspectFlagBits::eStencil;
++        depth_stencil_view = true;
++    }
++    // nhlport (Vulkan validation, VUID-VkImageViewCreateInfo-image-01761): a colour view of a
++    // depth image (e.g. A2B10G10R10 over D32 when the game swaps a buffer between the two) is not
++    // allowed in Vulkan and undefined on the GPU. Read the depth instead.
++    if ((image.aspect_mask & vk::ImageAspectFlagBits::eDepth) && !depth_stencil_view &&
++        format != image.info.pixel_format) {
++        static std::atomic<u32> logged{0};
++        if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
++            LOG_WARNING(Render_Vulkan, "colour view {} of depth image {} {}x{}, using depth view",
++                        vk::to_string(format), vk::to_string(image.info.pixel_format),
++                        image.info.size.width, image.info.size.height);
++        }
++        format = image.info.pixel_format;
++        aspect = vk::ImageAspectFlagBits::eDepth;
+     }
+ 
+     const auto components = info.mapping == AmdGpu::IdentityMapping
+                                 ? vk::ComponentMapping{}
+                                 : Vulkan::LiverpoolToVK::ComponentMapping(info.mapping);
+ 
++    const vk::Format view_format = instance.GetSupportedFormat(format, image.format_features);
++    // nhlport (Vulkan validation, VUID-VkImageViewCreateInfo-usage-08931): a view inherits every
++    // usage of its image, but a reinterpreting view format may not support all of them
++    // (E5B9G9R9 can't be a colour attachment on NVIDIA). Keep only what the view format supports.
++    {
++        const auto feats =
++            instance.GetPhysicalDevice().getFormatProperties(view_format).optimalTilingFeatures;
++        if (!(feats & vk::FormatFeatureFlagBits::eColorAttachment)) {
++            usage_ci.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
++        }
++        if (!(feats & vk::FormatFeatureFlagBits::eDepthStencilAttachment)) {
++            usage_ci.usage &= ~vk::ImageUsageFlagBits::eDepthStencilAttachment;
++        }
++        if (!(feats & vk::FormatFeatureFlagBits::eStorageImage)) {
++            usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
++        }
++        if (!(feats & vk::FormatFeatureFlagBits::eSampledImage)) {
++            usage_ci.usage &= ~vk::ImageUsageFlagBits::eSampled;
++        }
++        if (!(usage_ci.usage & (vk::ImageUsageFlagBits::eColorAttachment |
++                                vk::ImageUsageFlagBits::eDepthStencilAttachment))) {
++            usage_ci.usage &= ~vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
++        }
++        if (!usage_ci.usage) {
++            usage_ci.usage = image.usage_flags & (vk::ImageUsageFlagBits::eTransferSrc |
++                                                  vk::ImageUsageFlagBits::eTransferDst);
++        }
++    }
++
+     const vk::ImageViewCreateInfo image_view_ci = {
+         .pNext = &usage_ci,
+         .image = image.GetImage(),
+         .viewType = ConvertImageViewType(info.type),
+-        .format = instance.GetSupportedFormat(format, image.format_features),
++        .format = view_format,
+         .components = components,
+         .subresourceRange{
+             .aspectMask = aspect,
+-            .baseMipLevel = info.range.base.level,
+-            .levelCount = info.range.extent.levels,
++            .baseMipLevel = view_base_level,
++            .levelCount = view_levels,
+             .baseArrayLayer = info.range.base.layer,
+             .layerCount = info.range.extent.layers,
+         },
+diff --git a/src/video_core/texture_cache/sampler.cpp b/src/video_core/texture_cache/sampler.cpp
+index 192ad33..c1e56ee 100644
+--- a/src/video_core/texture_cache/sampler.cpp
++++ b/src/video_core/texture_cache/sampler.cpp
+@@ -2,20 +2,50 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/texture_cache/sampler.h"
+ 
+ namespace VideoCore {
+ 
++// nhlport: NHLPORT_FORCE_ANISO=<n> raises anisotropic filtering of trilinear colour samplers to at
++// least n (2..16). The console title picks low anisotropy for its GPU budget; a PC GPU has headroom.
++static float ForcedAnisotropy() {
++    static const float value = [] {
++        const char* env = std::getenv("NHLPORT_FORCE_ANISO");
++        return env ? static_cast<float>(std::atof(env)) : 0.0f;
++    }();
++    return value;
++}
++
++// nhlport: NHLPORT_LOD_BIAS=<f> adds f to the mip LOD bias of the same samplers (negative = sharper).
++static float ExtraLodBias() {
++    static const float value = [] {
++        const char* env = std::getenv("NHLPORT_LOD_BIAS");
++        return env ? static_cast<float>(std::atof(env)) : 0.0f;
++    }();
++    return value;
++}
++
+ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
+                  const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth) {
+     using namespace Vulkan;
+-    const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
+-                                   (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
+-                                    AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
++    const bool game_aniso = AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
++                            AmdGpu::IsAnisoFilter(sampler.xy_min_filter);
++    const float forced_aniso = ForcedAnisotropy();
++    const bool trilinear_colour = !is_depth && sampler.mip_filter == AmdGpu::MipFilter::Linear &&
++                                  sampler.xy_min_filter != AmdGpu::Filter::Point;
++    const bool force_aniso = forced_aniso > 1.0f && trilinear_colour;
++    const float max_bias = instance.MaxSamplerLodBias();
++    const float lod_bias = std::clamp(
++        sampler.LodBias() + (trilinear_colour ? ExtraLodBias() : 0.0f), -max_bias, max_bias);
++    const bool anisotropy_enable =
++        instance.IsAnisotropicFilteringSupported() && (game_aniso || force_aniso);
++    const float wanted_aniso =
++        force_aniso ? std::max(sampler.MaxAniso(), forced_aniso) : sampler.MaxAniso();
+     const float max_anisotropy =
+-        anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
++        anisotropy_enable ? std::clamp(wanted_aniso, 1.0f, instance.MaxSamplerAnisotropy())
+                           : 1.0f;
+     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
+     if (border_color == vk::BorderColor::eFloatCustomEXT &&
+@@ -51,7 +81,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
+         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
+         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
+         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
+-        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
++        .mipLodBias = lod_bias,
+         .anisotropyEnable = anisotropy_enable,
+         .maxAnisotropy = max_anisotropy,
+         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index f1b2b68..2847802 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1,7 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
+ #include <cstdlib>
++#include <mutex>
++#include <string_view>
+ #include <cstring>
+ #include <array>
+ #include <span>
+@@ -57,10 +60,22 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
+         trigger_gc_memory = 0;
+         pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
+         critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
++        SetImagePoolLimit(4_GB);
+         return;
+     }
+ 
+-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
++    s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
++    // nhlport: NHLPORT_VRAM_BUDGET_MB pretends the card has less VRAM (to test the 4 GB path).
++    if (const char* env = std::getenv("NHLPORT_VRAM_BUDGET_MB")) {
++        const s64 forced = static_cast<s64>(std::strtoll(env, nullptr, 10)) * 1_MB;
++        if (forced > 0 && forced < device_local_memory) {
++            device_local_memory = forced;
++            gc_budget_forced = true;
++        }
++    }
++    SetImagePoolLimit(static_cast<u64>(device_local_memory));
++    LOG_INFO(Render_Vulkan, "texture cache: VRAM budget {} MB{}", device_local_memory / 1_MB,
++             gc_budget_forced ? " (NHLPORT_VRAM_BUDGET_MB)" : "");
+     const s64 min_spacing_expected = device_local_memory - 1_GB;
+     const s64 min_spacing_critical = device_local_memory - 512_MB;
+     const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
+@@ -77,6 +92,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
+         std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
+                       min_critical_floor));
+     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
++    LOG_INFO(Render_Vulkan, "texture cache: gc pressure {} MB, critical {} MB",
++             pressure_gc_memory / 1_MB, critical_gc_memory / 1_MB);
+ }
+ 
+ TextureCache::~TextureCache() = default;
+@@ -277,6 +294,33 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
+     }
+ }
+ 
++// nhlport: NHLPORT_DEPTH_COLOR_FIX=1 / 0 forces the depth-as-colour fix on / off; by default it is
++// on for NVIDIA Pascal (GTX 10xx, GT 10xx, MX 1xx, TITAN X/Xp, Quadro P), where the invalid view
++// faults the GPU.
++bool TextureCache::DepthAsColorFix() const {
++    static const bool enabled = [this] {
++        if (const char* env = std::getenv("NHLPORT_DEPTH_COLOR_FIX"); env && env[0]) {
++            return env[0] == '1';
++        }
++        if (instance.GetVendorID() != 0x10DE) {
++            return false;
++        }
++        const std::string_view name = instance.GetModelName();
++        for (const std::string_view key : {"GTX 10", "GT 10", "MX1", "MX 1", "MX2", "MX 2",
++                                           "TITAN X", "TITAN Xp", "Quadro P", "Tesla P"}) {
++            if (name.find(key) != std::string_view::npos) {
++                return true;
++            }
++        }
++        return false;
++    }();
++    static std::once_flag logged;
++    std::call_once(logged, [&] {
++        LOG_INFO(Render, "depth-as-colour fix: {}", enabled ? "on" : "off");
++    });
++    return enabled;
++}
++
+ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
+                                           ImageId cache_image_id) {
+     auto& cache_image = slot_images[cache_image_id];
+@@ -297,6 +341,21 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
+         // The guest requires a depth sampled texture, but cache can offer only Rxf. Need to
+         // recreate the image.
+         recreate |= requested_info.props.is_depth && !cache_image.info.props.is_depth;
++        // nhlport: the guest samples a depth image with a colour format that has no depth
++        // equivalent (NHL 24 aliases its depth buffer with B10G11R11 / A2B10G10R10 targets).
++        // A colour view of a depth image is invalid Vulkan: newer GPUs tolerate it, GTX 10xx
++        // (Pascal) raises "TEX FORMAT" and the device is lost. Recreate it as a colour image.
++        if (DepthAsColorFix() && cache_image.info.props.is_depth && !requested_info.props.is_depth &&
++            !Vulkan::LiverpoolToVK::IsFormatDepthCompatible(requested_info.pixel_format)) {
++            recreate = true;
++            static std::atomic<u64> n_fix{0};
++            const u64 k = n_fix.fetch_add(1, std::memory_order_relaxed);
++            if (k < 20 || k % 1000 == 0) {
++                LOG_INFO(Render, "depth-as-colour fix #{}: {} sampled as {} @ {:#x}", k,
++                         vk::to_string(cache_image.info.pixel_format),
++                         vk::to_string(requested_info.pixel_format), requested_info.guest_address);
++            }
++        }
+         break;
+     case BindingType::Storage:
+         // If the guest is going to use previously created depth as storage, the image needs to be
+@@ -360,8 +419,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
+         // meaningful when the new image is going to be *read* (texture / storage); for a render or
+         // depth target the game overwrites the surface and the copied bits (depth shown as colour)
+         // only cost a full-size copy per frame and leak garbage into untouched regions.
+-        const bool contents_matter =
++        bool contents_matter =
+             binding == BindingType::Texture || binding == BindingType::Storage;
++        // nhlport: depth bits reinterpreted as an unrelated colour format are meaningless and a
++        // copy between different texel sizes is not allowed; only copy same-size formats.
++        if (cache_image.info.props.is_depth && !new_info.props.is_depth &&
++            new_info.num_bits != cache_image.info.num_bits) {
++            contents_matter = false;
++        }
+         if (contents_matter) {
+             runtime.CopyColorAndDepth(&cache_image, &new_image);
+         } else {
+@@ -467,122 +532,24 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
+             return {merged_image_id, -1, -1};
+         }
+ 
+-        // Enhanced debug logging for unreachable case
+-        // Calculate expected size based on format and dimensions
+-        u64 expected_size =
+-            (static_cast<u64>(image_info.size.width) * static_cast<u64>(image_info.size.height) *
+-             static_cast<u64>(image_info.size.depth) * static_cast<u64>(image_info.num_bits) / 8);
+-        LOG_ERROR(Render_Vulkan,
+-                  "Unresolvable image overlap with equal memory address:\n"
+-                  "=== OLD IMAGE (cached) ===\n"
+-                  "  Address:        {:#x}\n"
+-                  "  Size:           {:#x} bytes\n"
+-                  "  Format:         {}\n"
+-                  "  Type:           {}\n"
+-                  "  Width:          {}\n"
+-                  "  Height:         {}\n"
+-                  "  Depth:          {}\n"
+-                  "  Pitch:          {}\n"
+-                  "  Mip levels:     {}\n"
+-                  "  Array layers:   {}\n"
+-                  "  Samples:        {}\n"
+-                  "  Tile mode:      {:#x}\n"
+-                  "  Block size:     {} bits\n"
+-                  "  Is block-comp:  {}\n"
+-                  "  Guest size:     {:#x}\n"
+-                  "  Last accessed:  tick {}\n"
+-                  "  Safe to delete: {}\n"
+-                  "  isPow2:         {}\n"
+-                  "  Alt tile:       {}\n"
+-                  "\n"
+-                  "=== NEW IMAGE (requested) ===\n"
+-                  "  Address:        {:#x}\n"
+-                  "  Size:           {:#x} bytes\n"
+-                  "  Format:         {}\n"
+-                  "  Type:           {}\n"
+-                  "  Width:          {}\n"
+-                  "  Height:         {}\n"
+-                  "  Depth:          {}\n"
+-                  "  Pitch:          {}\n"
+-                  "  Mip levels:     {}\n"
+-                  "  Array layers:   {}\n"
+-                  "  Samples:        {}\n"
+-                  "  Tile mode:      {:#x}\n"
+-                  "  Block size:     {} bits\n"
+-                  "  Is block-comp:  {}\n"
+-                  "  Guest size:     {:#x}\n"
+-                  "  isPow2:         {}\n"
+-                  "  Alt tile:       {}\n"
+-                  "\n"
+-                  "=== COMPARISON ===\n"
+-                  "  Same format:           {}\n"
+-                  "  Same type:             {}\n"
+-                  "  Same tile mode:        {}\n"
+-                  "  Same block size:       {}\n"
+-                  "  Same BlockDim:         {}\n"
+-                  "  Same pitch:            {}\n"
+-                  "  Same pow2:             {}\n"
+-                  "  Same alt tile:         {}\n"
+-                  "  Old resources <= new:  {} (old: {}, new: {})\n"
+-                  "  Old size <= new size:  {}\n"
+-                  "  Expected size (calc):  {} bytes\n"
+-                  "  Size ratio (new/expected): {:.2f}x\n"
+-                  "  Size ratio (new/old):  {:.2f}x\n"
+-                  "  Old vs expected diff:  {} bytes ({:+.2f}%)\n"
+-                  "  New vs expected diff:  {} bytes ({:+.2f}%)\n"
+-                  "  Merged image ID:       {}\n"
+-                  "  Binding type:          {}\n"
+-                  "  Current tick:          {}\n"
+-                  "  Age (ticks since last access): {}",
+-
+-                  // Old image details
+-                  cache_image.info.guest_address, cache_image.info.guest_size,
+-                  vk::to_string(cache_image.info.pixel_format),
+-                  static_cast<int>(cache_image.info.type), cache_image.info.size.width,
+-                  cache_image.info.size.height, cache_image.info.size.depth, cache_image.info.pitch,
+-                  cache_image.info.resources.levels, cache_image.info.resources.layers,
+-                  cache_image.info.num_samples, static_cast<u32>(cache_image.info.tile_mode),
+-                  cache_image.info.num_bits, +cache_image.info.props.is_block,
+-                  cache_image.info.guest_size, cache_image.tick_accessed_last, safe_to_delete,
+-                  bool(cache_image.info.props.is_pow2), cache_image.info.alt_tile,
+-
+-                  // New image details
+-                  image_info.guest_address, image_info.guest_size,
+-                  vk::to_string(image_info.pixel_format), static_cast<int>(image_info.type),
+-                  image_info.size.width, image_info.size.height, image_info.size.depth,
+-                  image_info.pitch, image_info.resources.levels, image_info.resources.layers,
+-                  image_info.num_samples, static_cast<u32>(image_info.tile_mode),
+-                  image_info.num_bits, image_info.props.is_block, image_info.guest_size,
+-                  bool(image_info.props.is_pow2), image_info.alt_tile,
+-
+-                  // Comparison
+-                  (image_info.pixel_format == cache_image.info.pixel_format),
+-                  (image_info.type == cache_image.info.type),
+-                  (image_info.tile_mode == cache_image.info.tile_mode),
+-                  (image_info.num_bits == cache_image.info.num_bits),
+-                  (image_info.BlockDim() == cache_image.info.BlockDim()),
+-                  (image_info.pitch == cache_image.info.pitch),
+-                  (image_info.props.is_pow2 == cache_image.info.props.is_pow2),
+-                  (image_info.alt_tile == cache_image.info.alt_tile),
+-                  (cache_image.info.resources <= image_info.resources),
+-                  cache_image.info.resources.levels, image_info.resources.levels,
+-                  (cache_image.info.guest_size <= image_info.guest_size), expected_size,
+-
+-                  // Size ratios
+-                  static_cast<double>(image_info.guest_size) / expected_size,
+-                  static_cast<double>(image_info.guest_size) / cache_image.info.guest_size,
+-
+-                  // Difference between actual and expected sizes with percentages
+-                  static_cast<s64>(cache_image.info.guest_size) - static_cast<s64>(expected_size),
+-                  (static_cast<double>(cache_image.info.guest_size) / expected_size - 1.0) * 100.0,
+-
+-                  static_cast<s64>(image_info.guest_size) - static_cast<s64>(expected_size),
+-                  (static_cast<double>(image_info.guest_size) / expected_size - 1.0) * 100.0,
+-
+-                  merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
+-                  scheduler.CurrentTick() - cache_image.tick_accessed_last);
+-
+-        UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
++        // nhlport: leaving a match NHL 24 reallocates a 1920x1080 HDR buffer at the same address
++        // with a bigger size and the same tiling. Handle it like a reused address (drop the old
++        // image, create the new one) instead of aborting.
++        {
++            static std::atomic<u64> n{0};
++            if (n.fetch_add(1, std::memory_order_relaxed) < 20) {
++                LOG_WARNING(Render_Vulkan,
++                            "image at {:#x} reallocated with a bigger size ({:#x} -> {:#x} bytes), "
++                            "recreating it",
++                            cache_image.info.guest_address, cache_image.info.guest_size,
++                            image_info.guest_size);
++            }
++        }
++        if (safe_to_delete) {
++            VideoCore::Perf::NoteFree(VideoCore::Perf::FreeTileMode);
++            FreeImage(cache_image_id);
++        }
++        return {merged_image_id, -1, -1};
+     }
+ 
+     // Right overlap, the image requested is a possible subresource of the image from cache.
+@@ -740,31 +707,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+     const auto& info = desc.info;
+     ASSERT(info.guest_address != 0);
+ 
+-    SmallVector<ImageId, 8> image_ids;
+-    ForEachImageInRegion(info.guest_address, info.guest_size,
+-                         [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+-
+     ImageId image_id{};
+ 
+-    // Check for a perfect match first
+-    for (const auto& cache_id : image_ids) {
+-        auto& cache_image = slot_images[cache_id];
++    const auto is_perfect_match = [&](const Image& cache_image) {
+         if (cache_image.info.guest_address != info.guest_address) {
+-            continue;
++            return false;
+         }
+         if (cache_image.info.guest_size != info.guest_size) {
+-            continue;
++            return false;
+         }
+         if (cache_image.info.size != info.size) {
+-            continue;
++            return false;
+         }
+         if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+             (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+-            continue;
++            return false;
+         }
+         if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+-            continue;
++            return false;
+         }
++        return true;
++    };
++    const auto pick_perfect_match = [&](ImageId cache_id, const Image& cache_image) {
+         if (image_id) {
+             // nhlport: two cached images match the same address and size (aliases that were
+             // never freed); the last one wins. Count and sample these ambiguous picks.
+@@ -785,6 +749,37 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+             }
+         }
+         image_id = cache_id;
++    };
++
++    // nhlport: perfect match fast path. A perfect match starts exactly at info.guest_address, so
++    // every candidate is registered in the bucket of the first page, in the same order the full
++    // region walk reports them. Scanning only that bucket picks the same image as the full walk,
++    // which for a 4K render target visits ~130 pages on every bind (the top hotspot of the GPU
++    // thread). NHLPORT_FAST_FIND=0 restores the full walk.
++    static const bool fast_find = [] {
++        const char* env = std::getenv("NHLPORT_FAST_FIND");
++        return !(env && env[0] == '0');
++    }();
++    SmallVector<ImageId, 8> image_ids;
++    if (fast_find) {
++        ForEachImageWithAddress(info.guest_address, [&](ImageId cache_id, Image& cache_image) {
++            if (is_perfect_match(cache_image)) {
++                pick_perfect_match(cache_id, cache_image);
++            }
++        });
++    }
++    if (!image_id) {
++        ForEachImageInRegion(info.guest_address, info.guest_size,
++                             [&](ImageId cache_id, Image& image) { image_ids.push_back(cache_id); });
++        if (!fast_find) {
++            // Check for a perfect match first
++            for (const auto& cache_id : image_ids) {
++                auto& cache_image = slot_images[cache_id];
++                if (is_perfect_match(cache_image)) {
++                    pick_perfect_match(cache_id, cache_image);
++                }
++            }
++        }
+     }
+ 
+     // Try to resolve overlaps (if any)
+@@ -1266,16 +1261,18 @@ void TextureCache::GarbageCollectImages() {
+         if (num_deletions == 0) {
+             return true;
+         }
+-        --num_deletions;
+         const bool download = image.SafeToDownload();
+         const bool tiled = image.info.IsTiled();
+         if (tiled && download) {
+             // This is a workaround for now. We can't handle non-linear image downloads.
++            // nhlport: skipped images no longer use up the deletion budget (they are most of
++            // the cache in NHL, so the GC used to free almost nothing); see the stale pass.
+             return false;
+         }
+         if (download && !pressured) {
+             return false;
+         }
++        --num_deletions;
+         const auto image_id = slot_images.GetSlotId(image);
+         if (download) {
+             DownloadImageMemory(image_id);
+@@ -1305,6 +1302,47 @@ void TextureCache::GarbageCollectImages() {
+         configure(true);
+         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+     }
++
++    // nhlport: stale pass. Frostbite moves its render targets around its transient pool, so
++    // GPU-written (tiled) images at addresses the game no longer uses pile up: they cannot be
++    // downloaded, so the passes above never free them and 4 GB cards run out of VRAM
++    // (ErrorOutOfDeviceMemory). Under memory pressure, free such images that have not been
++    // touched for a long time; anything the game still renders to or samples is touched every
++    // frame and is never this old.
++    if (instance.CanReportMemoryUsage()) {
++        total_used_memory = instance.GetDeviceMemoryUsage();
++    }
++    if (total_used_memory < pressure_gc_memory) {
++        return;
++    }
++    TrimImagePool();
++    const bool critical = total_used_memory >= critical_gc_memory;
++    const u64 stale_ticks = critical ? 600 : 2400;
++    if (gc_tick <= stale_ticks) {
++        return;
++    }
++    size_t stale_budget = critical ? 24 : 8;
++    image_lru_cache.ForEachItemBelow(gc_tick - stale_ticks, [&](Image& image) {
++        if (stale_budget == 0) {
++            return true;
++        }
++        if (!(image.info.IsTiled() && image.SafeToDownload())) {
++            return false;
++        }
++        --stale_budget;
++        ++gc_stale_frees;
++        VideoCore::Perf::NoteFree(VideoCore::Perf::FreeGc);
++        FreeImage(slot_images.GetSlotId(image));
++        if (total_used_memory < pressure_gc_memory) {
++            stale_budget = 0;
++        }
++        return false;
++    });
++    if (gc_stale_frees >= gc_stale_logged + 500) {
++        gc_stale_logged = gc_stale_frees;
++        LOG_INFO(Render_Vulkan, "texture cache: {} stale images freed under VRAM pressure",
++                 gc_stale_frees);
++    }
+ }
+ 
+ void TextureCache::GarbageCollectSamplers() {
+@@ -1399,6 +1437,9 @@ void TextureCache::LinkMeta(Image& image, MetaType type, VAddr address, s32 init
+     }
+     if (inserted || new_link) {
+         const auto& i = image.info;
++        it->second.width = i.size.width;
++        it->second.height = i.size.height;
++        it->second.layers = i.resources.layers;
+         it->second.owner = fmt::format("{}x{} {} mips {} layers {} @ {:#x}{}", i.size.width,
+                                        i.size.height, vk::to_string(i.pixel_format),
+                                        i.resources.levels, i.resources.layers, i.guest_address,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 07a2959..70a6319 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <mutex>
+ #include <vector>
+ #include <absl/container/flat_hash_map.h>
+@@ -170,6 +171,9 @@ public:
+                                                                ImageId merged_image_id);
+ 
+     /// Resolves depth overlap and either re-creates the image or returns existing one
++    /// nhlport: recreate depth images sampled with a colour format (see texture_cache.cpp).
++    [[nodiscard]] bool DepthAsColorFix() const;
++
+     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
+                                               ImageId cache_img_id);
+ 
+@@ -228,6 +232,19 @@ public:
+         return std::nullopt;
+     }
+ 
++    /// nhlport: upper bound of the CMASK bytes that cover the owner image (4 bits per 8x8
++    /// tile, pitch and height padded to 1024 px, 4 KB aligned); 0 if the owner is unknown.
++    u64 CmaskUpperBound(VAddr address) const {
++        const auto it = surface_metas.find(address);
++        if (it == surface_metas.end() || it->second.width == 0 || it->second.height == 0) {
++            return 0;
++        }
++        const u64 tiles_x = ((u64{it->second.width} + 1023) & ~u64{1023}) / 8;
++        const u64 tiles_y = ((u64{it->second.height} + 1023) & ~u64{1023}) / 8;
++        // every array layer / cube face has its own CMASK slice
++        return (((tiles_x * tiles_y / 2) + 4095) & ~u64{4095}) * std::max<u64>(it->second.layers, 1);
++    }
++
+     /// nhlport: human-readable description of a metadata surface for the diagnostic log.
+     std::string DescribeMeta(VAddr address) const {
+         const auto it = surface_metas.find(address);
+@@ -426,6 +443,9 @@ private:
+     u64 pressure_gc_samplers = 0;
+     u64 critical_gc_samplers = 0;
+     u64 gc_tick = 0;
++    u64 gc_stale_frees = 0;
++    u64 gc_stale_logged = 0;
++    bool gc_budget_forced = false;
+     Common::LRUCache<Image> image_lru_cache;
+     Common::LRUCache<Sampler> sampler_lru_cache;
+     const bool readback_linear_images;
+@@ -436,6 +456,9 @@ private:
+         u32 refs = 0; ///< nhlport: images linked to this metadata surface
+         bool shader_read = false; ///< nhlport: a shader reads this surface (coverage masks)
+         std::string owner;        ///< nhlport: last image linked (diagnostics)
++        u32 width = 0;
++        u32 height = 0;
++        u32 layers = 1;
+     };
+ 
+     /// nhlport: link an image to a metadata surface. The entry is created on first use (all
