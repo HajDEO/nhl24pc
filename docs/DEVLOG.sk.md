@@ -1,5 +1,29 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.0: hra 1.60, Be a Pro, koniec zápasu, CUSA37934 (2026-11-02, PR #7, #9, #12, #16, #18)
+
+Zapracované pull requesty komunity:
+
+- **#12 (hilals): update 1.60.** Zamrznutie pri prvom vhadzovaní s update 1.60 (issue #6) bol len
+  neaplikovaný patch „Synchronous replay compression“: `nhl24.xml` mal záznam iba pre `AppVer="01.00"`.
+  Pribudol druhý záznam pre `01.60` na adrese `0x068E0770`. Overené na lokálnom `build\game`
+  (CUSA37933, APP_VER 01.60): sekvencia `48 83 7F 08 00 74 48` je v SELF práve raz, file offset
+  0x65324eb, PT_LOAD[0] na file offsete 0x51d80, teda VA 0x64e076b a `je` na 0x64e0770 (+0x400000).
+  Pre CUSA37934 1.60 adresa overená nie je.
+- **#7 (hilals): pád na konci zápasu / medzi tretinami** (issues #2, #3). `ResolveOverlap` pri
+  rovnakej adrese, rovnakom formáte a tilingu, ale väčšej guest veľkosti a menej mip úrovniach už
+  nekončí `UNREACHABLE`, ale uvoľní starý obraz ako pri vetve s iným tile mode.
+- **#9 (hilals): Be a Pro** (issue #8). Shadery s dynamickým indexovaním VGPR cez jump tabuľku
+  (`s_getpc_b64` / `s_add_u32` / `s_addc_u32` / `s_setpc_b64`) sa pred stavbou CFG prepíšu na reťaz
+  `s_cmp_eq_u32` + `v_mov_b32` (`Gcn::ExpandIndirectRegisterTables`).
+- **#16 (wololo-wololo): európska verzia CUSA37934** v launcheri (kontrola PKG, title ID v stavovom
+  riadku, cesta k uloženým pozíciám). Súbor `i-didnt-check-my-work.md`, ktorý PR pridal, bol odstránený.
+- **#18 (0ktav1us): natívny Linux build**, návod a skripty v `docs/linux/`, bez zmien kódu.
+
+README (EN aj SK), README.txt balíka a hint pri „Install from PKG“ už neodporúčajú vynechať update:
+podporované sú verzie hry 1.00 aj 1.60. Verzia 0.9.0 (`src/common/port_version.h`, `FallbackVersion`
+v launcheri, README).
+
 ## v0.8.3: ochrana red zone v launcheri (2026-10-14, issues #1 a #3)
 
 **Pád pri načítaní zápasu (0xc0000005 hneď po výbere tímov, v0.8.2, hra v01.00).** Všetky

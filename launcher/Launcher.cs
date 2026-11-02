@@ -50,8 +50,8 @@ namespace NhlPort
             { "game_folder", new[] { "Priečinok hry", "Game folder" } },
             { "browse", new[] { "Prehľadávať…", "Browse…" } },
             { "install_pkg", new[] { "Inštalovať z PKG…", "Install from PKG…" } },
-            { "pkg_req", new[] { "Potrebuje PKG základnej hry NHL 24 v01.00 (CUSA37933 alebo CUSA37934). Update neinštaluj: s v1.6 hra zamrzne pri prvom vhadzovaní.",
-                                  "Needs the NHL 24 base game PKG v01.00 (CUSA37933 or CUSA37934). Do not install the update: v1.6 freezes at the first puck drop." } },
+            { "pkg_req", new[] { "Potrebuje PKG základnej hry NHL 24 v01.00 (CUSA37933 alebo CUSA37934). Update 1.60 môžeš nainštalovať potom.",
+                                  "Needs the NHL 24 base game PKG v01.00 (CUSA37933 or CUSA37934). The 1.60 update can be installed afterwards." } },
             { "output", new[] { "Výstup", "Output" } },
             { "display_mode", new[] { "Režim zobrazenia", "Display mode" } },
             { "windowed", new[] { "Okno", "Windowed" } },
@@ -462,7 +462,7 @@ namespace NhlPort
     // ------------------------------------------------------------------ the form
     public class LauncherForm : Form
     {
-        const string FallbackVersion = "0.8.3";
+        const string FallbackVersion = "0.9.0";
         string PortVersion = FallbackVersion; // taken from the version resource of nhl24.exe when present
         const string DefaultTitleId = "CUSA37933";
         static readonly string[] SupportedTitleIds = { "CUSA37933", "CUSA37934" };
