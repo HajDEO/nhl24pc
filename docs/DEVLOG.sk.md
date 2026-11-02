@@ -1,5 +1,24 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.2: pád pri Create a Team (2026-11-03, issue #13)
+
+**Creation Zone → Create a Team padalo na assert v recompileri shaderov** (`S_SETPC_B64 without a
+resolvable offset at PC 0xc4`, fs `0xcdcc7564`). Shader číta VGPR vybraný počas behu cez skokovú
+tabuľku, rovnaký vzor ako v Be a Pro (PR #9): `s_getpc_b64` / `s_add_u32` / `s_addc_u32` /
+`s_setpc_b64` a za ním 15 položiek `v_mov_b32 v5, vN`. Offset skoku sa načíta zo 16-položkovej
+tabuľky hneď za hlavičkou `OrbShdr` (`s_load_dwordx2 s[68:69], s[66:67], s64`, kde
+`s64 = min(index, 15) << 3`). `ExpandIndirectRegisterTables` to vzdalo z dvoch dôvodov:
+- Kompilátor medzi načítaním offsetu a skokom prepíše indexový register `s64` aj ukazovateľ na
+  tabuľku `s[66:67]` (`s_buffer_load_dwordx4 s[64:67]`), takže porovnávať index pri skoku nešlo.
+  Namiesto odstráneného načítania sa teraz index skopíruje (`s_mov_b32 s68, s64`) do offsetového
+  registra a porovnania idú proti nemu. Ten sa pred skokom nesmie meniť.
+- Kontrola „odstránené registre sa po tabuľke nečítajú“ hlásila `s66`, ktorý sa číta neskôr
+  (`v_sub_f32 v1, s66, v21`), lenže to je už hodnota z bufferu. Registre prepísané pred skokom sa
+  preto za stratené nepovažujú.
+
+Spoločná kontrola zápisu do SGPR (aj pre SMRD so šírkou `count`) je vo `WritesScalarReg`. Overené:
+Create a Team sa otvorí, tabuľka sa rozvinie pre shader aj jeho permutácie.
+
 ## v0.9.1: čierne pruhy v prestrihoch, videopamäť, opravy z Be-a-Pro (2026-11-02, issue #17)
 
 **Čierne obdĺžniky a pruhy v prestrihoch (issue #17) – vyriešené.** Reportér (RTX 3060, v0.8.3) mal
