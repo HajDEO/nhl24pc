@@ -20,6 +20,12 @@ Zapracované pull requesty komunity:
   riadku, cesta k uloženým pozíciám). Súbor `i-didnt-check-my-work.md`, ktorý PR pridal, bol odstránený.
 - **#18 (0ktav1us): natívny Linux build**, návod a skripty v `docs/linux/`, bez zmien kódu.
 
+**Čierne plochy a artefakty na ľade pri `readbacks_mode = 0`.** Test na 1.60 z `build\` ukázal čierny
+lichobežník nad ľadom, čierne časti ľadu a rozhádzané predmety. Log bol čistý; príčinou bol
+`build\user\config.json` vytvorený s predvolenými hodnotami emulátora (`GPU.readbacks_mode = 0`), kým
+`release\user\config.json` má 1. Po prepnutí na 1 artefakty zmizli. Predvolená hodnota
+v `src/core/emulator_settings.h` je preto `GpuReadbacksMode::Relaxed`, aby novo vytvorený config bol správny.
+
 README (EN aj SK), README.txt balíka a hint pri „Install from PKG“ už neodporúčajú vynechať update:
 podporované sú verzie hry 1.00 aj 1.60. Verzia 0.9.0 (`src/common/port_version.h`, `FallbackVersion`
 v launcheri, README).
