@@ -1,6 +1,6 @@
 # NHL24 PC
 
-**NHL 24 (PS4, CUSA37933) running natively on Windows** – a single-game fork of the
+**NHL 24 (PS4, CUSA37933 / CUSA37934) running natively on Windows** – a single-game fork of the
 [shadPS4](https://github.com/shadps4-emu/shadPS4) emulator, tuned and fixed for one title, with a launcher
 that extracts the game from your own PKG and starts it. No console, no CPU emulation: the game's x86-64
 code runs directly on your processor, the PS4 system libraries are replaced by native Windows
@@ -54,7 +54,7 @@ If this project is useful to you, you can support its development:
    unpacked folder somewhere you can write to (not Program Files).
 2. Start `launcher.exe`. Click **Install PKG** and pick your NHL 24 **base game** package (v01.00).
    **Do not install the update PKG**: the port needs game version 1.00; with the 1.6 update the game
-   freezes at the first puck drop (issue #1). The launcher checks the title ID (CUSA37933) and the kind
+   freezes at the first puck drop (issue #1). The launcher checks the title ID (CUSA37933 or CUSA37934) and the kind
    of package, shows size and version, and extracts into `game\` next to the launcher, with progress.
 3. Press **PLAY**. Simple view = the settings most people touch; Advanced = everything, including the
    keyboard mapping and the game folder.

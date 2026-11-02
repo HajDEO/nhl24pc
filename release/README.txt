@@ -3,7 +3,7 @@
 1. Keep this folder together (nhl24.exe, launcher.exe, *.dll, *.png, user\).
    Put it somewhere you can write to (not Program Files), path without special characters is safest.
 2. Start launcher.exe. Choose "Install PKG" and pick your NHL 24 BASE GAME package (v01.00, title ID
-   CUSA37933). Do NOT install the update PKG: the port needs game version 1.00; with the 1.6 update the
+   CUSA37933 or CUSA37934). Do NOT install the update PKG: the port needs game version 1.00; with the 1.6 update the
    game freezes at the first puck drop. The game is extracted into game\ next to the launcher.
 3. Press PLAY. Settings (resolution, fullscreen, vsync, sharpening, controls) are in the launcher.
    Saves, profile and the shader cache are created under user\ on first run; the first minutes of
