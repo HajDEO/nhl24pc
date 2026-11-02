@@ -250,8 +250,8 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
+    const u32 base_width = std::min(src->info.size.width, dst->info.size.width);
+    const u32 base_height = std::min(src->info.size.height, dst->info.size.height);
     const u32 base_depth =
         dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
 
@@ -772,6 +772,17 @@ void Runtime::FlushBarriers() {
     }
 
     scheduler.EndRendering();
+    // A depth attachment that was also sampled still performs its store when rendering ends,
+    // after the tracked access was replaced by the shader read.
+    for (auto& barrier : image_barriers) {
+        if (barrier.oldLayout != vk::ImageLayout::eUndefined &&
+            (barrier.subresourceRange.aspectMask &
+             (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil))) {
+            barrier.srcStageMask |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                    vk::PipelineStageFlagBits2::eLateFragmentTests;
+            barrier.srcAccessMask |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        }
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(dep_info);
 

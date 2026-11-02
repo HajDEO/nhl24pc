@@ -618,10 +618,20 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         return false;
     }
     Image& image = texture_cache.GetImage(image_id);
-    ASSERT_MSG(device_addr == image.info.guest_address,
-               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
-               image.info.guest_address);
-    const u64 arena_offset = arena->Offset(device_addr);
+    const VAddr image_addr = image.info.guest_address;
+    const VAddr image_end = image_addr + image.info.guest_size;
+    // The image lookup works in 256-byte buckets, so a neighbouring texel buffer can hit an
+    // image it does not touch. A view starting inside the image tiles the whole image in place.
+    if (device_addr < image_addr || device_addr >= image_end) {
+        return false;
+    }
+    if (device_addr != image_addr) {
+        if (!arena->IsInBounds(image_addr, image.info.guest_size)) {
+            return false;
+        }
+        EnsureResident(arena, image_addr >> block_shift, (image_end - 1) >> block_shift);
+    }
+    const u64 arena_offset = arena->Offset(image_addr);
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
         const auto& mip_info = image.info.mips_layout[mip];

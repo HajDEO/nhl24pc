@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <array>
+#include <bit>
 #include <span>
 #include "common/diag_log.h"
 #include "common/io_file.h"
@@ -382,7 +383,6 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            BindingType binding,
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
-    static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
     VideoCore::Perf::tc_overlap.fetch_add(1, std::memory_order_relaxed);
     VideoCore::Perf::current_request = &image_info;
     VideoCore::Perf::current_binding = static_cast<u32>(binding);
@@ -401,12 +401,33 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (safe_to_delete) {
                 VideoCore::Perf::NoteFree(VideoCore::Perf::FreePoolAlias);
                 FreeImage(cache_image_id);
+            } else {
+                NoteStaleAlias(cache_image_id);
             }
             return {merged_image_id, -1, -1};
         }
 
         if (const auto depth_image_id = ResolveDepthOverlap(image_info, binding, cache_image_id)) {
             return {depth_image_id, -1, -1};
+        }
+
+        // nhlport: dynamic resolution re-describes the same surface with a new width, height and
+        // pitch every few frames. A view of a smaller or larger host image clips draws and shifts
+        // normalized sampling, so the image is recreated at the requested size with the common
+        // region carried over.
+        if (image_info.size != cache_image.info.size &&
+            image_info.type == AmdGpu::ImageType::Color2D &&
+            cache_image.info.type == AmdGpu::ImageType::Color2D &&
+            image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.num_samples == cache_image.info.num_samples &&
+            image_info.resources.layers == 1 && cache_image.info.resources.layers == 1 &&
+            !image_info.props.is_block && !cache_image.info.props.is_block) {
+            ImageInfo resized_info = image_info;
+            resized_info.resources.levels = std::min<u32>(
+                std::max(image_info.resources.levels, cache_image.info.resources.levels),
+                std::bit_width(std::max(image_info.size.width, image_info.size.height)));
+            resized_info.UpdateSize();
+            return {ExpandImage(resized_info, cache_image_id), -1, -1};
         }
 
         // Compressed view of uncompressed image with same block size.
@@ -447,6 +468,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                              image_info.guest_address);
                 }
                 VideoCore::Perf::tc_incompatible.fetch_add(1, std::memory_order_relaxed);
+                NoteStaleAlias(cache_image_id);
             }
             return {is_compatible ? result_id : ImageId{}, -1, -1};
         }
@@ -463,6 +485,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             if (safe_to_delete) {
                 VideoCore::Perf::NoteFree(VideoCore::Perf::FreeTileMode);
                 FreeImage(cache_image_id);
+            } else {
+                NoteStaleAlias(cache_image_id);
             }
             return {merged_image_id, -1, -1};
         }
@@ -590,6 +614,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (safe_to_delete) {
             VideoCore::Perf::NoteFree(VideoCore::Perf::FreePoolAlias);
             FreeImage(cache_image_id);
+        } else {
+            NoteStaleAlias(cache_image_id);
         }
         return {merged_image_id, -1, -1};
     }
@@ -792,6 +818,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                          vk::to_string(cache_image.info.pixel_format), cache_image.info.resources.levels,
                          scheduler.CurrentTick() - cache_image.tick_accessed_last);
             }
+            NoteStaleAlias(image_id);
         }
         image_id = cache_id;
     }
@@ -1160,6 +1187,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                  scheduler.CurrentTick() - image.tick_accessed_last, req_str));
         VideoCore::Perf::last_free_reason = 0xffffffffu;
     }
+    {
+        std::scoped_lock lk{stale_aliases_mutex};
+        stale_aliases.erase(image_id);
+    }
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -1275,7 +1306,6 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
@@ -1285,6 +1315,7 @@ void TextureCache::GarbageCollectImages() {
         if (download && !pressured) {
             return false;
         }
+        --num_deletions;
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
             DownloadImageMemory(image_id);
@@ -1313,6 +1344,38 @@ void TextureCache::GarbageCollectImages() {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    }
+}
+
+void TextureCache::NoteStaleAlias(ImageId image_id) {
+    std::scoped_lock lk{stale_aliases_mutex};
+    stale_aliases.insert(image_id);
+}
+
+void TextureCache::CollectStaleAliases() {
+    SmallVector<ImageId, 16> superseded;
+    {
+        std::scoped_lock lk{stale_aliases_mutex};
+        const u64 tick = scheduler.CurrentTick();
+        for (const ImageId image_id : stale_aliases) {
+            const Image& image = slot_images[image_id];
+            if (tick - image.tick_accessed_last <= NUM_FRAMES_BEFORE_REMOVAL) {
+                continue;
+            }
+            bool newer = false;
+            ForEachImageWithAddress(image.info.guest_address, [&](ImageId other_id, Image& other) {
+                newer |= other_id != image_id &&
+                         other.info.guest_address == image.info.guest_address &&
+                         other.tick_accessed_last > image.tick_accessed_last;
+            });
+            if (newer) {
+                superseded.push_back(image_id);
+            }
+        }
+    }
+    for (const ImageId image_id : superseded) {
+        VideoCore::Perf::NoteFree(VideoCore::Perf::FreePoolAlias);
+        FreeImage(image_id);
     }
 }
 
@@ -1357,6 +1420,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    CollectStaleAliases();
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;

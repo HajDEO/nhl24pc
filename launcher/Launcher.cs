@@ -106,6 +106,7 @@ namespace NhlPort
             { "version_line", new[] { "Windows  •  v{0}", "Windows  •  v{0}" } },
             { "game_line", new[] { "{0}  •  verzia hry {1}", "{0}  •  game version {1}" } },
             { "game_line_none", new[] { "CUSA37933 / CUSA37934  •  hra nie je nainštalovaná", "CUSA37933 / CUSA37934  •  game not installed" } },
+            { "support", new[] { "♥  Podporte autora", "♥  Support the author" } },
         };
 
         public static string T(string key)
@@ -424,6 +425,7 @@ namespace NhlPort
     public static class Theme
     {
         public static readonly Color Orange = Color.FromArgb(255, 122, 26);
+        public static readonly Color KoFi = Color.FromArgb(255, 94, 91);
         public static readonly Color Field = Color.FromArgb(22, 29, 40);
         public static readonly Color FieldText = Color.White;
         public static readonly Font Body = new Font("Segoe UI", 10.5f);
@@ -462,7 +464,7 @@ namespace NhlPort
     // ------------------------------------------------------------------ the form
     public class LauncherForm : Form
     {
-        const string FallbackVersion = "0.9.0";
+        const string FallbackVersion = "0.9.1";
         string PortVersion = FallbackVersion; // taken from the version resource of nhl24.exe when present
         const string DefaultTitleId = "CUSA37933";
         static readonly string[] SupportedTitleIds = { "CUSA37933", "CUSA37934" };
@@ -990,6 +992,13 @@ namespace NhlPort
             Controls.Add(simpleBtn);
             Controls.Add(advancedBtn);
 
+            var supportBtn = new FlatButton { Left = 752, Top = 30, Width = 196, Height = 34, Text = Loc.T("support"), Font = new Font("Segoe UI", 10f, FontStyle.Bold), BackColor = Theme.KoFi };
+            supportBtn.FlatAppearance.BorderColor = Theme.KoFi;
+            supportBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(255, 125, 122);
+            supportBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(220, 70, 68);
+            supportBtn.Click += delegate { OpenSupportPage(); };
+            Controls.Add(supportBtn);
+
             BuildSimpleView();
             BuildAdvancedView();
             BuildBottomBar();
@@ -1280,6 +1289,11 @@ namespace NhlPort
         {
             var folder = Directory.Exists(GameFolder) ? GameFolder : baseDir;
             try { Process.Start("explorer.exe", "\"" + folder + "\""); } catch (Exception) { }
+        }
+
+        void OpenSupportPage()
+        {
+            try { Process.Start(new ProcessStartInfo("https://ko-fi.com/hajdeo") { UseShellExecute = true }); } catch (Exception) { }
         }
 
         void BrowseGameFolder()

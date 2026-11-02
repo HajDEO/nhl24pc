@@ -432,6 +432,7 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan11Features{
             .storageBuffer16BitAccess = vk11_features.storageBuffer16BitAccess,
+            .uniformAndStorageBuffer16BitAccess = vk11_features.uniformAndStorageBuffer16BitAccess,
             .shaderDrawParameters = vk11_features.shaderDrawParameters,
         },
         vk::PhysicalDeviceVulkan12Features{

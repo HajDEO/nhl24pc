@@ -11,8 +11,9 @@ implementations, and the GPU work goes through Vulkan.
 | | |
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
+| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.0** (2026-11-02), Windows 10/11 x64 |
+| Current build | **v0.9.1** (2026-11-02), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG (base v01.00, optionally the 1.60 update), a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -45,12 +46,31 @@ CPU directly, at native speed. What the emulator provides is everything around i
 
 If this project is useful to you, you can support its development:
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/E1E61VGHII)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/hajdeo)
+
+## What's new in v0.9.1
+
+- **Black boxes and lines in cutscenes fixed** (issue #17, NVIDIA and AMD). NHL 24 renders cutscenes
+  and intros at a dynamic resolution and re-describes the same render targets with a new width, height
+  and pitch every few frames. The texture cache served those requests with an image of the previous
+  size, which clipped draws and shifted sampling. Such images are now recreated at the requested size
+  with their contents carried over.
+- **Out-of-video-memory crashes after several matches** (`ErrorOutOfDeviceMemory` on 8 GB cards):
+  images left behind when the game reuses memory for another surface are now released once they go idle,
+  and the garbage collector no longer stalls on images it cannot release.
+- **Be a Pro and NVIDIA fixes** from [torpedatorpeda/NHL24-Be-a-Pro](https://github.com/torpedatorpeda/NHL24-Be-a-Pro),
+  reimplemented in the emulator source: no crash when a texel buffer starts inside an image (match
+  start), shared-memory ordering for compute shaders on GPUs with 32-wide subgroups (NVIDIA), separate
+  descriptors for colour sampling and depth comparison of the same texture, depth-store synchronisation
+  when a depth target is also sampled, and 16-bit uniform buffer access enabled where supported.
+- The shader cache is rebuilt once on the first start (expect a few minutes of stutter).
+- Launcher: **♥ Support the author** button (Ko-fi).
 
 ## Playing
 
-1. Download the repository (green **Code → Download ZIP**), unpack the ZIP and open its `release`
-   folder – everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
+1. Download `NHL24-PC-v0.9.1.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+   (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
+   everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
 2. Start `launcher.exe`. Click **Install PKG** and pick your NHL 24 **base game** package (v01.00).
    The 1.60 update PKG can be installed afterwards the same way; since v0.9.0 the port runs game
@@ -68,8 +88,9 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.9.0): occasional black tile columns in cutscenes that run at a dynamic resolution
-(analysis and next steps in `docs/DEVLOG.sk.md`, section "Finálny build v0.8.1"); rare "device lost" crashes. If the game
+**Known issues** (v0.9.1): on 8 GB graphics cards the video memory use can exceed the card's budget in
+long sessions (the driver then moves part of it to system RAM, which costs performance); rare "device
+lost" crashes. If the game
 crashes while a match loads (right after team selection, error 0xc0000005, issues #1/#3), turn on **Red zone
 protection (Windows)** in the launcher's quick settings (off by default, experimental; see `docs/DEVLOG.sk.md`,
 section "v0.8.3: ochrana red zone"). Windows SmartScreen may warn about the unsigned exe
@@ -131,7 +152,26 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
-**Hranie:** stiahnite repozitár (Code → Download ZIP), rozbaľte ho a prejdite do priečinka `release`
+**Novinky vo v0.9.1:**
+
+- **Opravené čierne obdĺžniky a pruhy v prestrihoch** (issue #17, NVIDIA aj AMD). Hra kreslí prestrihy
+  a úvody v dynamickom rozlíšení a tie isté render targety každých pár snímok opisuje s inou šírkou,
+  výškou a pitchom. Texture cache takéto požiadavky obsluhovala obrazom predchádzajúcej veľkosti, čím sa
+  kreslenie orezalo a vzorkovanie posunulo. Obraz sa teraz vytvorí v požadovanej veľkosti a obsah sa prenesie.
+- **Pády na nedostatok videopamäte po niekoľkých zápasoch** (`ErrorOutOfDeviceMemory` na 8 GB kartách):
+  obrazy, ktoré ostanú po tom, čo hra použije pamäť pre iný povrch, sa po nečinnosti uvoľnia
+  a garbage collector sa už nezasekne na obrazoch, ktoré uvoľniť nemôže.
+- **Opravy pre Be a Pro a NVIDIU** z projektu [torpedatorpeda/NHL24-Be-a-Pro](https://github.com/torpedatorpeda/NHL24-Be-a-Pro),
+  prepracované priamo v zdrojákoch emulátora: žiadny pád, keď texel buffer začína vnútri obrazu (začiatok
+  zápasu), poradie prístupov do shared memory v compute shaderoch na GPU s 32-šírkovým subgroupom
+  (NVIDIA), samostatné deskriptory pre vzorkovanie farby a porovnanie hĺbky tej istej textúry,
+  synchronizácia zápisu hĺbky, keď sa depth target zároveň vzorkuje, a 16-bitový prístup k uniform
+  bufferom tam, kde ho GPU podporuje.
+- Shader cache sa pri prvom spustení raz preloží nanovo (pár minút sekania).
+- Launcher: tlačidlo **♥ Podporte autora** (Ko-fi).
+
+**Hranie:** stiahnite `NHL24-PC-v0.9.1.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+(alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
 nainštalovať rovnako; od v0.9.0 port podporuje verziu hry 1.00 aj 1.60.
@@ -141,8 +181,9 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.0):** občasné čierne stĺpce dlaždíc v prestrihoch s dynamickým rozlíšením
-(rozbor v `docs/DEVLOG.sk.md`), zriedkavé pády „device lost“. Ak hra padá pri načítaní zápasu (hneď po
+**Známe problémy (v0.9.1):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon), zriedkavé
+pády „device lost“. Ak hra padá pri načítaní zápasu (hneď po
 výbere tímov, chyba 0xc0000005), zapnite v launcheri **Ochrana red zone (Windows)** (predvolene vypnuté,
 experimentálne; rozbor v `docs/DEVLOG.sk.md`, sekcia „v0.8.3: ochrana red zone“).
 

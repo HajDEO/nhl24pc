@@ -72,9 +72,21 @@ static void EmitBarrierAtBlockStart(IR::Block* block) {
 
 static bool IsDivergent(const IR::U1& cond) {
     return IR::BreadthFirstSearch(cond, [](IR::Inst* inst) -> std::optional<bool> {
-               if (inst->GetOpcode() == IR::Opcode::GetAttributeU32 &&
-                   inst->Arg(0).Attribute() == IR::Attribute::LocalInvocationId) {
+               switch (inst->GetOpcode()) {
+               case IR::Opcode::LaneId:
                    return true;
+               case IR::Opcode::GetAttributeU32:
+                   switch (inst->Arg(0).Attribute()) {
+                   case IR::Attribute::LocalInvocationId:
+                   case IR::Attribute::LocalInvocationIndex:
+                   case IR::Attribute::GlobalInvocationId:
+                       return true;
+                   default:
+                       break;
+                   }
+                   break;
+               default:
+                   break;
                }
                return std::nullopt;
            }) == true;
@@ -132,8 +144,11 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
         return;
     }
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup.
-    if (threadgroup_size != GcnSubgroupSize || !profile.needs_lds_barriers) {
+    // subgroup. A host subgroup narrower than a GCN wave splits each wave, so subgroup-scoped
+    // barriers no longer order the wave's shared memory accesses.
+    const bool splits_waves =
+        profile.subgroup_size < GcnSubgroupSize && threadgroup_size > profile.subgroup_size;
+    if (!splits_waves && (threadgroup_size != GcnSubgroupSize || !profile.needs_lds_barriers)) {
         // GCN waves can use shared memory between invocations without explicit barriers because
         // they run in lockstep. Host compilers can reorder these accesses, so keep their order
         // with subgroup memory barriers.

@@ -1,5 +1,60 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.1: čierne pruhy v prestrihoch, videopamäť, opravy z Be-a-Pro (2026-11-02, issue #17)
+
+**Čierne obdĺžniky a pruhy v prestrihoch (issue #17) – vyriešené.** Reportér (RTX 3060, v0.8.3) mal
+`readbacks_mode = 1`, takže nešlo o predvolený config. Jeho log ukazuje cieľ scény 1267×712 (66 %).
+Dočasná diagnostika v `TextureCache::FindImage` (každá požiadavka obslúžená obrazom inej veľkosti)
+ukázala, že hra v prestrihoch, úvodoch a nástupoch mení rozlíšenie v 19–21 krokoch medzi 1600×904
+a 1920×1080. Deje sa to aj pri predvolenom `NHLPORT_GPU_CLOCK=flat`, nafúknutie času GPU 4× na to
+nemá vplyv, takže DRS riadi typ kamery. Pri každej veľkosti sa mení aj **pitch** (1600→1600, 1640→1648,
+1656→1664, 1832→1840…).
+V rovnakoadresnej vetve `ResolveOverlap` sa požiadavka s rovnakým pitchom a výškou (rovnaký
+`guest_size`) obslúžila **menším** VkImage (napr. `req 680x380 → img 668x380`, `13x7 → 12x7`, 228–284
+unikátnych prípadov za beh): kreslenie sa orezalo a normalizované vzorkovanie posunulo. Väčšie obrazy
+pri menšej požiadavke vzorkovanie roztiahli. Živé A/B počas hry (prepínač cez `captures\drsctl`) na
+RTX 5060: pôvodné správanie → pruh v prvom úvode, presná veľkosť → 6 úvodov v dvoch sedeniach bez
+pruhov, potom 6 ďalších zápasov s finálnym buildom bez pruhov.
+Oprava: obraz s rovnakým formátom, počtom vzoriek a jednou vrstvou, no inou veľkosťou sa cez
+`ExpandImage` vytvorí v požadovanej veľkosti (mipy = max oboch, orezané na platný reťazec) a spoločná
+oblasť sa skopíruje. `Runtime::CopyImage` kopíruje len prienik rozmerov, aby zmenšenie nekopírovalo
+mimo cieľa. V oknách s mnohými zmenami veľkosti (úvody) ~23 fps oproti ~26 fps, v hre bez rozdielu.
+
+**Pád na `ErrorOutOfDeviceMemory` po niekoľkých zápasoch (8 GB karty).** Texture cache narástla na
+7+ GB a 3–5 tisíc obrazov. Dve príčiny:
+- Obrazy, ktoré `ResolveOverlap` nechá žiť vedľa novšieho obrazu na tej istej adrese (pool alias,
+  iný tile mode, nevyriešený prekryv, nekompatibilný view, „alias pick“), sa nikdy neuvoľnili:
+  GC preskakuje tiled obrazy zapísané GPU. Teraz sa zapamätajú (`NoteStaleAlias`) a
+  `CollectStaleAliases` ich pri každom GC uvoľní, keď sú nečinné viac ako 32 tickov a na adrese je
+  novšie použitý obraz. Uvoľnenia „pool-alias“: 10 095 oproti 1 106 za podobne dlhý beh.
+- `GarbageCollectImages` míňalo limit uvoľnení aj na obrazy, ktoré preskočilo. Staré neuvoľniteľné
+  obrazy na začiatku LRU tak GC zablokovali. Limit sa teraz počíta len pri skutočnom uvoľnení.
+Šesť zápasov za sebou bez pádu (predtým pád pri 2.–3.). VRAM na vrchole stále prekročí rozpočet
+(8,3 / 7,1 GB, driver presúva do RAM) – ostáva otvorené.
+
+**Opravy z [torpedatorpeda/NHL24-Be-a-Pro](https://github.com/torpedatorpeda/NHL24-Be-a-Pro)**
+(binárne záplaty nášho v0.8.3, tu prepracované v zdrojákoch):
+- R6: `SynchronizeMemoryFromImage` – texel buffer, ktorý začína vnútri obrazu, už nekončí
+  `ASSERT`-om. Vyhľadanie ide po 256-bajtových blokoch, takže susedný buffer mimo obrazu vráti `false`,
+  buffer vnútri obrazu zapíše celý obraz na jeho adresu (rezidencia celého rozsahu v aréne).
+- R7: povolené `uniformAndStorageBuffer16BitAccess`, ak ho GPU podporuje.
+- R8: bariéry depth obrazov po `EndRendering` zahŕňajú v source scope aj zápis depth attachmentu
+  (store pri konci renderingu, keď sa depth target zároveň vzorkuje).
+- R10: deduplikácia obrazov v `resource_patching_pass` rozlišuje `is_depth` (vzorkovanie farby
+  a porovnanie hĺbky tej istej T# dostanú samostatné bindingy).
+- R11: `SharedMemoryBarrierPass` – keď je host subgroup užší ako GCN wave (NVIDIA 32) a workgroup
+  širšia ako subgroup, bariéry so scope subgroup implicitný lockstep wave64 nezabezpečia. Použije sa
+  vetva s workgroup bariérami v uniformnom toku (bariéra na konci hlavičky pred divergentnou vetvou)
+  a divergencia sa rozpoznáva aj z `LocalInvocationIndex`, `GlobalInvocationId` a `LaneId`. Neatomické
+  zápisy rovnakej hodnoty do scratch pamäte wave64 (validácia ich hlási ako race, na HW sú neškodné)
+  ostali.
+- `ShaderBinaryVersion` 7 → 8, shader cache sa raz preloží.
+Neprevzaté: R2 (readbacky bez druhej fronty, bez dôkazu chyby), R5 (rieši to PR #7), R9 (PS4 Pro,
+nedokončené).
+
+Launcher: tlačidlo **♥ Podporte autora / Support the author** (Ko-fi, https://ko-fi.com/hajdeo)
+v hlavičke vedľa prepínača Jednoduchý/Rozšírený. Verzia 0.9.1.
+
 ## v0.9.0: hra 1.60, Be a Pro, koniec zápasu, CUSA37934 (2026-11-02, PR #7, #9, #12, #16, #18)
 
 Zapracované pull requesty komunity:
