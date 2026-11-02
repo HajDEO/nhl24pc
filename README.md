@@ -14,7 +14,7 @@ implementations, and the GPU work goes through Vulkan.
 | Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
 | Current build | **v0.9.1** (2026-11-02), Windows 10/11 x64 |
-| Needs | your own NHL 24 PKG (base v01.00, optionally the 1.60 update), a Vulkan 1.3 GPU |
+| Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
 ## How it works
@@ -74,8 +74,10 @@ If this project is useful to you, you can support its development:
    unpacked folder somewhere you can write to (not Program Files).
 2. Start `launcher.exe`. Click **Install PKG** and pick your NHL 24 **base game** package (v01.00).
    The 1.60 update PKG can be installed afterwards the same way; since v0.9.0 the port runs game
-   version 1.00 and 1.60. The launcher checks the title ID (CUSA37933 or CUSA37934) and the kind
-   of package, shows size and version, and extracts into `game\` next to the launcher, with progress.
+   version 1.00 and 1.60. Both the US (CUSA37933) and the European (CUSA37934, since v0.9.0) versions
+   are supported; the 1.60 update has so far been verified on the US version only. The launcher
+   checks the title ID and the kind of package, shows size and version, and extracts into `game\`
+   next to the launcher, with progress.
 3. Press **PLAY**. Simple view = the settings most people touch; Advanced = everything, including the
    keyboard mapping and the game folder.
 
@@ -174,7 +176,8 @@ s prekladom shaderov GCN → SPIR-V.
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
-nainštalovať rovnako; od v0.9.0 port podporuje verziu hry 1.00 aj 1.60.
+nainštalovať rovnako; od v0.9.0 port podporuje verziu hry 1.00 aj 1.60. Podporovaná je americká
+(CUSA37933) aj európska verzia (CUSA37934, od v0.9.0); update 1.60 je zatiaľ overený len na americkej.
 Uložené pozície, profil a shader cache vznikajú v `user\`; prvé minúty sa hra zasekáva (kompilácia
 shaderov), potom beží plynulo.
 
