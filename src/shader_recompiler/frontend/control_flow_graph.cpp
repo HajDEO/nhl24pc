@@ -116,6 +116,23 @@ struct TableEntry {
     u32 mov_count; // size of the v_mov_b32 in dwords
 };
 
+bool WritesScalarReg(const GcnInst& inst, u32 reg) {
+    for (u32 d = 0; d < 2; d++) {
+        if (inst.dst[d].field != OperandField::ScalarGPR) {
+            continue;
+        }
+        // Scalar memory loads and 64-bit results cover several consecutive registers.
+        u32 width = inst.dst[d].type == ScalarType::Uint64 ? 2 : 1;
+        if (inst.encoding == InstEncoding::SMRD) {
+            width = std::max<u32>(1, inst.control.smrd.count);
+        }
+        if (reg >= inst.dst[d].code && reg < inst.dst[d].code + width) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Rewrites one register-indexed jump table, whose s_setpc_b64 is insts[i]:
 //   s_getpc_b64  sA:sA+1
 //   s_add_u32    sA, sA, sX        (sX = byte offset from the next instruction)
@@ -247,14 +264,14 @@ bool AnalyzeJumpTable(std::span<const u32> code, std::span<const GcnInst> insts,
                 }
             }
         }
-        // The index register must still hold the same value at the jump.
-        for (u32 n = ld + 1; n < i - 3; n++) {
-            for (u32 d = 0; d < insts[n].dst_count; d++) {
-                if (insts[n].dst[d].field == OperandField::ScalarGPR &&
-                    (insts[n].dst[d].code == idx_reg || insts[n].dst[d].code + 1 == idx_reg)) {
-                    return false;
-                }
-            }
+        // The index register may be reused before the jump, so the load is replaced by a copy of
+        // the index into the offset register, which must then stay untouched until the jump.
+        const auto written_before_jump = [&](u32 r) {
+            return std::any_of(insts.begin() + ld + 1, insts.begin() + i - 3,
+                               [r](const GcnInst& inst) { return WritesScalarReg(inst, r); });
+        };
+        if (written_before_jump(offset_reg)) {
+            return false;
         }
         // The index may be biased (s_add_u32 sIDX, sIDX, imm) to select a table that starts
         // further into the same data array.
@@ -322,11 +339,17 @@ bool AnalyzeJumpTable(std::span<const u32> code, std::span<const GcnInst> insts,
         if (selectors.empty()) {
             return false;
         }
-        compare_reg = idx_reg;
-        load_removal = {pcs[ld - 3], pcs[ld] + insts[ld].length, {}};
+        constexpr u32 SOP1_MOV_B32 = 0xBE800300;
+        compare_reg = offset_reg;
+        load_removal = {pcs[ld - 3], pcs[ld] + insts[ld].length,
+                        {SOP1_MOV_B32 | (offset_reg << 16) | idx_reg}};
         has_load_removal = true;
-        for (u32 r : {sbase, sbase + 1, offset_reg, offset_reg + 1}) {
-            killed_regs.push_back(r);
+        killed_regs.push_back(offset_reg);
+        // Registers redefined before the jump do not depend on the removed load.
+        for (u32 r : {sbase, sbase + 1, offset_reg + 1}) {
+            if (!written_before_jump(r)) {
+                killed_regs.push_back(r);
+            }
         }
     } else {
         for (u32 k = 0; k < entries.size(); k++) {
@@ -363,21 +386,7 @@ bool AnalyzeJumpTable(std::span<const u32> code, std::span<const GcnInst> insts,
             if (reads) {
                 return false;
             }
-            bool writes = false;
-            for (u32 d = 0; d < 2; d++) {
-                if (inst.dst[d].field != OperandField::ScalarGPR) {
-                    continue;
-                }
-                // Scalar memory loads and 64-bit results cover several consecutive registers.
-                u32 width = inst.dst[d].type == ScalarType::Uint64 ? 2 : 1;
-                if (inst.encoding == InstEncoding::SMRD) {
-                    width = std::max<u32>(1, inst.control.smrd.count);
-                }
-                if (r >= inst.dst[d].code && r < inst.dst[d].code + width) {
-                    writes = true;
-                }
-            }
-            if (writes) {
+            if (WritesScalarReg(inst, r)) {
                 break;
             }
         }
