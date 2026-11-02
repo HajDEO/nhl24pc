@@ -50,8 +50,8 @@ namespace NhlPort
             { "game_folder", new[] { "Priečinok hry", "Game folder" } },
             { "browse", new[] { "Prehľadávať…", "Browse…" } },
             { "install_pkg", new[] { "Inštalovať z PKG…", "Install from PKG…" } },
-            { "pkg_req", new[] { "Potrebuje PKG základnej hry NHL 24 v01.00 (CUSA37933 alebo CUSA37934). Update 1.60 môžeš nainštalovať potom.",
-                                  "Needs the NHL 24 base game PKG v01.00 (CUSA37933 or CUSA37934). The 1.60 update can be installed afterwards." } },
+            { "pkg_req", new[] { "Potrebuje PKG základnej hry NHL 24 v01.00 – US (CUSA37933) alebo EU (CUSA37934). Update 1.60 môžeš nainštalovať potom.",
+                                  "Needs the NHL 24 base game PKG v01.00 – US (CUSA37933) or EU (CUSA37934). The 1.60 update can be installed afterwards." } },
             { "output", new[] { "Výstup", "Output" } },
             { "display_mode", new[] { "Režim zobrazenia", "Display mode" } },
             { "windowed", new[] { "Okno", "Windowed" } },
@@ -80,7 +80,7 @@ namespace NhlPort
             { "pkg_progress", new[] { "{0} / {1} MB   •   {2} / {3} súborov", "{0} / {1} MB   •   {2} / {3} files" } },
             { "pkg_done", new[] { "Hotovo: {0} nainštalovaný do {1}", "Done: {0} installed into {1}" } },
             { "pkg_error", new[] { "Inštalácia zlyhala: {0}", "Installation failed: {0}" } },
-            { "pkg_wrong", new[] { "Tento balík je {0} ({1}), port potrebuje NHL 24 (CUSA37933 alebo CUSA37934).", "This package is {0} ({1}); the port needs NHL 24 (CUSA37933 or CUSA37934)." } },
+            { "pkg_wrong", new[] { "Tento balík je {0} ({1}), port potrebuje NHL 24 – US (CUSA37933) alebo EU (CUSA37934).", "This package is {0} ({1}); the port needs NHL 24 – US (CUSA37933) or EU (CUSA37934)." } },
             { "pkg_kind_base", new[] { "základná hra", "base game" } },
             { "pkg_kind_patch", new[] { "aktualizácia", "update" } },
             { "pkg_kind_other", new[] { "iný obsah", "other content" } },
@@ -105,7 +105,7 @@ namespace NhlPort
                                        "The game renders at its native 1920x1080 (as on the PS4) and the output is scaled to the chosen window or screen. FSR improves sharpness at larger resolutions (1440p, 4K). The internal resolution stays fixed so the picture and menu layout stay intact." } },
             { "version_line", new[] { "Windows  •  v{0}", "Windows  •  v{0}" } },
             { "game_line", new[] { "{0}  •  verzia hry {1}", "{0}  •  game version {1}" } },
-            { "game_line_none", new[] { "CUSA37933 / CUSA37934  •  hra nie je nainštalovaná", "CUSA37933 / CUSA37934  •  game not installed" } },
+            { "game_line_none", new[] { "CUSA37933 (US) / CUSA37934 (EU)  •  hra nie je nainštalovaná", "CUSA37933 (US) / CUSA37934 (EU)  •  game not installed" } },
             { "support", new[] { "♥  Podporte autora", "♥  Support the author" } },
         };
 
@@ -669,6 +669,13 @@ namespace NhlPort
             return ReadSfoString(Path.Combine(folder, "sce_sys", "param.sfo"), "TITLE_ID");
         }
 
+        static string WithRegion(string titleId)
+        {
+            if (titleId == "CUSA37933") return titleId + " (US)";
+            if (titleId == "CUSA37934") return titleId + " (EU)";
+            return titleId;
+        }
+
         static bool IsSupportedTitleId(string titleId)
         {
             return Array.IndexOf(SupportedTitleIds, titleId) >= 0;
@@ -686,7 +693,7 @@ namespace NhlPort
                 var upd = InstalledVersion(folder + "-UPDATE");
                 if (upd != null) text += Loc.F("game_upd", upd);
                 rowGame.Text = text; rowGame.Ok = true;
-                gameVersionLabel.Text = Loc.F("game_line", titleId ?? DefaultTitleId, upd ?? version);
+                gameVersionLabel.Text = Loc.F("game_line", WithRegion(titleId ?? DefaultTitleId), upd ?? version);
             }
             else
             {
