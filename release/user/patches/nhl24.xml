@@ -20,4 +20,14 @@
       <Line Type="byte" Address="0x068ACB70" Value="0xEB"/>
     </PatchList>
   </Metadata>
+  <!--
+    Same patch for the 1.60 update (APP_VER 01.60). The instruction moved: in the 1.60 eboot.bin the
+    "cmp qword ptr [rdi+8], 0 ; je +0x48" is at eboot+0x64e076b, so the je opcode byte is at
+    0x68E0770 (checked against the installed 1.60 eboot.bin; the 1.00 entry above is unchanged).
+  -->
+  <Metadata Name="Synchronous replay compression (fixes black ice / frozen gameplay)" isEnabled="true" AppVer="01.60" AppElf="eboot.bin" Author="nhlport">
+    <PatchList>
+      <Line Type="byte" Address="0x068E0770" Value="0xEB"/>
+    </PatchList>
+  </Metadata>
 </Patch>

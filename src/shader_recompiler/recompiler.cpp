@@ -78,6 +78,19 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
     }
 
+    // Some shaders read a VGPR chosen at runtime through a jump table. Rewrite those into
+    // compare-and-move checks and decode the patched code instead.
+    std::vector<u32> patched_code;
+    if (Gcn::ExpandIndirectRegisterTables(code, program.ins_list, patched_code)) {
+        program.ins_list.clear();
+        Gcn::GcnCodeSlice patched_slice(patched_code.data(),
+                                        patched_code.data() + patched_code.size());
+        Gcn::GcnDecodeContext patched_decoder;
+        while (!patched_slice.atEnd()) {
+            program.ins_list.emplace_back(patched_decoder.decodeInstruction(patched_slice));
+        }
+    }
+
     // Clear any previous pooled data.
     pools.ReleaseContents();
 

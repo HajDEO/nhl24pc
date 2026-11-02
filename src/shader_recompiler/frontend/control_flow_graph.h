@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <span>
 #include <string>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include <boost/intrusive/set.hpp>
 
@@ -50,6 +51,14 @@ struct Block : Hook {
     IR::Block* ir_block{};
     bool is_dummy{};
 };
+
+/// Rewrites register-indexed jump tables (s_getpc_b64 / s_add_u32 / s_addc_u32 / s_setpc_b64 into a
+/// run of "v_mov_b32 vN, <src>" entries, used for dynamic VGPR indexing) into compare-and-move
+/// checks the recompiler can handle. The jump offsets are read from the table stored after the
+/// shader code when the shader loads them from there. Returns true and fills `out` with the
+/// patched code when at least one table was rewritten and every table could be handled.
+bool ExpandIndirectRegisterTables(std::span<const u32> code, std::span<const GcnInst> insts,
+                                  std::vector<u32>& out);
 
 class CFG {
     using Label = u32;

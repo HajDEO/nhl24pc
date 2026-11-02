@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <string>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -99,6 +100,436 @@ static std::optional<u32> ResolveSetPcTarget(std::span<const GcnInst> list, u32 
     const u32 result_pc = static_cast<u32>(static_cast<s32>(base_pc) + signed_offset);
     LOG_DEBUG(Render_Recompiler, "SetPC target: {} + {} = {}", base_pc, signed_offset, result_pc);
     return result_pc & ~0x3u;
+}
+
+namespace {
+
+struct Replacement {
+    u32 begin; // byte range in the original code that is replaced
+    u32 end;
+    std::vector<u32> words;
+};
+
+struct TableEntry {
+    u32 offset;    // byte offset of the entry from the instruction after s_getpc_b64
+    u32 mov_dword; // dword index of the v_mov_b32 in the original code
+    u32 mov_count; // size of the v_mov_b32 in dwords
+};
+
+// Rewrites one register-indexed jump table, whose s_setpc_b64 is insts[i]:
+//   s_getpc_b64  sA:sA+1
+//   s_add_u32    sA, sA, sX        (sX = byte offset from the next instruction)
+//   s_addc_u32   sA+1, sA+1, ...
+//   s_setpc_b64  sA:sA+1
+// followed by [s_waitcnt] v_mov_b32 vN, <src> [s_branch exit] entries. Shader compilers emit this
+// to read a VGPR selected by a runtime index. It is a dynamic jump the recompiler cannot resolve,
+// so it becomes a chain of "if (index == k) vN = src" checks.
+bool AnalyzeJumpTable(std::span<const u32> code, std::span<const GcnInst> insts,
+                      const std::vector<u32>& pcs, u32 i, std::vector<Replacement>& repl) {
+    const u32 count = static_cast<u32>(insts.size());
+    const u32 total = pcs[count];
+    if (i < 3) {
+        return false;
+    }
+    const GcnInst& getpc = insts[i - 3];
+    const GcnInst& add = insts[i - 2];
+    const GcnInst& addc = insts[i - 1];
+    const GcnInst& setpc = insts[i];
+    if (getpc.opcode != Opcode::S_GETPC_B64 || add.opcode != Opcode::S_ADD_U32 ||
+        addc.opcode != Opcode::S_ADDC_U32 || add.src_count < 2) {
+        return false;
+    }
+    const u32 reg = getpc.dst[0].code;
+    if (setpc.src[0].code != reg || add.dst[0].code != reg || addc.dst[0].code != reg + 1) {
+        return false;
+    }
+    const InstOperand* offset_op = nullptr;
+    if (add.src[0].field == OperandField::ScalarGPR && add.src[0].code == reg) {
+        offset_op = &add.src[1];
+    } else if (add.src[1].field == OperandField::ScalarGPR && add.src[1].code == reg) {
+        offset_op = &add.src[0];
+    }
+    if (!offset_op || offset_op->field != OperandField::ScalarGPR || offset_op->code > 103) {
+        return false;
+    }
+    const u32 offset_reg = offset_op->code;
+
+    // Parse the table that follows the jump.
+    const u32 base_pc = pcs[i - 3] + getpc.length;
+    std::vector<TableEntry> entries;
+    u32 exit_pc = 0;
+    u32 j = i + 1;
+    while (j < count) {
+        const u32 entry_pc = pcs[j];
+        u32 k = j;
+        while (k < count && insts[k].opcode == Opcode::S_WAITCNT) {
+            k++;
+        }
+        if (k >= count || insts[k].opcode != Opcode::V_MOV_B32 || insts[k].length % 4 != 0) {
+            return false;
+        }
+        entries.push_back({entry_pc - base_pc, pcs[k] / 4, insts[k].length / 4});
+        k++;
+        if (k < count && insts[k].opcode == Opcode::S_BRANCH) {
+            const u32 target = insts[k].BranchTarget(pcs[k]);
+            if (exit_pc != 0 && target != exit_pc) {
+                return false;
+            }
+            exit_pc = target;
+            j = k + 1;
+            continue;
+        }
+        // No branch: last entry falls through to the exit.
+        if (exit_pc != 0 && pcs[k] != exit_pc) {
+            return false;
+        }
+        exit_pc = pcs[k];
+        break;
+    }
+    if (entries.size() < 2 || exit_pc <= pcs[i] || exit_pc > total) {
+        return false;
+    }
+    if (!std::ranges::binary_search(pcs, exit_pc)) {
+        return false;
+    }
+    const u32 region_begin = pcs[i - 3];
+    const u32 region_end = exit_pc;
+
+    // Many compilers load the jump offset from a table stored in the shader binary:
+    //   s_getpc_b64 sP; s_add_u32 sP, sP, LIT; s_addc_u32 sP+1, sP+1, 0;
+    //   s_load_dwordx2 sX:sX+1, sP:sP+1, sIDX        (sIDX = 8 * index)
+    // Read that table so the checks can compare the index itself instead.
+    u32 compare_reg = offset_reg;
+    std::vector<std::pair<u32, u32>> selectors; // (value compared with compare_reg, entry index)
+    std::vector<u32> killed_regs = {reg, reg + 1};
+    Replacement load_removal{0, 0, {}};
+    bool has_load_removal = false;
+    u32 ld = 0;
+    for (u32 n = i - 4; n >= 3 && n + 80 > i; n--) {
+        // look back a short distance for the load that defines the offset register
+        if (insts[n].opcode == Opcode::S_LOAD_DWORDX2 && insts[n].dst[0].code == offset_reg) {
+            ld = n;
+            break;
+        }
+    }
+    if (ld != 0 && insts[ld].control.smrd.imm == 0 &&
+        insts[ld].src[1].field == OperandField::ScalarGPR) {
+        const u32 sbase = insts[ld].src[0].code * 2;
+        const u32 idx_reg = insts[ld].src[1].code;
+        const GcnInst& g = insts[ld - 3];
+        const GcnInst& a1 = insts[ld - 2];
+        const GcnInst& a2 = insts[ld - 1];
+        const bool shape_ok =
+            g.opcode == Opcode::S_GETPC_B64 && g.dst[0].code == sbase &&
+            a1.opcode == Opcode::S_ADD_U32 && a1.dst[0].code == sbase &&
+            a2.opcode == Opcode::S_ADDC_U32 && a2.dst[0].code == sbase + 1 &&
+            ((a1.src[0].field == OperandField::ScalarGPR && a1.src[0].code == sbase &&
+              a1.src[1].field == OperandField::LiteralConst) ||
+             (a1.src[1].field == OperandField::ScalarGPR && a1.src[1].code == sbase &&
+              a1.src[0].field == OperandField::LiteralConst));
+        if (!shape_ok) {
+            return false;
+        }
+        const u32 table_literal = a1.src[0].field == OperandField::LiteralConst ? a1.src[0].code
+                                                                                 : a1.src[1].code;
+        // Nothing between the load and the jump may use the registers being removed.
+        for (u32 n = ld + 1; n < i - 3; n++) {
+            for (u32 sidx = 0; sidx < insts[n].src_count && sidx < 4; sidx++) {
+                if (insts[n].src[sidx].field != OperandField::ScalarGPR) {
+                    continue;
+                }
+                u32 c = insts[n].src[sidx].code;
+                if (insts[n].encoding == InstEncoding::SMRD && sidx == 0) {
+                    c *= 2;
+                }
+                if (c == offset_reg || c == offset_reg + 1 || c == sbase || c == sbase + 1) {
+                    return false;
+                }
+            }
+        }
+        // The index register must still hold the same value at the jump.
+        for (u32 n = ld + 1; n < i - 3; n++) {
+            for (u32 d = 0; d < insts[n].dst_count; d++) {
+                if (insts[n].dst[d].field == OperandField::ScalarGPR &&
+                    (insts[n].dst[d].code == idx_reg || insts[n].dst[d].code + 1 == idx_reg)) {
+                    return false;
+                }
+            }
+        }
+        // The index may be biased (s_add_u32 sIDX, sIDX, imm) to select a table that starts
+        // further into the same data array.
+        u32 bias = 0;
+        for (u32 n = ld - 1; n > ld - 12 && n >= 3; n--) {
+            bool writes_idx = false;
+            for (u32 d = 0; d < 2; d++) {
+                if (insts[n].dst[d].field == OperandField::ScalarGPR &&
+                    insts[n].dst[d].code == idx_reg) {
+                    writes_idx = true;
+                }
+            }
+            if (!writes_idx) {
+                continue;
+            }
+            if (insts[n].opcode == Opcode::S_ADD_U32) {
+                const InstOperand& lhs = insts[n].src[0];
+                const InstOperand& rhs = insts[n].src[1];
+                const InstOperand* imm = nullptr;
+                if (lhs.field == OperandField::ScalarGPR && lhs.code == idx_reg) {
+                    imm = &rhs;
+                } else if (rhs.field == OperandField::ScalarGPR && rhs.code == idx_reg) {
+                    imm = &lhs;
+                }
+                if (!imm) {
+                    return false;
+                }
+                if (imm->field == OperandField::LiteralConst) {
+                    bias = imm->code;
+                } else if (imm->field == OperandField::SignedConstIntPos) {
+                    bias = imm->code - 128;
+                } else if (imm->field == OperandField::ConstZero) {
+                    bias = 0;
+                } else {
+                    return false;
+                }
+            }
+            break;
+        }
+        const u32 table_pc = pcs[ld - 3] + g.length + table_literal + bias;
+        const u32* base_ptr = code.data();
+        std::vector<u32> valid_offsets;
+        for (const auto& e : entries) {
+            valid_offsets.push_back(e.offset);
+        }
+        valid_offsets.push_back(exit_pc - base_pc);
+        std::string dump;
+        for (u32 k = 0; k < 64; k++) {
+            const u32 lo = base_ptr[table_pc / 4 + k * 2];
+            const u32 hi = base_ptr[table_pc / 4 + k * 2 + 1];
+            if (k < 20) {
+                dump += fmt::format(" {:x}:{:x}", hi, lo);
+            }
+            if (hi != 0 || std::ranges::find(valid_offsets, lo) == valid_offsets.end()) {
+                break;
+            }
+            if (lo == exit_pc - base_pc) {
+                continue; // jumps straight to the end: nothing to do
+            }
+            const auto it =
+                std::ranges::find_if(entries, [&](const TableEntry& e) { return e.offset == lo; });
+            selectors.emplace_back(bias + k * 8, static_cast<u32>(it - entries.begin()));
+        }
+        LOG_DEBUG(Render_Recompiler, "Jump table data at {:#x}:{}", table_pc, dump);
+        if (selectors.empty()) {
+            return false;
+        }
+        compare_reg = idx_reg;
+        load_removal = {pcs[ld - 3], pcs[ld] + insts[ld].length, {}};
+        has_load_removal = true;
+        for (u32 r : {sbase, sbase + 1, offset_reg, offset_reg + 1}) {
+            killed_regs.push_back(r);
+        }
+    } else {
+        for (u32 k = 0; k < entries.size(); k++) {
+            selectors.emplace_back(entries[k].offset, k);
+        }
+    }
+    if (compare_reg > 103) {
+        return false;
+    }
+
+    // Registers whose definition is going away must not be read afterwards.
+    for (u32 r : killed_regs) {
+        for (u32 n = 0; n < count; n++) {
+            if (pcs[n] < region_end) {
+                continue;
+            }
+            const GcnInst& inst = insts[n];
+            bool reads = false;
+            for (u32 sidx = 0; sidx < inst.src_count && sidx < 4; sidx++) {
+                if (inst.src[sidx].field != OperandField::ScalarGPR) {
+                    continue;
+                }
+                u32 c = inst.src[sidx].code;
+                if (inst.encoding == InstEncoding::SMRD && sidx == 0) {
+                    c *= 2;
+                    if (r == c || r == c + 1) {
+                        reads = true;
+                    }
+                } else if (c == r ||
+                           (inst.src[sidx].type == ScalarType::Uint64 && c + 1 == r)) {
+                    reads = true;
+                }
+            }
+            if (reads) {
+                return false;
+            }
+            bool writes = false;
+            for (u32 d = 0; d < 2; d++) {
+                if (inst.dst[d].field != OperandField::ScalarGPR) {
+                    continue;
+                }
+                // Scalar memory loads and 64-bit results cover several consecutive registers.
+                u32 width = inst.dst[d].type == ScalarType::Uint64 ? 2 : 1;
+                if (inst.encoding == InstEncoding::SMRD) {
+                    width = std::max<u32>(1, inst.control.smrd.count);
+                }
+                if (r >= inst.dst[d].code && r < inst.dst[d].code + width) {
+                    writes = true;
+                }
+            }
+            if (writes) {
+                break;
+            }
+        }
+    }
+
+    // Build the replacement.
+    std::vector<u32> region;
+    for (const auto& [value, entry_index] : selectors) {
+        const TableEntry& e = entries[entry_index];
+        constexpr u32 SOPC = 0xBF000000;
+        constexpr u32 SOPP = 0xBF800000;
+        if (value <= 64) {
+            region.push_back(SOPC | (6u << 16) | ((128 + value) << 8) | compare_reg);
+        } else {
+            region.push_back(SOPC | (6u << 16) | (255u << 8) | compare_reg);
+            region.push_back(value);
+        }
+        // Skip the v_mov when the index does not match.
+        region.push_back(SOPP | (4u << 16) | e.mov_count);
+        for (u32 d = 0; d < e.mov_count; d++) {
+            region.push_back(code[e.mov_dword + d]);
+        }
+    }
+    if (has_load_removal) {
+        repl.push_back(std::move(load_removal));
+    }
+    repl.push_back({region_begin, region_end, std::move(region)});
+    return true;
+}
+
+} // namespace
+
+bool ExpandIndirectRegisterTables(std::span<const u32> code, std::span<const GcnInst> insts,
+                                  std::vector<u32>& out) {
+    const u32 count = static_cast<u32>(insts.size());
+    std::vector<u32> pcs(count + 1);
+    u32 total = 0;
+    for (u32 i = 0; i < count; i++) {
+        pcs[i] = total;
+        total += insts[i].length;
+    }
+    pcs[count] = total;
+    if (total != code.size() * sizeof(u32)) {
+        return false;
+    }
+
+    std::vector<Replacement> repl;
+    u32 tables = 0;
+    for (u32 i = 3; i < count; i++) {
+        if (insts[i].opcode == Opcode::S_SETPC_B64 && !ResolveSetPcTarget(insts, i, pcs)) {
+            if (!AnalyzeJumpTable(code, insts, pcs, i, repl)) {
+                return false;
+            }
+            tables++;
+        }
+    }
+    if (tables == 0) {
+        return false;
+    }
+    std::ranges::sort(repl, {}, &Replacement::begin);
+    for (size_t n = 1; n < repl.size(); n++) {
+        if (repl[n - 1].end > repl[n].begin) {
+            return false;
+        }
+    }
+
+    bool bad_target = false;
+    const auto map_pc = [&](u32 pc) -> u32 {
+        s64 shift = 0;
+        for (const auto& r : repl) {
+            if (pc >= r.end) {
+                shift += static_cast<s64>(r.words.size() * sizeof(u32)) -
+                         static_cast<s64>(r.end - r.begin);
+            } else if (pc > r.begin && pc < r.end) {
+                bad_target = true;
+            }
+        }
+        return static_cast<u32>(static_cast<s64>(pc) + shift);
+    };
+    const auto replaced = [&](u32 pc) {
+        return std::ranges::any_of(
+            repl, [&](const Replacement& r) { return pc >= r.begin && pc < r.end; });
+    };
+    const u32 first_begin = repl.front().begin;
+
+    // Relative branches around the rewritten ranges have to be re-encoded with the new distances.
+    std::vector<std::pair<u32, u16>> fixups; // (new dword index, new simm)
+    for (u32 n = 0; n < count; n++) {
+        const u32 pc = pcs[n];
+        if (replaced(pc)) {
+            continue;
+        }
+        const GcnInst& inst = insts[n];
+        if (inst.IsFork() || inst.opcode == Opcode::S_SWAPPC_B64) {
+            // Not safe to move.
+            if (pc >= first_begin) {
+                return false;
+            }
+            continue;
+        }
+        if (!inst.IsUnconditionalBranch() && !inst.IsConditionalBranch()) {
+            continue;
+        }
+        const u32 target = inst.BranchTarget(pc);
+        const s64 simm = (static_cast<s64>(map_pc(target)) - static_cast<s64>(map_pc(pc)) - 4) / 4;
+        if (simm < INT16_MIN || simm > INT16_MAX) {
+            return false;
+        }
+        fixups.emplace_back(map_pc(pc) / 4, static_cast<u16>(static_cast<s16>(simm)));
+    }
+
+    // Constant-offset jumps (s_getpc_b64 / s_add_u32 literal / s_setpc_b64) that cross a rewritten
+    // range need their literal recomputed too.
+    std::vector<std::pair<u32, u32>> literal_fixups; // (new dword index, new literal)
+    for (u32 n = 3; n < count; n++) {
+        const u32 pc = pcs[n];
+        if (insts[n].opcode != Opcode::S_SETPC_B64 || replaced(pc)) {
+            continue;
+        }
+        const auto target = ResolveSetPcTarget(insts, n, pcs);
+        if (!target) {
+            return false;
+        }
+        const GcnInst& arith = insts[n - 2];
+        const u32 base_pc = pcs[n - 3] + insts[n - 3].length;
+        const s32 new_offset =
+            static_cast<s32>(map_pc(*target)) - static_cast<s32>(map_pc(base_pc));
+        const u32 literal = arith.opcode == Opcode::S_ADD_U32 ? static_cast<u32>(new_offset)
+                                                              : static_cast<u32>(-new_offset);
+        literal_fixups.emplace_back(map_pc(pcs[n - 2]) / 4 + 1, literal);
+    }
+    if (bad_target) {
+        return false; // something jumps into the middle of a rewritten range
+    }
+
+    out.clear();
+    out.reserve(code.size());
+    u32 cursor = 0;
+    for (const auto& r : repl) {
+        out.insert(out.end(), code.begin() + cursor / 4, code.begin() + r.begin / 4);
+        out.insert(out.end(), r.words.begin(), r.words.end());
+        cursor = r.end;
+    }
+    out.insert(out.end(), code.begin() + cursor / 4, code.end());
+    for (const auto& [index, simm] : fixups) {
+        out[index] = (out[index] & 0xFFFF0000u) | simm;
+    }
+    for (const auto& [index, literal] : literal_fixups) {
+        out[index] = literal;
+    }
+    LOG_INFO(Render_Recompiler, "Expanded {} register-indexed jump table(s)", tables);
+    return true;
 }
 
 static constexpr size_t LabelReserveSize = 32;
