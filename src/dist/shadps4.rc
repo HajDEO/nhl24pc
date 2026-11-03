@@ -33,7 +33,7 @@ BEGIN
             VALUE "LegalCopyright", "NHL24 PC port, based on shadPS4 (GPL-2.0-or-later)\0"
             VALUE "OriginalFilename", "nhl24.exe\0"
             VALUE "ProductName", "NHL24 PC\0"
-            VALUE "ProductVersion", xstr(NHLPORT_VERSION_MAJOR) "." xstr(NHLPORT_VERSION_MINOR) "." xstr(NHLPORT_VERSION_PATCH) ".0\0"
+            VALUE "ProductVersion", xstr(NHLPORT_VERSION_MAJOR) "." xstr(NHLPORT_VERSION_MINOR) "." xstr(NHLPORT_VERSION_PATCH) xstr(NHLPORT_VERSION_SUFFIX) "\0"
         END
     END
     BLOCK "VarFileInfo"

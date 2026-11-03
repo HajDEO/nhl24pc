@@ -13,7 +13,7 @@ implementations, and the GPU work goes through Vulkan.
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.2** (2026-11-03), Windows 10/11 x64 |
+| Current build | **v0.9.2b** (2026-11-03), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -48,6 +48,13 @@ If this project is useful to you, you can support its development:
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/hajdeo)
 
+## What's new in v0.9.2b
+
+- **Create a Team crash fixed when opened from Franchise Mode** (issue #13). Starting a Franchise with
+  an expansion draft and creating the new team still crashed in v0.9.2. That screen uses another shader
+  with the same kind of jump table, and the shader recompiler misread the texture registers of an
+  image sample as a use of the table's registers, so it refused to rewrite the table.
+
 ## What's new in v0.9.2
 
 - **Crash when opening Create a Team fixed** (issue #13). Creation Zone → Create a Team crashed to the
@@ -75,7 +82,7 @@ If this project is useful to you, you can support its development:
 
 ## Playing
 
-1. Download `NHL24-PC-v0.9.2.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+1. Download `NHL24-PC-v0.9.2b.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
@@ -97,7 +104,7 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.9.2): on 8 GB graphics cards the video memory use can exceed the card's budget in
+**Known issues** (v0.9.2b): on 8 GB graphics cards the video memory use can exceed the card's budget in
 long sessions (the driver then moves part of it to system RAM, which costs performance); rare "device
 lost" crashes. If the game
 crashes while a match loads (right after team selection, error 0xc0000005, issues #1/#3), turn on **Red zone
@@ -161,6 +168,13 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
+**Novinky vo v0.9.2b:**
+
+- **Opravený pád pri Create a Team vo Franchise Mode** (issue #13). Franšíza s expanzným draftom a
+  vytvorením nového tímu vo v0.9.2 stále zhodila hru. Táto obrazovka používa iný shader s rovnakým
+  typom skokovej tabuľky a recompiler shaderov si registre textúry pri vzorkovaní obrázka pomýlil s
+  použitím registrov tabuľky, takže tabuľku odmietol prepísať.
+
 **Novinky vo v0.9.2:**
 
 - **Opravený pád pri otvorení Create a Team** (issue #13). Creation Zone → Create a Team zhodilo hru:
@@ -186,7 +200,7 @@ s prekladom shaderov GCN → SPIR-V.
 - Shader cache sa pri prvom spustení raz preloží nanovo (pár minút sekania).
 - Launcher: tlačidlo **♥ Podporte autora** (Ko-fi).
 
-**Hranie:** stiahnite `NHL24-PC-v0.9.2.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+**Hranie:** stiahnite `NHL24-PC-v0.9.2b.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
@@ -198,7 +212,7 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.2):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+**Známe problémy (v0.9.2b):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
 prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon), zriedkavé
 pády „device lost“. Ak hra padá pri načítaní zápasu (hneď po
 výbere tímov, chyba 0xc0000005), zapnite v launcheri **Ochrana red zone (Windows)** (predvolene vypnuté,

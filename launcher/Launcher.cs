@@ -464,7 +464,7 @@ namespace NhlPort
     // ------------------------------------------------------------------ the form
     public class LauncherForm : Form
     {
-        const string FallbackVersion = "0.9.2";
+        const string FallbackVersion = "0.9.2b";
         string PortVersion = FallbackVersion; // taken from the version resource of nhl24.exe when present
         const string DefaultTitleId = "CUSA37933";
         static readonly string[] SupportedTitleIds = { "CUSA37933", "CUSA37934" };
@@ -543,7 +543,14 @@ namespace NhlPort
                 {
                     var fvi = FileVersionInfo.GetVersionInfo(gameExe);
                     if (fvi.FileMajorPart + fvi.FileMinorPart + fvi.FileBuildPart > 0)
+                    {
                         PortVersion = fvi.FileMajorPart + "." + fvi.FileMinorPart + "." + fvi.FileBuildPart;
+                        // hotfix releases carry a letter suffix (0.9.2b) in the product version string
+                        string product = fvi.ProductVersion ?? "";
+                        if (product.StartsWith(PortVersion) && product.Length > PortVersion.Length &&
+                            char.IsLetter(product[PortVersion.Length]))
+                            PortVersion = product;
+                    }
                 }
             }
             catch (Exception) { }

@@ -1,5 +1,22 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.2b: Create a Team z Franchise Mode (2026-11-03, issue #13)
+
+**Create a Team otvorené z franšízy s expanzným draftom stále padalo** na rovnaký assert
+(`S_SETPC_B64 without a resolvable offset at PC 0xc0`), tentoraz vo fs `0x37e6e54f`. Tabuľka má
+rovnaký tvar ako v `0xcdcc7564` (`s64 → s10 = min(index, 15) << 3`, `s_load_dwordx2 s[8:9],
+s[58:59], s10`, 15 položiek `v_mov_b32 v9, vN`) a jej dáta sa prečítali správne, ale kontrola
+„odstránené registre sa po tabuľke nečítajú“ našla falošné čítanie `s9`. Hneď za tabuľkou je
+`image_sample` s T# `s[36:43]` a samplerom `s[56:59]` a dekodér ukladá `srsrc`/`ssamp` pri MIMG
+(a `srsrc` pri MUBUF/MTBUF) v jednotkách štyroch registrov, teda 9 a 14. Kontroly prepočítavali
+len `sbase` pri SMRD. Pribudlo `ReadsScalarReg` (náprotivok `WritesScalarReg`), ktoré rozvinie páry
+SMRD, štvorice VMEM (T# 4 alebo 8 registrov podľa `r128`) aj 64-bitové operandy, a používajú ho obe
+kontroly čítania. Overené: Franchise Mode → expanzia → vytvorenie tímu aj Creation Zone → Create a
+Team sa otvoria, tabuľka sa rozvinie.
+
+Verzia môže mať písmenový sufix (`NHLPORT_VERSION "0.9.2b"`): CMake ho prenesie do `ProductVersion`
+v resource exe a launcher ho zobrazí, číselná `FileVersion` ostáva 0.9.2.0.
+
 ## v0.9.2: pád pri Create a Team (2026-11-03, issue #13)
 
 **Creation Zone → Create a Team padalo na assert v recompileri shaderov** (`S_SETPC_B64 without a
