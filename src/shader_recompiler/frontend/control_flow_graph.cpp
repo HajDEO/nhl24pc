@@ -133,6 +133,33 @@ bool WritesScalarReg(const GcnInst& inst, u32 reg) {
     return false;
 }
 
+bool ReadsScalarReg(const GcnInst& inst, u32 reg) {
+    for (u32 s = 0; s < inst.src_count && s < 4; s++) {
+        const InstOperand& src = inst.src[s];
+        if (src.field != OperandField::ScalarGPR) {
+            continue;
+        }
+        // Resource operands are encoded in units of register pairs (SMRD) or quads (VMEM).
+        u32 first = src.code;
+        u32 width = src.type == ScalarType::Uint64 ? 2 : 1;
+        if (inst.encoding == InstEncoding::SMRD && s == 0) {
+            first = src.code * 2;
+            width = 2;
+        } else if ((inst.encoding == InstEncoding::MUBUF || inst.encoding == InstEncoding::MTBUF) &&
+                   s == 2) {
+            first = src.code * 4;
+            width = 4;
+        } else if (inst.encoding == InstEncoding::MIMG && (s == 2 || s == 3)) {
+            first = src.code * 4;
+            width = s == 2 && !inst.control.mimg.r128 ? 8 : 4;
+        }
+        if (reg >= first && reg < first + width) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Rewrites one register-indexed jump table, whose s_setpc_b64 is insts[i]:
 //   s_getpc_b64  sA:sA+1
 //   s_add_u32    sA, sA, sX        (sX = byte offset from the next instruction)
@@ -251,15 +278,8 @@ bool AnalyzeJumpTable(std::span<const u32> code, std::span<const GcnInst> insts,
                                                                                  : a1.src[1].code;
         // Nothing between the load and the jump may use the registers being removed.
         for (u32 n = ld + 1; n < i - 3; n++) {
-            for (u32 sidx = 0; sidx < insts[n].src_count && sidx < 4; sidx++) {
-                if (insts[n].src[sidx].field != OperandField::ScalarGPR) {
-                    continue;
-                }
-                u32 c = insts[n].src[sidx].code;
-                if (insts[n].encoding == InstEncoding::SMRD && sidx == 0) {
-                    c *= 2;
-                }
-                if (c == offset_reg || c == offset_reg + 1 || c == sbase || c == sbase + 1) {
+            for (u32 r : {offset_reg, offset_reg + 1, sbase, sbase + 1}) {
+                if (ReadsScalarReg(insts[n], r)) {
                     return false;
                 }
             }
@@ -367,23 +387,7 @@ bool AnalyzeJumpTable(std::span<const u32> code, std::span<const GcnInst> insts,
                 continue;
             }
             const GcnInst& inst = insts[n];
-            bool reads = false;
-            for (u32 sidx = 0; sidx < inst.src_count && sidx < 4; sidx++) {
-                if (inst.src[sidx].field != OperandField::ScalarGPR) {
-                    continue;
-                }
-                u32 c = inst.src[sidx].code;
-                if (inst.encoding == InstEncoding::SMRD && sidx == 0) {
-                    c *= 2;
-                    if (r == c || r == c + 1) {
-                        reads = true;
-                    }
-                } else if (c == r ||
-                           (inst.src[sidx].type == ScalarType::Uint64 && c + 1 == r)) {
-                    reads = true;
-                }
-            }
-            if (reads) {
+            if (ReadsScalarReg(inst, r)) {
                 return false;
             }
             if (WritesScalarReg(inst, r)) {
