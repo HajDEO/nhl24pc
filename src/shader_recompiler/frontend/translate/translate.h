@@ -29,6 +29,7 @@ enum class ConditionOp : u32 {
     LE,
     TRU,
     U,
+    O, // ordered: true when neither operand is NaN
 };
 
 enum class AtomicOp : u32 {
@@ -198,6 +199,23 @@ public:
     void V_MUL_F16(const GcnInst& inst);
     void V_MAX_F16(const GcnInst& inst);
     void V_MIN_F16(const GcnInst& inst);
+    void V_SUBREV_F16(const GcnInst& inst);
+    void V_LDEXP_F16(const GcnInst& inst);
+    void V_RCP_F16(const GcnInst& inst);
+    void V_SQRT_F16(const GcnInst& inst);
+    void V_RSQ_F16(const GcnInst& inst);
+    void V_LOG_F16(const GcnInst& inst);
+    void V_EXP_F16(const GcnInst& inst);
+    void V_FREXP_MANT_F16(const GcnInst& inst);
+    void V_FREXP_EXP_I16_F16(const GcnInst& inst);
+    void V_FLOOR_F16(const GcnInst& inst);
+    void V_CEIL_F16(const GcnInst& inst);
+    void V_TRUNC_F16(const GcnInst& inst);
+    void V_RNDNE_F16(const GcnInst& inst);
+    void V_FRACT_F16(const GcnInst& inst);
+    void V_SIN_F16(const GcnInst& inst);
+    void V_COS_F16(const GcnInst& inst);
+    void V_MAD_F16(const GcnInst& inst);
 
     // VOP1
     void V_MOV(const GcnInst& inst);
@@ -252,6 +270,7 @@ public:
     void V_CMP_F64(ConditionOp op, bool ordered, bool set_exec, const GcnInst& inst);
     void V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst);
     void V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst);
+    void V_CMP_F16(ConditionOp op, bool ordered, const GcnInst& inst);
     void V_CMP_CLASS_F32(const GcnInst& inst);
 
     // VOP3a

@@ -346,6 +346,7 @@ OperandField GcnDecodeContext::getOperandField(uint32_t code) {
 
 void GcnDecodeContext::decodeInstruction32(InstEncoding encoding, GcnCodeSlice& code) {
     u32 hexInstruction = code.readu32();
+    m_instruction.raw = hexInstruction; // nhlport: diagnostics
     switch (encoding) {
     case InstEncoding::SOP1:
         decodeInstructionSOP1(hexInstruction);
@@ -384,6 +385,7 @@ void GcnDecodeContext::decodeInstruction32(InstEncoding encoding, GcnCodeSlice& 
 
 void GcnDecodeContext::decodeInstruction64(InstEncoding encoding, GcnCodeSlice& code) {
     uint64_t hexInstruction = code.readu64();
+    m_instruction.raw = hexInstruction; // nhlport: diagnostics
     switch (encoding) {
     case InstEncoding::VOP3:
         decodeInstructionVOP3(hexInstruction);
