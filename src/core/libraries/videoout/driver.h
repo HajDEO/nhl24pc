@@ -78,6 +78,9 @@ class VideoOutDriver {
 public:
     VideoOutDriver(u32 width, u32 height);
     ~VideoOutDriver();
+    // nhlport: update the resolution the game sees from sceVideoOutGetResolutionStatus
+    // (used by the render resolution override, which runs after this driver is created).
+    void SetResolution(u32 width, u32 height);
 
     int Open(const ServiceThreadParams* params);
     void Close(s32 handle);

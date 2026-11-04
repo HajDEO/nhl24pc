@@ -8,9 +8,12 @@
 #include <string>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
+#include <windows.h>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/emulator_settings.h"
+#include "core/libraries/videoout/video_out.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "memory_patcher.h"
@@ -220,6 +223,81 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
     }
 }
 
+// nhlport: patch the game's base-mode resolution table entry to the configured height.
+// NHL 24 holds a 16-byte-stride resolution table in eboot - {1920,1080} (base mode)
+// followed 16 bytes later by {3840,2160} (Neo mode) - and fills its VideoOut buffer
+// attribute from these values, so overwriting the base entry changes the whole render
+// resolution. The module's load base varies per run, so the table is located by its
+// unique signature (the 3840x2160 Neo entry 16 bytes after the base entry) inside the
+// committed regions of the module rather than by a hardcoded offset. The signature IS
+// the safety check: a future game update with different stock values simply won't match.
+void ApplyRenderResolutionOverride() {
+    if (g_eboot_address == 0) {
+        return;
+    }
+    const int height = EmulatorSettings.GetRenderResolution();
+    if (height != 1080 && height != 1440 && height != 2160) {
+        return;
+    }
+    constexpr u64 ScanSpan = 0xE800000; // covers the module plus mapping slack
+    constexpr std::array<u8, 8> BaseEntry{0x80, 0x07, 0x00, 0x00, 0x38, 0x04, 0x00, 0x00};
+    constexpr std::array<u8, 8> NeoEntry{0x00, 0x0F, 0x00, 0x00, 0x70, 0x08, 0x00, 0x00};
+
+    const u8* found = nullptr;
+    uintptr_t addr = g_eboot_address;
+    const uintptr_t scan_end = g_eboot_address + ScanSpan;
+    while (addr < scan_end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) == 0) {
+            break;
+        }
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && region_end > g_eboot_address) {
+            const u8* begin = reinterpret_cast<const u8*>(
+                std::max(addr, g_eboot_address));
+            const u8* stop = reinterpret_cast<const u8*>(std::min(region_end, scan_end));
+            for (const u8* p = begin; p + 32 <= stop; ++p) {
+                if (std::memcmp(p, BaseEntry.data(), BaseEntry.size()) == 0 &&
+                    std::memcmp(p + 16, NeoEntry.data(), NeoEntry.size()) == 0) {
+                    found = p;
+                    break;
+                }
+            }
+            if (found) {
+                break;
+            }
+        }
+        addr = region_end;
+    }
+    if (!found) {
+        LOG_WARNING(Loader,
+                    "Render resolution override: resolution table signature not found; "
+                    "skipping (game update?)");
+        return;
+    }
+
+    const u32 width = u32(height) * 16 / 9;
+    const std::array<u8, 8> patched = {
+        u8(width & 0xff), u8((width >> 8) & 0xff), 0, 0,
+        u8(height & 0xff), u8((height >> 8) & 0xff), 0, 0};
+    void* target = const_cast<u8*>(found);
+    DWORD old_protect = 0;
+    void* page_start = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(target) & ~uintptr_t(0xFFF));
+    if (VirtualProtect(page_start, 8, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
+        LOG_ERROR(Loader, "Render resolution override: VirtualProtect failed at {:#x} (error {})",
+                  reinterpret_cast<uintptr_t>(target), GetLastError());
+        return;
+    }
+    std::memcpy(target, patched.data(), patched.size());
+    VirtualProtect(page_start, 8, old_protect, &old_protect);
+    // nhlport: keep the reported VideoOut resolution consistent with the patched
+    // buffers - a mismatch (game told 1080p while its buffers are 1440p) crashes the
+    // engine at gameplay load.
+    Libraries::VideoOut::SetInternalResolution(width, height);
+    LOG_INFO(Loader, "Render resolution override: base mode now renders {}x{}", width, height);
+}
+
 void OnGameLoaded() {
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
@@ -273,6 +351,7 @@ void OnGameLoaded() {
         }
     }
     ApplyPendingPatches();
+    ApplyRenderResolutionOverride();
 }
 
 void AddPatchToQueue(const patchInfo& patchToAdd) {
@@ -411,7 +490,21 @@ void PatchMemory(const patchInfo& patch) {
         std::reverse(bytePatch.begin(), bytePatch.end());
     }
 
+    // nhlport: guest code pages can be mapped execute-only at patch time (some pages are
+    // re-protected after the static CPU patches); unprotect the target range so patches
+    // apply regardless of which page they land on.
+    DWORD old_protect = 0;
+    void* page_start = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(cheatAddress) & ~uintptr_t(0xFFF));
+    const size_t span = bytePatch.size() + (reinterpret_cast<uintptr_t>(cheatAddress) -
+                                            reinterpret_cast<uintptr_t>(page_start));
+    if (VirtualProtect(page_start, span, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
+        LOG_ERROR(Loader, "Failed to unprotect patch target {:#x} (span {}, error {})",
+                  reinterpret_cast<uintptr_t>(cheatAddress), span, GetLastError());
+        return;
+    }
     std::memcpy(cheatAddress, bytePatch.data(), bytePatch.size());
+    VirtualProtect(page_start, span, old_protect, &old_protect);
 
     LOG_INFO(Loader, "Applied patch: {}, Offset: {:#x}, Value: {}", patch.modNameStr,
              (uintptr_t)cheatAddress, patch.valueStr);
