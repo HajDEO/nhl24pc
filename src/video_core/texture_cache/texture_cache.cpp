@@ -449,9 +449,29 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
             cache_image.info.resources.layers == 1;
 
+        // nhlport/neo: with Neo mode enabled the game re-describes some surfaces with the
+        // alt_tile bit set. Alternate tiling is not implemented in the detiler, so both
+        // descriptors detile identically; the only observable difference is the padded guest
+        // size from the alt-tile size calculation (e.g. 0x7f8000 vs 0x870000 for a 1920x1080
+        // A2B10G10R10 surface). BlockDim and block size are already checked above, so a
+        // request differing only in alt_tile (and its size effect) describes the same
+        // surface: resolve it like the pow2-padding case instead of falling through as
+        // unresolvable, which left Neo mode rendering black (nhl24pc PR #18).
+        const bool alt_tile_only =
+            image_info.alt_tile != cache_image.info.alt_tile &&
+            image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.type == cache_image.info.type &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.size == cache_image.info.size &&
+            image_info.pitch == cache_image.info.pitch &&
+            image_info.props.is_pow2 == cache_image.info.props.is_pow2 &&
+            image_info.resources.levels == cache_image.info.resources.levels &&
+            image_info.resources.layers == cache_image.info.resources.layers;
+
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
+            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only ||
+            alt_tile_only) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
