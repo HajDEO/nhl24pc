@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
 #include <tracy/TracyVulkan.hpp>
@@ -25,6 +26,11 @@ public:
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
+
+    /// nhlport: Optional DLSS context; null when shadps4_dlss.dll is absent.
+    DlssNgx* GetDlssNgx() const {
+        return dlss_ngx.get();
+    }
 
     /// Returns a formatted string for the driver version
     std::string GetDriverVersionName();
@@ -492,6 +498,7 @@ private:
     [[nodiscard]] vk::FormatFeatureFlags2 GetFormatFeatureFlags(vk::Format format) const;
 
 private:
+    std::unique_ptr<DlssNgx> dlss_ngx;
     vk::UniqueInstance instance;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;

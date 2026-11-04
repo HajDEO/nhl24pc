@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <vector>
 #include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -29,6 +30,14 @@ asm(".zerofill USER_AREA,USER_AREA,__USER_AREA,0x5F9000000000");
 #endif
 
 namespace Core {
+
+namespace {
+PreDeviceInitHook g_pre_device_init_hook = nullptr;
+} // namespace
+
+void SetPreDeviceInitHook(PreDeviceInitHook hook) {
+    g_pre_device_init_hook = hook;
+}
 
 // Constants used for mapping address space.
 constexpr VAddr SYSTEM_MANAGED_MIN = 0x400000ULL;
@@ -144,41 +153,68 @@ struct AddressSpace::Impl {
             }
         }
 
-        // Determine the free address ranges we can access.
-        VAddr next_addr = SYSTEM_MANAGED_MIN;
-        MEMORY_BASIC_INFORMATION info{};
-        while (next_addr <= supported_user_max) {
-            ASSERT_MSG(VirtualQuery(reinterpret_cast<PVOID>(next_addr), &info, sizeof(info)),
-                       "Failed to query memory information for address {:#x}", next_addr);
+        // nhlport: NVIDIA's CUDA driver initializes its own virtual address space
+        // (~64GB in the low user range) inside vkCreateDevice when the NGX/DLSS
+        // extensions are enabled. The guest's fixed memory layout lives in that same
+        // low range, so reserve it first, let the CUDA driver claim its space via the
+        // hook, and only then claim the remaining user space around it.
+        constexpr VAddr DriverClaimFloor = 0x1000000000ULL; // 64 GiB
+        auto reserve_pass = [&](VAddr start, VAddr max_addr) {
+            std::vector<MemoryRegion> batch;
+            VAddr next_addr = start;
+            MEMORY_BASIC_INFORMATION info{};
+            while (next_addr <= max_addr) {
+                ASSERT_MSG(VirtualQuery(reinterpret_cast<PVOID>(next_addr), &info, sizeof(info)),
+                           "Failed to query memory information for address {:#x}", next_addr);
 
-            // Ensure logic uses values aligned to bage boundaries.
-            next_addr = reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize;
-            next_addr = Common::AlignUp(next_addr, alignment);
+                // Ensure logic uses values aligned to bage boundaries.
+                next_addr = reinterpret_cast<VAddr>(info.BaseAddress) + info.RegionSize;
+                next_addr = Common::AlignUp(next_addr, alignment);
 
-            // Prevent size from going past supported_user_max
-            u64 size = info.RegionSize;
-            if (next_addr > supported_user_max) {
-                size -= (next_addr - supported_user_max);
+                // Prevent size from going past max_addr
+                u64 size = info.RegionSize;
+                if (next_addr > max_addr) {
+                    size -= (next_addr - max_addr);
+                }
+                size = Common::AlignDown(size, alignment);
+
+                // Check for free memory areas
+                // Restrict region size to avoid overly fragmenting the virtual memory space.
+                if (info.State == MEM_FREE && info.RegionSize > 0x1000000) {
+                    VAddr addr =
+                        Common::AlignUp(reinterpret_cast<VAddr>(info.BaseAddress), alignment);
+                    batch.emplace_back(
+                        MemoryRegion{addr, PAddr(-1), size, PAGE_NOACCESS, -1, false});
+                }
             }
-            size = Common::AlignDown(size, alignment);
 
-            // Check for free memory areas
-            // Restrict region size to avoid overly fragmenting the virtual memory space.
-            if (info.State == MEM_FREE && info.RegionSize > 0x1000000) {
-                VAddr addr = Common::AlignUp(reinterpret_cast<VAddr>(info.BaseAddress), alignment);
-                regions.emplace(addr,
-                                MemoryRegion{addr, PAddr(-1), size, PAGE_NOACCESS, -1, false});
+            // Reserve all detected free regions.
+            for (const auto& region : batch) {
+                auto addr = static_cast<u8*>(VirtualAlloc2(
+                    process, reinterpret_cast<PVOID>(region.base), region.size,
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0));
+                // All marked regions should reserve fine since they're free.
+                ASSERT_MSG(addr, "Unable to reserve virtual address space: {}",
+                           Common::GetLastErrorMsg());
             }
-        }
+            for (const auto& region : batch) {
+                regions.emplace(region.base, region);
+            }
+        };
 
-        // Reserve all detected free regions.
-        for (auto region : regions) {
-            auto addr = static_cast<u8*>(VirtualAlloc2(
-                process, reinterpret_cast<PVOID>(region.second.base), region.second.size,
-                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0));
-            // All marked regions should reserve fine since they're free.
-            ASSERT_MSG(addr, "Unable to reserve virtual address space: {}",
-                       Common::GetLastErrorMsg());
+        // Only split the reservation when a driver actually wants to claim space;
+        // otherwise keep the original single-pass layout untouched.
+        if (g_pre_device_init_hook && g_pre_device_init_hook(false)) {
+            const VAddr floor_limit = supported_user_max < DriverClaimFloor
+                                          ? supported_user_max
+                                          : DriverClaimFloor;
+            reserve_pass(SYSTEM_MANAGED_MIN, floor_limit);
+            g_pre_device_init_hook(true);
+            if (supported_user_max > DriverClaimFloor) {
+                reserve_pass(DriverClaimFloor, supported_user_max);
+            }
+        } else {
+            reserve_pass(SYSTEM_MANAGED_MIN, supported_user_max);
         }
 
         // Set these constants to ensure code relying on them works.

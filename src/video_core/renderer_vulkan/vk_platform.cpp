@@ -22,6 +22,7 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -255,7 +256,7 @@ std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_c
 }
 
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,
-                                  bool enable_crash_diagnostic) {
+                                  bool enable_crash_diagnostic, DlssNgx* dlss_ngx) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
 #if defined(__APPLE__)
@@ -286,7 +287,13 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    const auto base_extensions =
+        GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    // nhlport: DLSS NGX instance extensions (VK_KHR_get_physical_device_properties2 etc.).
+    std::vector<const char*> extensions{base_extensions.begin(), base_extensions.end()};
+    if (dlss_ngx) {
+        dlss_ngx->AppendInstanceExtensions(extensions);
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",

@@ -14,6 +14,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -91,14 +92,16 @@ std::string GetReadableVersion(u32 version) {
 } // Anonymous namespace
 
 Instance::Instance(bool enable_validation, bool enable_crash_diagnostic)
-    : instance{CreateInstance(Frontend::WindowSystemType::Headless, enable_validation,
-                              enable_crash_diagnostic)},
+    : dlss_ngx{DlssNgx::Create()},
+      instance{CreateInstance(Frontend::WindowSystemType::Headless, enable_validation,
+                              enable_crash_diagnostic, dlss_ngx.get())},
       physical_devices{EnumeratePhysicalDevices(instance)} {}
 
 Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                    bool enable_validation /*= false*/, bool enable_crash_diagnostic /*= false*/)
-    : instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
-                              enable_crash_diagnostic)},
+    : dlss_ngx{DlssNgx::Create()},
+      instance{CreateInstance(window.GetWindowInfo().type, enable_validation,
+                              enable_crash_diagnostic, dlss_ngx.get())},
       physical_devices{EnumeratePhysicalDevices(instance)} {
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
@@ -180,6 +183,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
+    dlss_ngx.reset();
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }
@@ -289,6 +293,12 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // nhlport: for the device fault report on device lost (vk_scheduler SubmitExecution).
+    // Gated behind NHL_DEVICE_FAULT=1: NVIDIA's fault instrumentation alters driver
+    // behavior at submit time and has been implicated in access violations there.
+    if (std::getenv("NHL_DEVICE_FAULT")) {
+        add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
     list_restart = driver_id != vk::DriverId::eMesaKosmickrisp &&
@@ -391,6 +401,15 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+
+    // nhlport: DLSS NGX device extensions (VK_EXT_device_fault etc.).
+    if (dlss_ngx) {
+        std::vector<const char*> dlss_extensions{enabled_extensions.begin(),
+                                                 enabled_extensions.end()};
+        dlss_ngx->AppendDeviceExtensions(*instance, physical_device, dlss_extensions);
+        enabled_extensions.assign(dlss_extensions.begin(), dlss_extensions.end());
+    }
+
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -593,6 +612,11 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+    // nhlport: initialize the DLSS NGX context once the device exists.
+    if (dlss_ngx) {
+        dlss_ngx->Initialize(*instance, physical_device, *device);
+    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

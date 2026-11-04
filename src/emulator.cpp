@@ -49,6 +49,8 @@
 #include "emulator.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlss_ngx.h"
+#include "core/address_space.h"
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -581,6 +583,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     Common::Singleton<FileSys::HandleTable>::Instance()->CreateStdHandles();
 
     // Initialize components
+    // nhlport: the CUDA driver (initialized for DLSS/NGX at device creation) claims
+    // ~64GB of virtual address space. The AddressSpace constructor invokes this hook
+    // after the guest-critical low range is reserved but before the rest of the user
+    // space is claimed, so the driver's reservations land above the guest layout.
+    Core::SetPreDeviceInitHook([](bool claim_now) -> bool {
+        if (!Vulkan::DlssNgx::Present()) {
+            return false;
+        }
+        if (claim_now) {
+            Vulkan::DlssNgx::PreWarmCuda();
+        }
+        return true;
+    });
     memory = Core::Memory::Instance();
     controllers = Common::Singleton<Input::GameControllers>::Instance();
     linker = Common::Singleton<Core::Linker>::Instance();
