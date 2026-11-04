@@ -282,15 +282,17 @@ void ApplyRenderResolutionOverride() {
         u8(height & 0xff), u8((height >> 8) & 0xff), 0, 0};
     void* target = const_cast<u8*>(found);
     DWORD old_protect = 0;
+    // nhlport: the write can straddle a page boundary; unprotect through its end.
+    const size_t span = (reinterpret_cast<uintptr_t>(target) & 0xFFF) + patched.size();
     void* page_start = reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(target) & ~uintptr_t(0xFFF));
-    if (VirtualProtect(page_start, 8, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
+    if (VirtualProtect(page_start, span, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
         LOG_ERROR(Loader, "Render resolution override: VirtualProtect failed at {:#x} (error {})",
                   reinterpret_cast<uintptr_t>(target), GetLastError());
         return;
     }
     std::memcpy(target, patched.data(), patched.size());
-    VirtualProtect(page_start, 8, old_protect, &old_protect);
+    VirtualProtect(page_start, span, old_protect, &old_protect);
     // nhlport: keep the reported VideoOut resolution consistent with the patched
     // buffers - a mismatch (game told 1080p while its buffers are 1440p) crashes the
     // engine at gameplay load.
