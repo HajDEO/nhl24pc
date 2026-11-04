@@ -428,6 +428,12 @@ struct GPUSettings {
     Setting<std::string> present_mode{"Mailbox"};
     Setting<bool> hdr_allowed{false};
     Setting<bool> fsr_enabled{false};
+    // nhlport: DLSS presenter upscaler (replaces FSR when the NGX context is available).
+    Setting<bool> dlss_enabled{true};
+    Setting<int> dlss_preset{9}; // NVSDK_NGX_DLSS_Hint_Render_Preset_J (transformer)
+    // nhlport: base-mode render resolution override. 0 keeps the game's own choice
+    // (1080p); 1080/1440/2160 patch the game's resolution table to that height.
+    Setting<int> render_resolution{0};
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
@@ -444,6 +450,9 @@ struct GPUSettings {
             make_override<GPUSettings>("window_width", &GPUSettings::window_width),
             make_override<GPUSettings>("hdr_allowed", &GPUSettings::hdr_allowed),
             make_override<GPUSettings>("fsr_enabled", &GPUSettings::fsr_enabled),
+            make_override<GPUSettings>("dlss_enabled", &GPUSettings::dlss_enabled),
+            make_override<GPUSettings>("dlss_preset", &GPUSettings::dlss_preset),
+            make_override<GPUSettings>("render_resolution", &GPUSettings::render_resolution),
             make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
             make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
@@ -464,7 +473,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
+                                   hdr_allowed, fsr_enabled, dlss_enabled, dlss_preset, render_resolution, rcas_enabled,
+                                   rcas_attenuation,
                                    userfaultfd, inline_fetch_shader)
 
 // -------------------------------
@@ -738,6 +748,9 @@ public:
     SETTING_FORWARD(m_gpu, InternalScreenWidth, internal_screen_width)
     SETTING_FORWARD_BOOL(m_gpu, HdrAllowed, hdr_allowed)
     SETTING_FORWARD_BOOL(m_gpu, FsrEnabled, fsr_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, DlssEnabled, dlss_enabled)
+    SETTING_FORWARD(m_gpu, DlssPreset, dlss_preset)
+    SETTING_FORWARD(m_gpu, RenderResolution, render_resolution)
     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)

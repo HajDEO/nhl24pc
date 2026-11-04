@@ -8,6 +8,7 @@
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
+#include "video_core/renderer_vulkan/vk_dlss_present.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -117,6 +118,7 @@ private:
     Instance instance;
     HostPasses::FsrPass fsr_pass;
     HostPasses::FsrPass::Settings fsr_settings{};
+    std::unique_ptr<DlssPresentUpscaler> dlss_present;
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
     AmdGpu::Liverpool* liverpool;
