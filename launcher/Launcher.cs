@@ -522,6 +522,7 @@ namespace NhlPort
         TrackBar sharpnessBar;
         ComboBox dlssPresetBox;
         ComboBox renderResQuick;
+        bool syncingUpscaler; // nhlport: suppresses syncFsr while the dropdown drives the FSR checkboxes
         static readonly int[] DlssPresetValues = { 0, 9, 10 };
         static readonly int[] RenderResValues = { 0, 1080, 1440, 2160 };
         Label sharpnessLabel;
@@ -1154,13 +1155,15 @@ namespace NhlPort
             };
             upscalerBox.SelectedIndexChanged += delegate
             {
-                bool dlssSel = upscalerBox.SelectedIndex == 3;
-                fsrBox.Checked = upscalerBox.SelectedIndex == 1 || upscalerBox.SelectedIndex == 2;
-                rcasBox.Checked = upscalerBox.SelectedIndex == 2;
-                sharpBar.Enabled = upscalerBox.SelectedIndex == 2;
-                fsrBox.Enabled = !dlssSel;
-                rcasBox.Enabled = !dlssSel;
-                dlssPresetBox.Enabled = dlssSel;
+                int idx = upscalerBox.SelectedIndex;
+                syncingUpscaler = true;
+                fsrBox.Checked = idx == 1 || idx == 2;
+                rcasBox.Checked = idx == 2;
+                sharpBar.Enabled = idx == 2;
+                fsrBox.Enabled = idx != 3;
+                rcasBox.Enabled = idx != 3;
+                dlssPresetBox.Enabled = idx == 3;
+                syncingUpscaler = false;
                 RefreshSummary();
             };
             sharpBar.ValueChanged += delegate { sharpnessBar.Value = sharpBar.Value; };
@@ -1256,7 +1259,7 @@ namespace NhlPort
             fullscreenModeBox.SelectedIndexChanged += syncMode;
             EventHandler syncFsr = delegate
             {
-                if (upscalerBox.SelectedIndex == 3) return;
+                if (syncingUpscaler || upscalerBox.SelectedIndex == 3) return;
                 int idx = !fsrBox.Checked ? 0 : (rcasBox.Checked ? 2 : 1);
                 if (upscalerBox.SelectedIndex != idx) upscalerBox.SelectedIndex = idx;
             };
