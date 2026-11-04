@@ -61,6 +61,7 @@ namespace NhlPort
             { "ups_off", new[] { "Vypnutý (bilineárne)", "Off (bilinear)" } },
             { "ups_fsr", new[] { "FSR", "FSR" } },
             { "ups_fsr_rcas", new[] { "FSR + RCAS zaostrenie", "FSR + RCAS sharpening" } },
+            { "ups_dlss", new[] { "DLSS (RTX)", "DLSS (RTX)" } },
             { "sharpness", new[] { "Zaostrenie", "Sharpness" } },
             { "vsync", new[] { "VSync", "VSync" } },
             { "vsync_desc", new[] { "Synchronizácia s obnovovacou frekvenciou (bez trhania, mierne vyššia odozva).", "Synchronises with the refresh rate (no tearing, slightly more input lag)." } },
@@ -99,8 +100,8 @@ namespace NhlPort
             { "key_unusable", new[] { "Túto klávesu nie je možné použiť, skús inú.", "This key cannot be used, try another one." } },
             { "resolution", new[] { "Rozlíšenie okna / obrazovky:", "Window / screen resolution:" } },
             { "fsr_group", new[] { "AMD FidelityFX Super Resolution (FSR)", "AMD FidelityFX Super Resolution (FSR)" } },
-            { "dlss_group", new[] { "DLSS (NVIDIA RTX) a rozlíšenie hry", "DLSS (NVIDIA RTX) and game resolution" } },
-            { "dlss_box", new[] { "DLSS upscaling (vyžaduje shadps4_dlss.dll + nvngx_dlss.dll)", "DLSS upscaling (requires shadps4_dlss.dll + nvngx_dlss.dll)" } },
+            { "dlss_group", new[] { "DLSS (NVIDIA RTX)", "DLSS (NVIDIA RTX)" } },
+            { "dlss_note", new[] { "Vyžaduje shadps4_dlss.dll a nvngx_dlss.dll vedľa nhl24.exe. Vyberte ho ako Upscaler: DLSS (RTX).", "Requires shadps4_dlss.dll and nvngx_dlss.dll next to nhl24.exe. Select it as Upscaler: DLSS (RTX)." } },
             { "dlss_preset_lbl", new[] { "DLSS model", "DLSS model" } },
             { "render_res_lbl", new[] { "Renderovacie rozlíšenie hry", "Game render resolution" } },
             { "fsr_box", new[] { "FSR upscaling na rozlíšenie okna", "FSR upscaling to the window resolution" } },
@@ -519,7 +520,6 @@ namespace NhlPort
         CheckBox fsrBox;
         CheckBox rcasBox;
         TrackBar sharpnessBar;
-        CheckBox dlssBox;
         ComboBox dlssPresetBox;
         ComboBox renderResQuick;
         static readonly int[] DlssPresetValues = { 0, 9, 10 };
@@ -930,7 +930,7 @@ namespace NhlPort
             h = Math.Max(360, Math.Min(4320, h));
             Gpu["window_width"] = w;
             Gpu["window_height"] = h;
-            Gpu["dlss_enabled"] = dlssBox.Checked;
+            Gpu["dlss_enabled"] = upscalerBox.SelectedIndex == 3;
             Gpu["dlss_preset"] = DlssPresetValues[Math.Max(0, Math.Min(DlssPresetValues.Length - 1, dlssPresetBox.SelectedIndex))];
             var renderRes = RenderResValues[Math.Max(0, Math.Min(RenderResValues.Length - 1, renderResQuick.SelectedIndex))];
             Gpu["render_resolution"] = renderRes;
@@ -942,7 +942,7 @@ namespace NhlPort
             Gpu["full_screen"] = fullscreenBox.Checked;
             Gpu["full_screen_mode"] = fullscreenModeBox.SelectedIndex == 1 ? "Fullscreen" : "Windowed";
             Gpu["present_mode"] = vsyncBox.Checked ? "Fifo" : "Mailbox";
-            Gpu["fsr_enabled"] = fsrBox.Checked;
+            Gpu["fsr_enabled"] = upscalerBox.SelectedIndex == 1 || upscalerBox.SelectedIndex == 2;
             Gpu["rcas_enabled"] = rcasBox.Checked;
             Gpu["rcas_attenuation"] = sharpnessBar.Value;
             Gpu["vblank_frequency"] = 60;
@@ -1113,9 +1113,10 @@ namespace NhlPort
             y += 22;
             upscalerBox = new ComboBox { Left = c1, Top = y, Width = cw, DropDownStyle = ComboBoxStyle.DropDownList };
             Theme.Style(upscalerBox);
-            upscalerBox.Items.AddRange(new object[] { Loc.T("ups_off"), Loc.T("ups_fsr"), Loc.T("ups_fsr_rcas") });
+            upscalerBox.Items.AddRange(new object[] { Loc.T("ups_off"), Loc.T("ups_fsr"), Loc.T("ups_fsr_rcas"), Loc.T("ups_dlss") });
+            bool dlss = Convert.ToBoolean(GpuValue("dlss_enabled", true));
             bool fsr = Convert.ToBoolean(GpuValue("fsr_enabled", false)), rcas = Convert.ToBoolean(GpuValue("rcas_enabled", true));
-            upscalerBox.SelectedIndex = !fsr ? 0 : (rcas ? 2 : 1);
+            upscalerBox.SelectedIndex = dlss ? 3 : (!fsr ? 0 : (rcas ? 2 : 1));
             quickPanel.Controls.Add(upscalerBox);
             sharpBar = new GlassSlider { Left = c2 - 8, Top = y - 1, Width = cw - 60, Minimum = 0, Maximum = 1000, Value = Math.Max(0, Math.Min(1000, Convert.ToInt32(GpuValue("rcas_attenuation", 250)))) };
             quickPanel.Controls.Add(sharpBar);
@@ -1153,9 +1154,13 @@ namespace NhlPort
             };
             upscalerBox.SelectedIndexChanged += delegate
             {
-                fsrBox.Checked = upscalerBox.SelectedIndex != 0;
+                bool dlssSel = upscalerBox.SelectedIndex == 3;
+                fsrBox.Checked = upscalerBox.SelectedIndex == 1 || upscalerBox.SelectedIndex == 2;
                 rcasBox.Checked = upscalerBox.SelectedIndex == 2;
                 sharpBar.Enabled = upscalerBox.SelectedIndex == 2;
+                fsrBox.Enabled = !dlssSel;
+                rcasBox.Enabled = !dlssSel;
+                dlssPresetBox.Enabled = dlssSel;
                 RefreshSummary();
             };
             sharpBar.ValueChanged += delegate { sharpnessBar.Value = sharpBar.Value; };
@@ -1218,8 +1223,8 @@ namespace NhlPort
             displayTab.Controls.Add(vsyncBox);
             y += 50;
             var fsrGroup = new GroupBox { Left = 20, Top = y, Width = 640, Height = 150, ForeColor = Color.White, Font = Theme.Body, Text = Loc.T("fsr_group") };
-            fsrBox = new CheckBox { Left = 15, Top = 25, Width = 400, ForeColor = Color.White, Text = Loc.T("fsr_box"), Checked = upscalerBox.SelectedIndex != 0 };
-            rcasBox = new CheckBox { Left = 15, Top = 55, Width = 400, ForeColor = Color.White, Text = Loc.T("rcas_box"), Checked = upscalerBox.SelectedIndex == 2 };
+            fsrBox = new CheckBox { Left = 15, Top = 25, Width = 400, ForeColor = Color.White, Text = Loc.T("fsr_box"), Checked = upscalerBox.SelectedIndex == 1 || upscalerBox.SelectedIndex == 2, Enabled = upscalerBox.SelectedIndex != 3 };
+            rcasBox = new CheckBox { Left = 15, Top = 55, Width = 400, ForeColor = Color.White, Text = Loc.T("rcas_box"), Checked = upscalerBox.SelectedIndex == 2, Enabled = upscalerBox.SelectedIndex != 3 };
             sharpnessBar = new TrackBar { Left = 15, Top = 85, Width = 400, Minimum = 0, Maximum = 1000, TickFrequency = 100, Value = sharpBar.Value, BackColor = Color.FromArgb(24, 31, 42) };
             sharpnessLabel = new Label { Left = 430, Top = 90, Width = 180, ForeColor = Color.White };
             sharpnessBar.ValueChanged += delegate { sharpnessLabel.Text = Loc.T("sharpness") + ": " + sharpnessBar.Value; };
@@ -1228,13 +1233,14 @@ namespace NhlPort
             displayTab.Controls.Add(fsrGroup);
             y += 170;
             var dlssGroup = new GroupBox { Left = 20, Top = y, Width = 640, Height = 110, ForeColor = Color.White, Font = Theme.Body, Text = Loc.T("dlss_group") };
-            dlssBox = new CheckBox { Left = 15, Top = 25, Width = 560, ForeColor = Color.White, Text = Loc.T("dlss_box"), Checked = Convert.ToBoolean(GpuValue("dlss_enabled", true)) };
-            dlssPresetBox = new ComboBox { Left = 15, Top = 55, Width = 250, DropDownStyle = ComboBoxStyle.DropDownList };
+            dlssGroup.Controls.Add(new TransparentLabel { Left = 15, Top = 25, Width = 250, Height = 20, Font = Theme.Label, Text = Loc.T("dlss_preset_lbl") });
+            dlssPresetBox = new ComboBox { Left = 15, Top = 50, Width = 250, DropDownStyle = ComboBoxStyle.DropDownList, Enabled = upscalerBox.SelectedIndex == 3 };
             Theme.Style(dlssPresetBox);
             dlssPresetBox.Items.AddRange(new object[] { "Driver default", "J (transformer)", "K" });
             var dlssPreset = Convert.ToInt32(GpuValue("dlss_preset", 9));
             dlssPresetBox.SelectedIndex = dlssPreset == 10 ? 2 : (dlssPreset == 9 ? 1 : 0);
-            dlssGroup.Controls.Add(dlssBox); dlssGroup.Controls.Add(dlssPresetBox);
+            dlssGroup.Controls.Add(new Label { Left = 290, Top = 48, Width = 330, Height = 50, ForeColor = Color.FromArgb(200, 210, 225), BackColor = Color.Transparent, Font = Theme.Small, Text = Loc.T("dlss_note") });
+            dlssGroup.Controls.Add(dlssPresetBox);
             displayTab.Controls.Add(dlssGroup);
             y += 130;
             displayTab.Controls.Add(new Label { Left = 20, Top = y, Width = 1000, Height = 80, ForeColor = Color.FromArgb(200, 210, 225), BackColor = Color.Transparent, Font = Theme.Small, Text = Loc.T("display_note") });
@@ -1250,6 +1256,7 @@ namespace NhlPort
             fullscreenModeBox.SelectedIndexChanged += syncMode;
             EventHandler syncFsr = delegate
             {
+                if (upscalerBox.SelectedIndex == 3) return;
                 int idx = !fsrBox.Checked ? 0 : (rcasBox.Checked ? 2 : 1);
                 if (upscalerBox.SelectedIndex != idx) upscalerBox.SelectedIndex = idx;
             };
