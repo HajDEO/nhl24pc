@@ -1406,6 +1406,11 @@ void OnGpuComplete(u64 from_tick, u64 to_tick) {
         return;
     }
     if (to_tick - from_tick > TimelineRing) {
+        static std::atomic<u32> clamp_logs{0};
+        if (clamp_logs.fetch_add(1, std::memory_order_relaxed) < 10) {
+            LOG_WARNING(Config, "OnGpuComplete: tick range {:#x} -> {:#x} clamped (ring {})",
+                        from_tick, to_tick, TimelineRing);
+        }
         from_tick = to_tick - TimelineRing;
     }
     const s64 now = NowNs();
