@@ -34,7 +34,6 @@ Semaphore::~Semaphore() = default;
 void Semaphore::Refresh() {
     u64 this_tick{};
     u64 counter{};
-    u32 retries = 0;
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         auto [counter_result, cntr] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
@@ -59,13 +58,6 @@ void Semaphore::Refresh() {
                             counter, max_issued);
             }
             return;
-        }
-        // nhlport: the GPU thread was observed spinning at 100% CPU inside Refresh during
-        // the Neo-mode texture storm; report the tick dynamics when the CAS keeps failing.
-        if (++retries == 1000) {
-            LOG_WARNING(Render_Vulkan,
-                        "Semaphore::Refresh retried {} times (gpu_tick {:#x}, counter {:#x})",
-                        retries, this_tick, counter);
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));

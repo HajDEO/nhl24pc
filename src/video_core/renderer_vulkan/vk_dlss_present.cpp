@@ -4,8 +4,6 @@
 #include "video_core/renderer_vulkan/vk_dlss_present.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <string_view>
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -41,14 +39,9 @@ DlssPresentUpscaler::DlssPresentUpscaler(const Instance& instance, Runtime& runt
     if (!dlss || !dlss->IsAvailable()) {
         return;
     }
-    // nhlport: the config setting GPU.dlss_enabled controls the presenter upscaler;
-    // NHL_DLSS_PRESENT=0 still forces it off for debugging.
+    // nhlport: the config setting GPU.dlss_enabled controls the presenter upscaler.
     if (!EmulatorSettings.IsDlssEnabled()) {
         LOG_INFO(Render_Vulkan, "[DLSS] disabled by config (GPU.dlss_enabled=false)");
-        return;
-    }
-    if (const char* env = std::getenv("NHL_DLSS_PRESENT"); env && std::string_view{env} == "0") {
-        LOG_WARNING(Render_Vulkan, "[DLSS] NHL_DLSS_PRESENT=0: presenter upscaling disabled");
         return;
     }
     active = true;
@@ -332,12 +325,8 @@ vk::ImageView DlssPresentUpscaler::Render(vk::CommandBuffer cmdbuf, VideoCore::I
                                 ? static_cast<float>(frame_size.height) /
                                       static_cast<float>(game_size.height)
                                 : 1.0f;
-        // GPU.dlss_preset: NVSDK_NGX_DLSS_Hint_Render_Preset value (9 = J, transformer);
-        // NHL_DLSS_PRESET overrides for debugging.
+        // GPU.dlss_preset: NVSDK_NGX_DLSS_Hint_Render_Preset value (9 = J, transformer).
         u32 preset = static_cast<u32>(std::clamp(EmulatorSettings.GetDlssPreset(), 0, 11));
-        if (const char* env = std::getenv("NHL_DLSS_PRESET")) {
-            preset = static_cast<u32>(std::atoi(env));
-        }
         const DlssNgx::FeatureDesc desc{
             .input_width = game_size.width,
             .input_height = game_size.height,

@@ -121,15 +121,8 @@ bool CollectExtensions(const VkExtensionProperties* required, u32 count,
                        const std::vector<vk::ExtensionProperties>& available,
                        std::vector<std::string>& storage, std::vector<const char*>& enabled) {
     storage.clear();
-    // nhlport bisection: skip an extension named by NHL_DLSS_SKIP_EXT to find which
-    // NGX requirement breaks device creation.
-    const char* skip = std::getenv("NHL_DLSS_SKIP_EXT");
     for (u32 i = 0; i < count; ++i) {
         const auto& request = required[i];
-        if (skip && std::strcmp(request.extensionName, skip) == 0) {
-            LOG_WARNING(Render_Vulkan, "[DLSS] Skipping extension {} (NHL_DLSS_SKIP_EXT)", skip);
-            continue;
-        }
         const auto match = std::ranges::find_if(available, [&](const auto& extension) {
             return std::strcmp(extension.extensionName.data(), request.extensionName) == 0 &&
                    extension.specVersion >= request.specVersion;
@@ -156,8 +149,6 @@ struct DlssNgx::Impl {
     std::vector<std::string> instance_extensions, device_extensions;
     std::optional<FeatureDesc> feature;
     bool eligible{true}, instance_ready{}, device_ready{}, initialized{}, available{};
-    // nhlport bisection: NHL_DLSS_LATE defers the bridge load until after device creation.
-    bool deferred{};
 
     void Disable(std::string_view reason) {
         eligible = available = false;
@@ -170,14 +161,6 @@ DlssNgx::DlssNgx() : impl{std::make_unique<Impl>()} {
     if (g_cuda_prewarm == 1) {
         impl->Disable("the CUDA driver failed to initialize before the PS4 memory "
                       "reservations were made");
-        return;
-    }
-    // nhlport bisection: NHL_DLSS_LATE=1 defers loading the bridge (and NGX SDK init)
-    // until after device creation, while still enabling the NGX device extensions.
-    if (std::getenv("NHL_DLSS_LATE")) {
-        impl->deferred = true;
-        LOG_WARNING(Render_Vulkan,
-                    "[DLSS] NHL_DLSS_LATE: deferring bridge load until after device creation");
         return;
     }
     const auto directory = ExecutableDirectory();
@@ -220,11 +203,6 @@ DlssNgx::~DlssNgx() {
 void DlssNgx::AppendInstanceExtensions(std::vector<const char*>& enabled) {
     if (!impl->eligible)
         return;
-    if (impl->deferred) {
-        // The port already enables VK_KHR_get_physical_device_properties2.
-        impl->instance_ready = true;
-        return;
-    }
     u32 count{};
     const VkExtensionProperties* required{};
     if (!impl->api->InstanceExtensions(&count, &required))
@@ -244,24 +222,9 @@ void DlssNgx::AppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice p
     LOG_INFO(Render_Vulkan, "DLSS GPU: {}", properties.deviceName.data());
     if (properties.vendorID != 0x10de)
         return impl->Disable("this is not an NVIDIA GPU");
-    // nhlport bisection: NHL_DLSS_NO_QUERY=1 skips the NGX requirements query (which may
-    // create internal NGX state) and hardcodes the known DLSS requirements instead.
-    VkExtensionProperties hardcoded[4] = {};
-    const char* hardcoded_names[4] = {"VK_NVX_binary_import", "VK_NVX_image_view_handle",
-                                      "VK_KHR_buffer_device_address", "VK_KHR_push_descriptor"};
     u32 count{};
     const VkExtensionProperties* required{};
-    if (impl->deferred || std::getenv("NHL_DLSS_NO_QUERY")) {
-        for (u32 i = 0; i < 4; ++i) {
-            VkExtensionProperties prop{};
-            strncpy(prop.extensionName, hardcoded_names[i], VK_MAX_EXTENSION_NAME_SIZE - 1);
-            prop.specVersion = 1u;
-            hardcoded[i] = prop;
-        }
-        count = 4;
-        required = hardcoded;
-        LOG_WARNING(Render_Vulkan, "[DLSS] NHL_DLSS_NO_QUERY: using hardcoded requirements");
-    } else if (!impl->api->DeviceExtensions(instance, physical, &count, &required)) {
+    if (!impl->api->DeviceExtensions(instance, physical, &count, &required)) {
         return impl->Disable("this GPU or driver does not support DLSS (RTX GPU required)");
     }
     const auto [result, extensions] = physical.enumerateDeviceExtensionProperties();
@@ -275,23 +238,6 @@ void DlssNgx::Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk:
     if (!impl->eligible || !impl->device_ready || impl->initialized)
         return;
     impl->initialized = true;
-    if (impl->deferred && !impl->api) {
-        const auto directory = ExecutableDirectory();
-        impl->module = LoadLibraryW((directory / BridgeName).c_str());
-        const auto get_api =
-            impl->module
-                ? reinterpret_cast<ShadDlssGetApiFn>(GetProcAddress(impl->module, "ShadDlssGetApi"))
-                : nullptr;
-        impl->api = get_api ? get_api() : nullptr;
-        if (!impl->api || impl->api->abi != SHADPS4_DLSS_BRIDGE_ABI)
-            return impl->Disable("shadps4_dlss.dll is missing or from a different version");
-        const auto data = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dlss";
-        std::error_code error;
-        std::filesystem::create_directories(data, error);
-        if (!impl->api->Configure(directory.c_str(), data.c_str(), BridgeLog))
-            return impl->Disable("bridge configuration failed");
-        LOG_WARNING(Render_Vulkan, "[DLSS] NHL_DLSS_LATE: bridge loaded after device creation");
-    }
     if (!impl->api->Initialize(instance, physical, device,
                                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
                                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr))

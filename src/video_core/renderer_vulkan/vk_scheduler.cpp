@@ -153,15 +153,9 @@ void Scheduler::PopPendingOperations() {
     if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         work_semaphore.Refresh();
     }
-    u64 pops = 0;
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
-        // nhlport: the GPU thread was observed spinning at 100% CPU in this loop during
-        // the Neo-mode texture storm; report when the queue drains abnormally fast.
-        if (++pops == 10000) {
-            LOG_WARNING(Render_Vulkan, "PopPendingOperations popped {} ops in one call", pops);
-        }
     }
 }
 
