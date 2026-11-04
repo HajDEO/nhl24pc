@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 
@@ -282,37 +283,51 @@ bool EqueueInternal::AddSmallTimer(EqueueEvent& ev) {
         std::scoped_lock lock{m_mutex};
         m_small_timers[st.event.ident] = std::move(st);
     }
+    // nhlport: wake small-timer waiters so they can recompute the earliest expiry.
+    m_cond.notify_all();
     return true;
 }
 
 int EqueueInternal::WaitForSmallTimer(OrbisKernelEvent* ev, int num, u32 micros) {
     ASSERT(num >= 1);
 
-    auto curr_clock = std::chrono::steady_clock::now();
-    const auto wait_end_us = (micros == 0) ? std::chrono::steady_clock::time_point::max()
-                                           : curr_clock + std::chrono::microseconds{micros};
+    // nhlport: the original implementation busy-spinned with yield() for the entire
+    // wait - forever when micros==0 - burning a full core per waiting thread and
+    // starving the GPU threads during texture-streaming bursts. Sleep on the queue's
+    // condition variable instead, waking on the earliest timer expiry, the deadline,
+    // or a newly added timer.
+    const auto deadline = (micros == 0) ? std::chrono::steady_clock::time_point::max()
+                                        : std::chrono::steady_clock::now() +
+                                              std::chrono::microseconds{micros};
     int count = 0;
-    do {
-        curr_clock = std::chrono::steady_clock::now();
-        {
-            std::scoped_lock lock{m_mutex};
-            for (auto it = m_small_timers.begin(); it != m_small_timers.end() && count < num;) {
-                const SmallTimer& st = it->second;
+    std::unique_lock lock{m_mutex};
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = m_small_timers.begin(); it != m_small_timers.end() && count < num;) {
+            const SmallTimer& st = it->second;
 
-                if (curr_clock - st.added >= st.interval) {
-                    ev[count++] = st.event;
-                    it = m_small_timers.erase(it);
-                } else {
-                    ++it;
-                }
+            if (now - st.added >= st.interval) {
+                ev[count++] = st.event;
+                it = m_small_timers.erase(it);
+            } else {
+                ++it;
             }
-
-            if (count > 0)
-                return count;
         }
-        std::this_thread::yield();
-    } while (curr_clock < wait_end_us);
+        if (count > 0) {
+            return count;
+        }
 
+        auto next_expiry = deadline;
+        for (const auto& [ident, st] : m_small_timers) {
+            next_expiry = std::min(next_expiry, st.added + st.interval);
+        }
+        if (next_expiry != std::chrono::steady_clock::time_point::max()) {
+            m_cond.wait_until(lock, next_expiry);
+        } else {
+            // No expiry to wake for; a newly added timer notifies the condvar.
+            m_cond.wait(lock);
+        }
+    }
     return 0;
 }
 
