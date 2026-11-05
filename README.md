@@ -17,6 +17,31 @@ implementations, and the GPU work goes through Vulkan.
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
+## Support / Podpora
+
+Lately, I've been running into more and more limitations with some of the most popular AI models.
+Whether it's reverse engineering, software analysis, security research, or experimenting with my own
+projects, mainstream AI services don't always give me the freedom and flexibility I need.
+
+That's why I'd love to build my own powerful AI machine — a dedicated setup where I can run open-source
+models locally, experiment without unnecessary restrictions, dive deeper into reverse engineering, and
+develop new tools and projects.
+
+The goal is simple: more independence, fewer limitations, and more freedom to explore, learn, build, and
+share cool stuff with the community.
+
+Work on the next project is already under way: an **NHL 27 PC port** – see the first look on YouTube:
+[NHL 27 running on PC](https://www.youtube.com/watch?v=SU0FeYNAgO8).
+
+If you'd like to support this journey, every contribution brings me one step closer to making it happen.
+Even the smallest tip means a lot! ❤️
+
+Thanks for supporting independent development, security research, and open-source projects! 🚀
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/hajdeo)
+
+Ko-fi: [ko-fi.com/hajdeo](https://ko-fi.com/hajdeo)
+
 ## How it works
 
 The PS4 is an x86-64 machine. NHL 24's executable (`eboot.bin`) and its modules are ordinary AMD64 code,
@@ -41,12 +66,6 @@ CPU directly, at native speed. What the emulator provides is everything around i
   extracts the base/update PKG with shadPS4's PKG/PFS code built into `nhl24.exe`
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
   fullscreen, vsync, sharpening, language, controls, the Windows red-zone protection) and starts the game.
-
-## Support / Podpora
-
-If this project is useful to you, you can support its development:
-
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/hajdeo)
 
 ## What's new in v0.9.2b
 
