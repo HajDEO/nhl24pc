@@ -22,6 +22,20 @@ enum class MemoryPermission : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 
+using PreDeviceInitHook = bool (*)(bool claim_now);
+
+/**
+ * Registers a hook consulted by the AddressSpace constructor. When the hook
+ * reports that a GPU driver wants to claim virtual address space (NVIDIA CUDA,
+ * required by NGX/DLSS, initializes during device creation and needs free
+ * address space), the constructor first reserves only the guest-critical low
+ * range, then invokes the hook with claim_now=true so the driver places its
+ * reservations above the guest layout, and finally claims the remaining user
+ * space around them. Without the hook (or when it reports false) the original
+ * single-pass reservation is used.
+ */
+void SetPreDeviceInitHook(PreDeviceInitHook hook);
+
 /**
  * Represents the user virtual address space backed by a dmem memory block
  */

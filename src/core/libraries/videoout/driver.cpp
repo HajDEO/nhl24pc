@@ -60,6 +60,13 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
 
 VideoOutDriver::~VideoOutDriver() = default;
 
+void VideoOutDriver::SetResolution(u32 width, u32 height) {
+    main_port.resolution.full_width = width;
+    main_port.resolution.full_height = height;
+    main_port.resolution.pane_width = width;
+    main_port.resolution.pane_height = height;
+}
+
 int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
         return ORBIS_VIDEO_OUT_ERROR_RESOURCE_BUSY;

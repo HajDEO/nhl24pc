@@ -258,7 +258,52 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        // nhlport: query the driver's fault report (VK_EXT_device_fault) before asserting,
+        // to identify the faulting GPU address / pipeline.
+        try {
+            if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
+                LOG_CRITICAL(Render_Vulkan, "Device fault query unavailable: "
+                             "VK_EXT_device_fault not enabled at device creation");
+            }
+            constexpr u32 max_addresses = 16;
+            constexpr u32 max_vendor = 8;
+            constexpr u32 max_binary = 4096;
+            std::array<vk::DeviceFaultAddressInfoEXT, max_addresses> address_infos{};
+            std::array<vk::DeviceFaultVendorInfoEXT, max_vendor> vendor_infos{};
+            std::array<u8, max_binary> vendor_binary{};
+            vk::DeviceFaultCountsEXT counts{};
+            counts.addressInfoCount = max_addresses;
+            counts.vendorInfoCount = max_vendor;
+            counts.vendorBinarySize = max_binary;
+            vk::DeviceFaultInfoEXT fault{};
+            fault.pAddressInfos = address_infos.data();
+            fault.pVendorInfos = vendor_infos.data();
+            fault.pVendorBinaryData = vendor_binary.data();
+            const auto fault_result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT
+                ? instance.GetDevice().getFaultInfoEXT(&counts, &fault)
+                : vk::Result::eErrorFeatureNotPresent;
+            if (fault_result == vk::Result::eSuccess) {
+                LOG_CRITICAL(Render_Vulkan, "Device fault: {}", fault.description.data());
+                for (u32 i = 0; i < counts.addressInfoCount && i < max_addresses; ++i) {
+                    LOG_CRITICAL(Render_Vulkan, "  fault address #{}: type={}, va={:#x}", i,
+                                 vk::to_string(address_infos[i].addressType),
+                                 address_infos[i].addressPrecision);
+                }
+                for (u32 i = 0; i < counts.vendorInfoCount && i < max_vendor; ++i) {
+                    LOG_CRITICAL(Render_Vulkan, "  vendor fault #{}: {} code={:#x} data={:#x}", i,
+                                 vendor_infos[i].description.data(), vendor_infos[i].vendorFaultCode,
+                                 vendor_infos[i].vendorFaultData);
+                }
+            } else {
+                LOG_CRITICAL(Render_Vulkan, "Device fault query failed: {}",
+                             vk::to_string(fault_result));
+            }
+        } catch (const std::exception& e) {
+            LOG_CRITICAL(Render_Vulkan, "Device fault query threw: {}", e.what());
+        }
+        ASSERT_MSG(false, "Device lost during submit");
+    }
     if (diag_timeline) {
         Diag::OnGpuSubmit(signal_value);
     }

@@ -341,6 +341,7 @@ struct Dpp {
 struct GcnInst {
     Opcode opcode;
     InstEncoding encoding;
+    u64 raw{}; // nhlport: original instruction encoding, for diagnostics
     InstClass inst_class;
     InstCategory category;
     InstControl control;

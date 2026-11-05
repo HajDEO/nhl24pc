@@ -105,6 +105,17 @@ OPCODE(UndefU32x2,                                          U32x2,              
 OPCODE(UndefU32x3,                                          U32x3,                                                                                            )
 OPCODE(UndefU32x4,                                          U32x4,                                                                                            )
 OPCODE(UndefF32,                                            F32,                                                                                            )
+OPCODE(UndefF16,                                            F16,                                                                                            )
+OPCODE(UndefF16x2,                                          F16x2,                                                                                            )
+OPCODE(UndefF16x3,                                          F16x3,                                                                                            )
+OPCODE(UndefF16x4,                                          F16x4,                                                                                            )
+OPCODE(UndefF32x2,                                          F32x2,                                                                                            )
+OPCODE(UndefF32x3,                                          F32x3,                                                                                            )
+OPCODE(UndefF32x4,                                          F32x4,                                                                                            )
+OPCODE(UndefF64,                                            F64,                                                                                            )
+OPCODE(UndefF64x2,                                          F64x2,                                                                                            )
+OPCODE(UndefF64x3,                                          F64x3,                                                                                            )
+OPCODE(UndefF64x4,                                          F64x4,                                                                                            )
 OPCODE(UndefU64,                                            U64,                                                                                            )
 
 // Buffer operations

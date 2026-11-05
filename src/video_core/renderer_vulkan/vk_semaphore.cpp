@@ -43,6 +43,22 @@ void Semaphore::Refresh() {
         if (counter < this_tick) {
             return;
         }
+        // nhlport: during the Neo-mode texture storm the driver reported a garbage
+        // counter (0xffffffffffffffff) while the highest tick we ever handed to a
+        // submit was 0x171. Accepting it poisoned gpu_tick and voided all GPU
+        // synchronization (the GPU thread then spun at 100% CPU). Signaled values are
+        // always < current_tick, so anything above is bogus - ignore it.
+        const u64 max_issued = current_tick.load(std::memory_order_acquire) - 1;
+        if (counter > max_issued) {
+            static std::atomic<u32> bogus_logs{0};
+            if (bogus_logs.fetch_add(1, std::memory_order_relaxed) < 10) {
+                LOG_WARNING(Render_Vulkan,
+                            "Semaphore::Refresh: counter {:#x} exceeds last issued tick "
+                            "{:#x}; ignoring bogus GPU counter",
+                            counter, max_issued);
+            }
+            return;
+        }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
     if (diag_tracked && counter > this_tick) {

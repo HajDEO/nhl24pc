@@ -13,6 +13,9 @@ class SymbolsResolver;
 
 namespace Libraries::VideoOut {
 
+// nhlport: update the resolution the game is told about (render resolution override).
+void SetInternalResolution(u32 width, u32 height);
+
 // SceVideoOutBusType
 constexpr int SCE_VIDEO_OUT_BUS_TYPE_MAIN = 0;                    // Main output
 constexpr int SCE_VIDEO_OUT_BUS_TYPE_AUX_SOCIAL_SCREEN = 5;       // Aux output for social

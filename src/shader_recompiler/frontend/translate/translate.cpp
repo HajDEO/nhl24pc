@@ -709,9 +709,14 @@ IR::F32 Translator::GetSrcMix(const InstOperand& operand) {
         }
         break;
     }
-    case OperandField::VccHi:
-        UNREACHABLE();
+    case OperandField::VccHi: {
+        // nhlport: v_mad_mix can source the high half of the 64-bit VCC pair. The proper
+        // half read is not validated yet - gameplay shaders hit this path, and a wrong
+        // value here corrupts readback data - so it stays neutralized to match the
+        // gameplay-validated behavior until the correct semantics are confirmed.
+        value = ir.Imm32(std::bit_cast<float>(0U));
         break;
+    }
     case OperandField::M0:
         UNREACHABLE();
         break;
@@ -1231,9 +1236,9 @@ void Translator::EmitFetch(const GcnInst& inst) {
 }
 
 void Translator::LogMissingOpcode(const GcnInst& inst) {
-    LOG_ERROR(Render_Recompiler, "Unknown opcode {} ({}, category = {})",
+    LOG_ERROR(Render_Recompiler, "Unknown opcode {} ({}, category = {}, raw = {:#x})",
               magic_enum::enum_name(inst.opcode), u32(inst.opcode),
-              magic_enum::enum_name(inst.category));
+              magic_enum::enum_name(inst.category), inst.raw);
     info.translation_failed = true;
 }
 

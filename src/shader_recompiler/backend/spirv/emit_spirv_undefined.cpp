@@ -38,6 +38,50 @@ Id EmitUndefF32(EmitContext& ctx) {
     return ctx.OpUndef(ctx.F32[1]);
 }
 
+Id EmitUndefF16(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F16[1]);
+}
+
+Id EmitUndefF16x2(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F16[2]);
+}
+
+Id EmitUndefF16x3(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F16[3]);
+}
+
+Id EmitUndefF16x4(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F16[4]);
+}
+
+Id EmitUndefF32x2(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F32[2]);
+}
+
+Id EmitUndefF32x3(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F32[3]);
+}
+
+Id EmitUndefF32x4(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F32[4]);
+}
+
+Id EmitUndefF64(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F64[1]);
+}
+
+Id EmitUndefF64x2(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F64[2]);
+}
+
+Id EmitUndefF64x3(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F64[3]);
+}
+
+Id EmitUndefF64x4(EmitContext& ctx) {
+    return ctx.OpUndef(ctx.F64[4]);
+}
+
 Id EmitUndefU64(EmitContext&) {
     UNREACHABLE_MSG("SPIR-V Instruction");
 }
