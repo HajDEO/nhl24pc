@@ -58,13 +58,15 @@ install -m644 "$REPO/release/user/input_config/default.ini" \
     "$REPO/release/user/input_config/global.ini" "$APPDIR/usr/share/nhl24pc/input_config/"
 install -m644 "$REPO/game_patches/nhl24.xml" "$APPDIR/usr/share/nhl24pc/nhl24.xml"
 install -m644 "$REPO/src/resources/nhl24.png" "$APPDIR/usr/share/nhl24pc/nhl24-pc.png"
-install -m644 "$HERE/appimage/nhl24-pc.desktop" "$APPDIR/nhl24-pc.desktop"
-install -m644 "$HERE/appimage/nhl24-pc.desktop" "$APPDIR/usr/share/applications/nhl24-pc.desktop"
+install -m644 "$HERE/appimage/io.github.hajdeo.nhl24pc.desktop" \
+    "$APPDIR/io.github.hajdeo.nhl24pc.desktop"
+install -m644 "$HERE/appimage/io.github.hajdeo.nhl24pc.desktop" \
+    "$APPDIR/usr/share/applications/io.github.hajdeo.nhl24pc.desktop"
 install -m644 "$REPO/src/resources/nhl24.png" "$APPDIR/nhl24-pc.png"
 install -m644 "$REPO/src/resources/nhl24.png" \
     "$APPDIR/usr/share/icons/hicolor/256x256/apps/nhl24-pc.png"
-install -m644 "$HERE/appimage/nhl24-pc.appdata.xml" \
-    "$APPDIR/usr/share/metainfo/nhl24-pc.appdata.xml"
+install -m644 "$HERE/appimage/io.github.hajdeo.nhl24pc.metainfo.xml" \
+    "$APPDIR/usr/share/metainfo/io.github.hajdeo.nhl24pc.metainfo.xml"
 install -m644 "$HERE/LINUX.md" "$HERE/LINUX_RU.md" "$REPO/LICENSE" \
     "$APPDIR/usr/share/doc/nhl24pc/"
 install -m644 "$HERE/LINUX.md" "$HERE/LINUX_RU.md" "$APPDIR/usr/share/nhl24pc/"
@@ -149,7 +151,7 @@ fi
 
 deploy_args=(--appdir "$APPDIR" --executable "$APPDIR/usr/bin/nhl24"
              --executable "$APPDIR/usr/bin/python3"
-             --desktop-file "$APPDIR/usr/share/applications/nhl24-pc.desktop"
+             --desktop-file "$APPDIR/usr/share/applications/io.github.hajdeo.nhl24pc.desktop"
              --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/nhl24-pc.png")
 
 APPIMAGE_EXTRACT_AND_RUN=1 "$LINUXDEPLOY_BIN" "${deploy_args[@]}"
