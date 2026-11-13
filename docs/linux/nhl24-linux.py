@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# NHL 24 PC - Linux installer and launcher (no Wine, no PowerShell).
-# Port of the NHL24PC repack's setup.ps1 / common.ps1 / launcher.ps1 for the native Linux build
-# of https://github.com/HajDEO/nhl24pc. Python 3.8+, standard library only.
+# NHL 24 PC - native Linux installer and launcher (no Wine or PowerShell).
+# Works with the current https://github.com/HajDEO/nhl24pc source. Python 3.8+,
+# standard library only.
 #
 #   ./nhl24-linux.py install BASE.pkg [UPDATE.pkg]   extract + patch + config + menu entry
 #   ./nhl24-linux.py update UPDATE.pkg               install / replace the 1.60 update
@@ -12,29 +12,77 @@
 #   ./nhl24-linux.py mod [install|remove|status]     Russia / Belarus national teams mod
 #   ./nhl24-linux.py desktop [--remove-wine]         menu + desktop shortcuts (and remove old Wine ones)
 #
-# Game patches are found by byte signatures (same as the repack), checked before writing,
-# and work on CUSA37934 (EU) and CUSA37933 (US), versions 1.00 and 1.60.
+# Game patches are found by byte signatures, checked before writing, and work on
+# CUSA37934 (EU) and CUSA37933 (US), versions 1.00 and 1.60.
 
 import json, os, re, shutil, struct, subprocess, sys
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
-EMU = os.path.join(ROOT, 'nhl24-linux')
-GAME = os.path.join(ROOT, 'game')
-UPDATE = os.path.join(ROOT, 'game-UPDATE')
-USER = os.path.join(ROOT, 'user')
-CONFIG = os.path.join(USER, 'config.json')
-SETTINGS = os.path.join(USER, 'launcher_settings.json')
-OFFSET_CACHE = os.path.join(USER, 'eboot_offsets.json')
-LOC_CACHE = os.path.join(USER, 'loc_offset.json')
-CONFIG_TEMPLATES = [os.path.join(ROOT, 'tools', 'config_default.json'),
-                    os.path.join(ROOT, 'config_default.json')]
+REPO_ROOT = os.path.realpath(os.path.join(ROOT, '..', '..'))
+EMU_CANDIDATES = [os.path.join(ROOT, 'nhl24-linux'), os.path.join(ROOT, 'nhl24'),
+                  os.path.join(REPO_ROOT, 'build', 'nhl24')]
+
+
+def find_emulator():
+    for path in EMU_CANDIDATES:
+        if os.access(path, os.X_OK):
+            return path
+    return EMU_CANDIDATES[0]
+
+
+def port_version():
+    version_file = os.path.join(ROOT, 'VERSION')
+    try:
+        with open(version_file, encoding='utf-8') as f:
+            version = f.read().strip()
+        if version:
+            return version
+    except OSError:
+        pass
+    header = os.path.join(REPO_ROOT, 'src', 'common', 'port_version.h')
+    try:
+        with open(header, encoding='utf-8') as f:
+            match = re.search(r'^#define NHLPORT_VERSION "([^"]+)"', f.read(), re.M)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    return 'development'
+
+
+PORT_VERSION = port_version()
+
+
+def refresh_runtime_paths():
+    global EMU, DATA_ROOT, GAME, UPDATE, USER, CONFIG, SETTINGS, OFFSET_CACHE, LOC_CACHE
+    EMU = find_emulator()
+    emulator_dir = os.path.dirname(os.path.realpath(EMU))
+    DATA_ROOT = ROOT if emulator_dir == os.path.realpath(ROOT) else emulator_dir
+    GAME = os.path.join(DATA_ROOT, 'game')
+    UPDATE = os.path.join(DATA_ROOT, 'game-UPDATE')
+    USER = os.path.join(DATA_ROOT, 'user')
+    CONFIG = os.path.join(USER, 'config.json')
+    SETTINGS = os.path.join(USER, 'launcher_settings.json')
+    OFFSET_CACHE = os.path.join(USER, 'eboot_offsets.json')
+    LOC_CACHE = os.path.join(USER, 'loc_offset.json')
+
+
+refresh_runtime_paths()
+
+
+def config_templates():
+    return [os.path.join(DATA_ROOT, 'config_default.json'),
+            os.path.join(ROOT, 'config_default.json'),
+            os.path.join(ROOT, 'release', 'user', 'config.json'),
+            os.path.join(ROOT, 'tools', 'config_default.json'),
+            os.path.join(REPO_ROOT, 'release', 'user', 'config.json')]
+
+
 KNOWN_TITLES = ('CUSA37933', 'CUSA37934')
 
 RES_MODES = {'720': (1280, 720), '1080': (1920, 1080), '1200': (1920, 1200),
              '1440': (2560, 1440), '1600': (2560, 1600), '2160': (3840, 2160)}
 FPS_VALUES = (60, 90, 120, 144)
-SHARPNESS = ('off', 'light', 'strong')
-
 # Render resolution: Frostbite settings block "1.0f 1.0f 0 0 | W H | 0 0 | 3840 2160"
 RES_SIG = '0000803f0000803f0000000000000000 ???????????????? 0000000000000000000f000070080000'
 RES_SKIP = 16
@@ -54,9 +102,7 @@ LOC_GER_SIG = '67657200 ???????????? 0073776500'
 
 DEFAULT_SETTINGS = {
     'resolution': '1440', 'fullscreen': True, 'hdr': 'off', 'vsync': False, 'fps': 120,
-    'menu_full_fps': True, 'ps4pro': False, 'aniso16': True, 'sharpness': 'light', 'fsr': True,
-    'diag': False, 'lang': 'ru', 'ru_text': False, 'gpu10_fix': True, 'gpu10_other': False,
-    'stable': False, 'tdr_asked': True, 'overlay_warned': '', 'redzone': False,
+    'fsr': True, 'diag': False, 'lang': '', 'ru_text': False, 'stable': False,
 }
 
 
@@ -311,26 +357,35 @@ def pkg_info(path):
 # ---------------- emulator config / settings ----------------
 
 def set_config(values):
-    # plain text edits keep the emulator's formatting and every key we do not touch
     if not os.path.isfile(CONFIG):
-        tpl = next((p for p in CONFIG_TEMPLATES if os.path.isfile(p)), None)
+        tpl = next((p for p in config_templates() if os.path.isfile(p)), None)
         if not tpl:
-            fail('нет ни user/config.json, ни шаблона tools/config_default.json')
-        os.makedirs(USER, exist_ok=True)
+            raise RuntimeError('no emulator config template was found')
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
         shutil.copy(tpl, CONFIG)
-    with open(CONFIG, encoding='utf-8-sig') as f:
-        s = f.read()
+
+    config = read_json(CONFIG)
+    if not isinstance(config, dict):
+        raise RuntimeError('invalid JSON in %s' % CONFIG)
+    sections = {
+        'console_language': 'General', 'neo_mode': 'General',
+        'extra_dmem_in_mbytes': 'General', 'show_fps_counter': 'General',
+        'show_splash': 'General', 'redzone_patches': 'General',
+        'readbacks_mode': 'GPU', 'present_mode': 'GPU', 'vblank_frequency': 'GPU',
+        'full_screen': 'GPU', 'hdr_allowed': 'GPU', 'window_width': 'GPU',
+        'window_height': 'GPU', 'fsr_enabled': 'GPU', 'rcas_enabled': 'GPU',
+    }
+    missing = []
     for k, v in values.items():
-        if isinstance(v, bool):
-            js = 'true' if v else 'false'
-        elif isinstance(v, str):
-            js = '"%s"' % v
-        else:
-            js = str(v)
-        pat = r'("' + re.escape(k) + r'":\s*)("[^"]*"|true|false|-?\d+(\.\d+)?)'
-        s = re.sub(pat, lambda m: m.group(1) + js, s)
-    with open(CONFIG, 'w', encoding='utf-8') as f:
-        f.write(s)
+        section_name = sections.get(k)
+        section = config.get(section_name) if section_name else None
+        if not isinstance(section, dict) or k not in section:
+            missing.append('%s.%s' % (section_name or '?', k))
+            continue
+        section[k] = v
+    if missing:
+        raise RuntimeError('config template is missing: %s' % ', '.join(missing))
+    write_json(CONFIG, config)
 
 
 def load_settings():
@@ -338,7 +393,6 @@ def load_settings():
     j = read_json(SETTINGS)
     if isinstance(j, dict):
         s.update({k: v for k, v in j.items() if k in s})
-    s['ps4pro'] = False   # PS4 Pro (neo) mode crashes the Linux build (texture_cache.cpp:585)
     return s
 
 
@@ -416,14 +470,15 @@ def best_resolution():
 # ---------------- extraction ----------------
 
 def need_emu():
+    refresh_runtime_paths()
     if not os.access(EMU, os.X_OK):
-        fail('нет %s - соберите эмулятор (build/nhl24) и положите сюда под этим именем' % EMU)
+        fail('emulator not found; checked: %s' % ', '.join(EMU_CANDIDATES))
 
 
 def extract(pkg, target_dir):
     need_emu()
     size = os.path.getsize(pkg)
-    free = shutil.disk_usage(ROOT).free
+    free = shutil.disk_usage(DATA_ROOT).free
     if free < size + (5 << 30):
         fail('мало места: свободно %.0f ГБ, нужно около %.0f ГБ' % (free / 2**30, (size + (5 << 30)) / 2**30))
     if os.path.exists(target_dir):
@@ -432,7 +487,7 @@ def extract(pkg, target_dir):
     say('Распаковка %s (%.1f ГБ)...' % (os.path.basename(pkg), size / 2**30))
     os.makedirs(os.path.join(USER, 'log'), exist_ok=True)
     log = open(os.path.join(USER, 'log', 'extract.log'), 'w')
-    p = subprocess.Popen([EMU, '--extract-pkg', pkg, '--extract-to', 'game'], cwd=ROOT,
+    p = subprocess.Popen([EMU, '--extract-pkg', pkg, '--extract-to', GAME], cwd=DATA_ROOT,
                          stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
     last_err = ''
     try:
@@ -496,10 +551,10 @@ def patch_game(res=None):
     eb = eboot_path()
     if not os.path.isfile(eb):
         fail('нет game/eboot.bin')
-    say('\n== Патчи игры (%s) ==' % os.path.relpath(eb, ROOT), 'head')
+    say('\n== Патчи игры (%s) ==' % os.path.relpath(eb, DATA_ROOT), 'head')
     if not os.path.isfile(eb + '.orig'):
         shutil.copy2(eb, eb + '.orig')
-        say('Резервная копия: %s.orig' % os.path.relpath(eb, ROOT))
+        say('Резервная копия: %s.orig' % os.path.relpath(eb, DATA_ROOT))
     for name, fn in (('Зависание перед первым вбрасыванием', lambda: freeze_fix(eb)),
                      ('Динамическое разрешение выключено', lambda: disable_drs(eb))):
         try:
@@ -516,10 +571,6 @@ def patch_game(res=None):
     mark = os.path.join(USER, 'freezefix_%d.ok' % os.path.getsize(eb))
     with open(mark, 'w') as f:
         f.write('ok')
-    xml = os.path.join(USER, 'patches', 'nhl24.xml')
-    if os.path.isfile(xml):     # the repo's memory patch targets 1.00 only; the repack disables it
-        os.replace(xml, xml + '.off')
-        say('Старый файл патчей user/patches/nhl24.xml отключён.')
 
 
 def desktop_dir():
@@ -567,14 +618,17 @@ def write_desktop_entries(on_desktop=True, remove_wine=False):
     me = os.path.realpath(__file__)
     gui = os.path.join(ROOT, 'nhl24-launcher.py')
     main = ('python3 "%s"' % gui) if os.path.isfile(gui) else ('python3 "%s" play' % me)
+    language = (load_settings().get('lang') or
+                ('ru' if os.environ.get('LANG', '').startswith('ru') else 'en'))
+    settings_name = 'NHL 24 - настройки' if language == 'ru' else 'NHL 24 - Settings'
     entries = (('nhl24.desktop', 'NHL 24', main, 'false', 'StartupWMClass=nhl24-launcher\n'),
-               ('nhl24-settings.desktop', 'NHL 24 - настройки (терминал)', 'python3 "%s" settings' % me, 'true', ''))
+               ('nhl24-settings.desktop', settings_name, 'python3 "%s" settings' % me, 'true', ''))
     for fname, name, cmd, term, extra in entries:
         path = os.path.join(apps, fname)
         with open(path, 'w') as f:
             f.write('[Desktop Entry]\nType=Application\nName=%s\nComment=NHL 24 (PS4) - native Linux build\n'
                     'Exec=%s\nPath=%s\nIcon=%s\nTerminal=%s\nCategories=Game;SportsGame;\nKeywords=nhl;hockey;\n%s'
-                    % (name, cmd, ROOT, icon, term, extra))
+                    % (name, cmd, DATA_ROOT, icon, term, extra))
         os.chmod(path, 0o755)
     say('Ярлыки «NHL 24» и «NHL 24 - настройки» добавлены в меню приложений.', 'ok')
 
@@ -625,8 +679,6 @@ def cmd_install(args):
                 'hdr_allowed': False, 'show_splash': True})
     s = load_settings()
     s.update({'resolution': res, 'fps': fps})
-    if 0 < v <= 8:
-        s['sharpness'] = 'off'
     save_settings(s)
     write_desktop_entries()
     say('\nГОТОВО. Запуск: «NHL 24» в меню или ./nhl24-linux.py play', 'ok')
@@ -661,7 +713,7 @@ def cmd_status(_):
             say('%s: %s' % (name, fn()))
         except Exception as e:
             say('%s: ? (%s)' % (name, e), 'warn')
-    say('Эмулятор: %s' % ('есть' if os.access(EMU, os.X_OK) else 'НЕТ (nhl24-linux)'))
+    say('Эмулятор: %s' % (EMU if os.access(EMU, os.X_OK) else 'НЕТ'))
 
 
 # ---------------- settings menu ----------------
@@ -679,11 +731,8 @@ def cmd_settings(_):
         ('Разрешение', lambda: s['resolution'] + 'p', lambda: s.update(resolution=cycle(RES_MODES, str(s['resolution'])))),
         ('Полный экран', lambda: yn(s['fullscreen']), lambda: s.update(fullscreen=not s['fullscreen'])),
         ('Лимит FPS', lambda: str(s['fps']), lambda: s.update(fps=cycle(FPS_VALUES, int(s['fps'])))),
-        ('Высокий FPS в меню', lambda: yn(s['menu_full_fps']), lambda: s.update(menu_full_fps=not s['menu_full_fps'])),
         ('Вертикальная синхронизация', lambda: yn(s['vsync']), lambda: s.update(vsync=not s['vsync'])),
         ('Апскейл FSR', lambda: yn(s['fsr']), lambda: s.update(fsr=not s['fsr'])),
-        ('Анизотропия 16x', lambda: yn(s['aniso16']), lambda: s.update(aniso16=not s['aniso16'])),
-        ('Чёткость текстур', lambda: s['sharpness'], lambda: s.update(sharpness=cycle(SHARPNESS, s['sharpness']))),
         ('Русский текст в игре' + ('' if has_update else ' (нужно обновление 1.60)'),
          lambda: yn(s['ru_text']), lambda: s.update(ru_text=not s['ru_text'])),
         ('Стабильный режим (если вылетает)', lambda: yn(s['stable']), lambda: s.update(stable=not s['stable'])),
@@ -734,17 +783,7 @@ def gpu_names():
     return names
 
 
-def is_nvidia():
-    return any('NVIDIA' in n or 'GeForce' in n for n in gpu_names())
-
-
-def test_pascal():
-    # NVIDIA Pascal (GTX 10xx, MX 1xx/2xx, Quadro P...): the emulator skips the shader that hangs them
-    keys = ('GTX 10', 'GT 10', 'MX1', 'MX 1', 'MX2', 'MX 2', 'TITAN X', 'Quadro P', 'Tesla P', 'GP10')
-    return any(k in n for n in gpu_names() if 'NVIDIA' in n or 'GeForce' in n for k in keys)
-
-
-def prepare_launch(s, pascal=None):
+def prepare_launch(s):
     """Patch eboot + write config.json from settings s; returns the environment for the emulator."""
     eb = eboot_path()
     has_update = os.path.isfile(os.path.join(UPDATE, 'eboot.bin'))
@@ -786,26 +825,12 @@ def prepare_launch(s, pascal=None):
     })
 
     env = dict(os.environ)
-    env['NHLPORT_FORCE_ANISO'] = '16' if s['aniso16'] else '0'
-    env['NHLPORT_LOD_BIAS'] = {'off': '0', 'strong': '-0.25'}.get(s['sharpness'], '-0.1')
-    env['NHLPORT_IGNORE_FLIP_RATE'] = '2' if s['menu_full_fps'] else '0'
-    v = vram_gb()
-    for key, on, val in (('NHLPORT_IMAGE_POOL', 0 < v < 10, '0'), ('NHLPORT_DIAG', s['diag'], '1'),
-                         ('NHLPORT_READBACK_DRAIN', s['stable'], '1'),
-                         ('NHLPORT_GPU_CHECKPOINTS', s['diag'] and is_nvidia(), '1')):
+    for key, on, val in (('NHLPORT_DIAG', s['diag'], '1'),
+                         ('NHLPORT_READBACK_DRAIN', s['stable'], '1')):
         if on:
             env[key] = val
         else:
             env.pop(key, None)
-    if pascal is None:
-        pascal = test_pascal()
-    env.pop('NHLPORT_SKIP_CS', None)
-    if pascal and not s.get('gpu10_fix', True):
-        env['NHLPORT_GTX10_FIX'] = 'off'
-    elif not pascal and s.get('gpu10_other'):
-        env['NHLPORT_GTX10_FIX'] = 'skip'
-    else:
-        env.pop('NHLPORT_GTX10_FIX', None)
     return env
 
 
@@ -818,7 +843,7 @@ def cmd_play(_):
     os.makedirs(os.path.join(USER, 'log'), exist_ok=True)
     log = open(os.path.join(USER, 'log', 'linux_run.log'), 'w')
     say('Запуск NHL 24... (лог: user/log/linux_run.log)', 'ok')
-    os.chdir(ROOT)
+    os.chdir(DATA_ROOT)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
     os.execve(EMU, [EMU], env)
@@ -831,7 +856,7 @@ def cmd_play(_):
 # pointed at it. Removing writes the original entries back and deletes cas_02.cas. Everything is
 # checked by SHA-1 before writing.
 
-MOD_DIR = os.path.join(ROOT, 'tools', 'mods')
+MOD_DIR = os.path.join(DATA_ROOT, 'tools', 'mods')
 MOD_BACKUP = os.path.join(USER, 'mods_backup')
 
 
@@ -1063,4 +1088,7 @@ if __name__ == '__main__':
         print('Команды: install BASE.pkg [UPDATE.pkg] | update UPDATE.pkg | remove-update | settings | play | status |\n'
               '         mod [install|remove|status] | desktop [--remove-wine] [--no-desktop]')
         sys.exit(0 if len(sys.argv) < 2 else 1)
-    COMMANDS[sys.argv[1]](sys.argv[2:])
+    try:
+        COMMANDS[sys.argv[1]](sys.argv[2:])
+    except RuntimeError as e:
+        fail(str(e))

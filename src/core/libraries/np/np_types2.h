@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "common/types.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/rtc/rtc.h"
