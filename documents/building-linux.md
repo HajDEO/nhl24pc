@@ -3,9 +3,12 @@ SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-## Build shadPS4 for Linux
+## Build NHL24 PC for Linux
 
-First and foremost, Clang 19 is the **recommended compiler** as it is used for official Linux builds and CI. GCC 14 is also tested by CI. If you build with GCC, you might encounter issues — please report any you find. Additionally, if you choose to use GCC, please build shadPS4 with Clang at least once before creating an `[APP BUG]` issue or submitting a pull request.
+NHL24 PC requires x86-64 Linux because the PS4 game's x86-64 code executes directly on the host CPU.
+The binary targets the x86-64-v3 baseline (Intel Haswell or AMD Excavator and newer). CMake 3.24 or
+newer is required. Clang 19 is the **recommended compiler** and is used by this fork's Linux CI build.
+GCC is not currently tested by this fork's CI.
 
 ## Preparatory steps
 
@@ -26,10 +29,10 @@ sudo apt update
 Then install the build dependencies:
 
 ```bash
-sudo apt install build-essential clang-19 git cmake libasound2-dev \
+sudo apt install build-essential clang-19 clang-tools-19 git cmake libasound2-dev \
     libpulse-dev libopenal-dev libssl-dev zlib1g-dev libedit-dev \
     libudev-dev libevdev-dev libsdl2-dev libjack-dev libsndio-dev \
-    libvulkan-dev vulkan-validationlayers libpng-dev
+    libvulkan-dev vulkan-validationlayers libpng-dev ninja-build uuid-dev
 ```
 
 #### Fedora
@@ -46,10 +49,10 @@ sudo dnf install ninja-build clang git cmake libatomic alsa-lib-devel \
 
 ```bash
 sudo pacman -S base-devel clang git cmake sndio jack2 openal \
-    sdl2 vulkan-validation-layers libpng
+    sdl2 vulkan-validation-layers libpng ninja util-linux
 ```
 
-**Note**: The `shadps4-git` AUR package is not maintained by any of the developers, and it uses the default compiler, which is often set to GCC. Use at your own discretion.
+**Note**: The upstream `shadps4-git` AUR package does not build this NHL24 PC fork. Build this repository directly.
 
 #### OpenSUSE
 
@@ -57,7 +60,7 @@ sudo pacman -S base-devel clang git cmake sndio jack2 openal \
 sudo zypper install clang git cmake libasound2 libpulse-devel \
     libsndio7 libjack-devel openal-soft-devel libopenssl-devel \
     zlib-devel libedit-devel systemd-devel libevdev-devel \
-    vulkan-devel vulkan-validationlayers libpng-devel
+    vulkan-devel vulkan-validationlayers libpng-devel libuuid-devel ninja
 ```
 
 #### Nix Flake Development Shell
@@ -95,8 +98,8 @@ This option is **highly recommended** for distributions with immutable/atomic fi
 The project uses submodules to manage dependencies, and they need to be initialized before you can build the project. To achieve this, make sure you've cloned the repository with the --recursive flag
 
 ```bash
-git clone --recursive https://github.com/shadps4-emu/shadPS4.git
-cd shadPS4
+git clone --recursive https://github.com/HajDEO/nhl24pc.git
+cd nhl24pc
 ```
 
 ## Building
@@ -105,15 +108,18 @@ There are 3 options you can choose from. Option 1 is **highly recommended**.
 
 #### Option 1: Terminal-only
 
-1. Generate the build directory in the shadPS4 directory.
+1. Generate the build directory in the `nhl24pc` directory.
 
 ```bash
-cmake -S . -B build/ -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19
+cmake -S . -B build/ -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang-19 \
+    -DCMAKE_CXX_COMPILER=clang++-19
 ```
 
-To change the build type (for debugging), add `-DCMAKE_BUILD_TYPE=Debug`.
+To build with debugging information, change `Release` to `RelWithDebInfo` or `Debug`.
 
-1. Use CMake to build the project:
+2. Use CMake to build the project:
 
 ```bash
 cmake --build ./build --parallel$(nproc)
@@ -124,15 +130,25 @@ If your computer freezes during this step, this could be caused by excessive sys
 Now run the emulator to get the list of options:
 
 ```bash
-./build/shadps4
+./build/nhl24
 ```
 
-You can also specify the Game ID as an argument for which game to boot, as long as the folder containing the games is specified in config.toml (example: Bloodborne (US) is CUSA00900).
+For the native installer, launcher, and expected game directory layout, see `docs/linux/LINUX.md`.
+
+To package the build as an AppImage, install `python3-tk`, `curl`, and `desktop-file-utils`, then run:
+
+```bash
+./docs/linux/make-linux-appimage.sh build/nhl24
+```
+
+This produces `NHL24-PC-v<version>-x86_64.AppImage`. The packaging script bundles Python/Tk and
+verifies pinned AppImage tools before using them.
+
 #### Option 2: Configuring with cmake-gui
 
 `cmake-gui` should be installed by default alongside `cmake`, if not search for the package in your package manager and install it.
 
-Open `cmake-gui` and specify the source code and build directories. If you cloned the source code to your Home directory, it would be `/home/user/shadPS4` and `/home/user/shadPS4/build`.
+Open `cmake-gui` and specify the source code and build directories. If you cloned the source code to your Home directory, it would be `/home/user/nhl24pc` and `/home/user/nhl24pc/build`.
 
 Click on Configure, select "Unix Makefiles", select "Specify native compilers", click Next and choose `clang-19` and `clang++-19` as the C and CXX compilers. Click on Finish and let it configure the project.
 
@@ -160,8 +176,8 @@ On the CMake tab, change the options as you wish, but make sure that it looks si
 
 When hovering over Project Status > Configure, there should be an icon titled "Configure". Click on it and let it configure the project, then do the same for Project Status > Build.
 
-If you want to debug it, change the build type under Project Status > Configure to Debug (it should be the default) and compile it, then click on the icon in Project Status > Debug. If you simply want to launch the shadPS4 executable from within VSCode, click on the icon in Project Status > Launch.
+If you want to debug it, change the build type under Project Status > Configure to Debug (it should be the default) and compile it, then click on the icon in Project Status > Debug. If you simply want to launch `nhl24` from within VSCode, click on the icon in Project Status > Launch.
 
-Don't forget to change the launch target for both options to the shadPS4 executable inside shadPS4/build:
+Don't forget to change the launch target for both options to the `nhl24` executable inside `nhl24pc/build`:
 
 ![image](https://raw.githubusercontent.com/shadps4-emu/shadPS4/refs/heads/main/documents/Screenshots/Linux/5.png)

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# NHL 24 PC - Linux launcher window. A Tkinter port of the NHL24PC repack's launcher.ps1:
-# same layout, colours, texts and settings; uses nhl24-linux.py (next to it) for the game
-# patches, emulator config and the native Linux emulator build. Python 3.8+ with Tk 8.6.
-import importlib.util, math, os, re, shutil, subprocess, sys, time, zipfile
+# NHL 24 PC - native Linux launcher. Uses nhl24-linux.py for package installation,
+# game patches, emulator configuration and launching. Python 3.8+ with Tk 8.6.
+import importlib.util, math, os, re, shutil, subprocess, sys, threading, time, zipfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 _spec = importlib.util.spec_from_file_location('nhlcore', os.path.join(HERE, 'nhl24-linux.py'))
@@ -12,6 +11,7 @@ _spec.loader.exec_module(core)
 try:
     import tkinter as tk
     from tkinter import font as tkfont
+    from tkinter import filedialog
 except ImportError:
     print('Нет Tkinter. Gentoo: включите USE="tk" для dev-lang/python и пересоберите:\n'
           '  echo "dev-lang/python tk" | sudo tee -a /etc/portage/package.use/python\n'
@@ -19,10 +19,10 @@ except ImportError:
           'Debian/Ubuntu: sudo apt install python3-tk   Arch: sudo pacman -S tk')
     sys.exit(1)
 
-ROOT = core.ROOT
-AUTHOR = 'LEVASTAK'
-CHANNEL_URL = 'https://www.youtube.com/@levastak'
-DONATE = [('USDT TRC-20', 'TT8mDjSke4Tb2evTbDgfpu4dynLjABgULH'), ('RUB Sber', '4274320051677592')]
+SCRIPT_ROOT = core.ROOT
+AUTHOR = 'HajDEO'
+CHANNEL_URL = 'https://github.com/HajDEO/nhl24pc'
+DONATE = [('Ko-fi', 'https://ko-fi.com/hajdeo')]
 LAYOUT_W, LAYOUT_H = 1080, 620
 
 # palette: deep ink, graphite cards, ice-blue accent, goal-light red for PLAY, gold for support
@@ -49,28 +49,20 @@ T = {
     rutextTip='Puts the Russian translation from the game files in place of English.\nAt the language screen of the game pick English.',
     res=['720p  ·  4 GB video cards', '1080p  ·  Full HD', '1200p  ·  16:10', '1440p  ·  QHD', '1600p  ·  16:10', '2160p  ·  4K'],
     modes=['Fullscreen', 'Windowed'], hdrs=['Off', 'On (experimental)'],
-    frames='FRAME RATE', fpscap='FPS cap in a match',
+    frames='FRAME RATE', fpscap='FPS cap',
     fps=['60  ·  console, steadiest', '90  ·  6-core CPU', '120  ·  8+ core CPU', '144  ·  experimental'],
-    menu='High FPS in menus and cutscenes',
-    menuTip='Menus and cutscenes run at the full rate; where the PC can not keep up the game drops to its own 60.',
     vsync='V-Sync (no tearing)', quality='GRAPHICS', pro='PS4 Pro mode',
     proTip='On Linux the PS4 Pro mode crashes the game on the first frames (texture_cache.cpp:585), so it is always off.',
-    aniso='16x anisotropic filtering', anisoTip='Sharper textures at an angle (ice, boards). Almost free.',
     fsr='FSR upscaling', fsrTip='Sharper picture when the game renders below the screen resolution.',
-    sharp='Texture sharpness', sharps=['Default  ·  weak GPU', 'A bit sharper  ·  recommended', 'Sharp  ·  costs 5-8 FPS'],
     stability='STABILITY', playtime='Played {0} h {1} min',
     stable='Stable mode (for frequent crashes)',
     stableTip='Turn on if the game often crashes or freezes ("device lost", crash on the second match, on goals).\n'
               'The emulator then reads data back from the video card in the safest way.\nCosts a few FPS; leave it off if the game runs fine.',
     stableHint='\n\nAlso turn on "Stable mode" in the launcher.',
-    gpu10='GTX 10xx fix (no hangs, faces may be black)', gpu10No='GTX 10xx fix (only for constant crashes)',
-    gpu10Tip='For GTX 10xx (1050-1080, MX): turns off one effect that hangs these cards\n(face and helmet texture compression). '
-             'Without it the game hangs at startup and on match loading.\nSide effect: faces and helmets may be black. Other GPUs: only as a last resort.',
-    gpu10Warn='Without this fix the game on GTX 10xx hangs at startup, on match loading and in practice.\n\nTurn it off only to test. Turn it off?',
-    gpu10Other='This fix is made for GTX 10xx cards; your GPU normally does not need it.\n\nYou can try it if the game keeps hanging or crashing '
-               'at startup, on match loading or in practice. Player faces and helmets may be black.\n\nTurn it on?',
     diag='Diagnostics (detailed log)', diagTip='Only when something is wrong: writes a detailed log for the crash report. Costs some FPS.',
-    play='PLAY', guide='Guide', logs='Crash report', weak='Weak PC preset',
+    play='PLAY', install='Install PKG', installing='Installing…', installTitle='Install NHL 24 package',
+    installDone='Package installed successfully.', installFail='Package installation failed:\n{0}',
+    guide='Guide', logs='Crash log', weak='Weak PC preset',
     kbd='Keyboard', kbdTitle='Keyboard controls',
     kbdNote="The game plays best with a gamepad (Xbox / DualShock / DualSense).\nOn a keyboard pick the HYBRID control scheme in the "
             "game's settings (game update 1.60): shot, pass and hit are on buttons.",
@@ -80,17 +72,16 @@ T = {
     kbdNames=['Cross (X)', 'Circle (O)', 'Square', 'Triangle', 'L1', 'R1', 'L2', 'R2', 'L3 (left stick click)', 'R3 (right stick click)',
               'Options', 'Touchpad', 'D-pad up', 'D-pad down', 'D-pad left', 'D-pad right', 'Left stick up', 'Left stick down',
               'Left stick left', 'Left stick right', 'Right stick up', 'Right stick down', 'Right stick left', 'Right stick right'],
-    weakDone='Weak PC preset is set:\n1080p (720p on 4 GB cards), FPS cap 60, 16x filtering off, default sharpness, '
-             'menus at the console rate, stable mode on.\n\nPress PLAY.',
-    reportDone='Crash report saved:\n{0}\n\nSend it to levspotyfy@gmail.com and write in a few words what you were doing when the game crashed.',
+    weakDone='Weak PC preset is set:\n1080p (720p on 4 GB cards), FPS cap 60, FSR on and stable mode on.\n\nPress PLAY.',
+    reportDone='Crash report saved:\n{0}\n\nAttach it to a GitHub issue and describe what you were doing when the game crashed.',
     reportFail='Could not create the crash report: ',
     crashAsk='\n\nCreate a crash report (zip on the Desktop) to send to the author?',
-    author='by {0}', video='YouTube channel', support='Support the author', supportTitle='Support the author',
-    supportText='If you enjoy the build, you can thank the author. Thank you!', copy='Copy', copied='Copied', close='Close',
-    notInstalled='Game not installed - run ./nhl24-linux.py install first.', gameLine='{0}  ·  version {1}',
-    edition='PC EDITION  ·  V3.2  ·  LINUX',
-    msgNotInstalled='The game is not installed. Run:\n./nhl24-linux.py install BASE.pkg UPDATE.pkg',
-    msgNoEmu='The emulator nhl24-linux was not found next to the launcher.',
+    author='by {0}', video='Project repository', support='Support the author', supportTitle='Support the author',
+    supportText='If you enjoy the project, you can support its author. Thank you!', copy='Copy', copied='Copied', close='Close',
+    notInstalled='Game not installed - click Install PKG.', gameLine='{0}  ·  version {1}',
+    edition='NHL24 PC  ·  v{0}  ·  LINUX',
+    msgNotInstalled='The game is not installed. Click Install PKG and select your base-game package.',
+    msgNoEmu='The native Linux emulator was not found. Build it first or use the Linux package.',
     msgRunning='The game is already running.', msgFail='Could not start the game: ',
     tStart='Starting NHL 24...', tCompile='Compiling new shaders: {0}  (cache {1})    {2}:{3:02d}',
     tLoad='Loading...  shader cache: {0} ready    {1}:{2:02d}',
@@ -111,28 +102,20 @@ T = {
     rutextTip='Ставит русский перевод из файлов игры на место английского.\nНа экране выбора языка в игре выбери English.',
     res=['720p  ·  карты на 4 ГБ', '1080p  ·  Full HD', '1200p  ·  16:10', '1440p  ·  2K', '1600p  ·  16:10', '2160p  ·  4K'],
     modes=['Полный экран', 'В окне'], hdrs=['Выкл', 'Вкл (эксперимент)'],
-    frames='КАДРЫ', fpscap='Лимит FPS в матче',
+    frames='КАДРЫ', fpscap='Лимит FPS',
     fps=['60  ·  как на консоли, ровнее всего', '90  ·  процессор от 6 ядер', '120  ·  процессор от 8 ядер', '144  ·  эксперимент'],
-    menu='Высокий FPS в меню и заставках',
-    menuTip='Меню и заставки идут на полной частоте; если ПК не тянет, игра сама переходит на свои 60.',
     vsync='V-Sync (без разрывов кадра)', quality='ГРАФИКА', pro='Режим PS4 Pro',
     proTip='На Linux режим PS4 Pro роняет игру на первых кадрах (texture_cache.cpp:585), поэтому он всегда выключен.',
-    aniso='Анизотропка 16x', anisoTip='Чётче текстуры под углом (лёд, борта). Почти не ест FPS.',
     fsr='Апскейл FSR', fsrTip='Чётче картинка, когда игра рендерит ниже разрешения экрана.',
-    sharp='Резкость текстур', sharps=['Как в игре  ·  слабая видеокарта', 'Чуть резче  ·  рекомендуется', 'Резкая  ·  минус 5-8 FPS'],
     stability='СТАБИЛЬНОСТЬ', playtime='Наиграно {0} ч {1} мин',
     stable='Стабильный режим (если часто вылетает)',
     stableTip='Включай, если игра часто вылетает или зависает ("device lost", вылет на втором матче, на голах).\n'
               'Эмулятор тогда читает данные с видеокарты самым надёжным способом.\nСтоит немного FPS; если игра работает нормально - не включай.',
     stableHint='\n\nТакже включи «Стабильный режим» в лаунчере.',
-    gpu10='Фикс GTX 10xx (без зависаний, лица могут быть чёрными)', gpu10No='Фикс GTX 10xx (только при постоянных вылетах)',
-    gpu10Tip='Для GTX 10xx (1050-1080, MX): отключает один эффект, на котором эти карты зависают\n(сжатие текстур лиц и шлемов). '
-             'Без фикса игра виснет на старте и на загрузке матча.\nПобочный эффект: лица и шлемы могут быть чёрными. Другим видеокартам - только как крайняя мера.',
-    gpu10Warn='Без этого фикса игра на GTX 10xx зависает на старте, на загрузке матча и тренировки.\n\nВыключай только для проверки. Выключить?',
-    gpu10Other='Этот фикс сделан для видеокарт GTX 10xx, твоей видеокарте он обычно не нужен.\n\nМожно попробовать, если игра постоянно '
-               'зависает или вылетает на старте, на загрузке матча или тренировки. Лица и шлемы игроков могут быть чёрными.\n\nВключить?',
     diag='Диагностика (подробный лог)', diagTip='Только если что-то не так: пишет подробный лог для отчёта о вылете. Немного ест FPS.',
-    play='ИГРАТЬ', guide='Гайд', logs='Отчёт о вылете', weak='Пресет «Слабый ПК»',
+    play='ИГРАТЬ', install='Установить PKG', installing='Установка…', installTitle='Установка PKG NHL 24',
+    installDone='PKG успешно установлен.', installFail='Ошибка установки PKG:\n{0}',
+    guide='Гайд', logs='Отчёт', weak='Пресет «Слабый ПК»',
     kbd='Клавиатура', kbdTitle='Управление с клавиатуры',
     kbdNote='В игру лучше играть на геймпаде (Xbox / DualShock / DualSense).\nНа клавиатуре выбери в настройках управления игры '
             'схему ГИБРИД (нужен патч 1.60): бросок, пас и силовой на кнопках.',
@@ -143,17 +126,16 @@ T = {
               'R3 (нажатие правого стика)', 'Options', 'Тачпад', 'Крестовина вверх', 'Крестовина вниз', 'Крестовина влево',
               'Крестовина вправо', 'Левый стик вверх', 'Левый стик вниз', 'Левый стик влево', 'Левый стик вправо',
               'Правый стик вверх', 'Правый стик вниз', 'Правый стик влево', 'Правый стик вправо'],
-    weakDone='Пресет «Слабый ПК» выставлен:\n1080p (720p на картах 4 ГБ), лимит 60 FPS, анизотропка выкл, резкость как в игре, '
-             'меню как на консоли, стабильный режим вкл.\n\nЖми ИГРАТЬ.',
-    reportDone='Отчёт о вылете сохранён:\n{0}\n\nОтправь его на levspotyfy@gmail.com и в двух словах напиши, что делал, когда игра вылетела.',
+    weakDone='Пресет «Слабый ПК» выставлен:\n1080p (720p на картах 4 ГБ), лимит 60 FPS, FSR и стабильный режим вкл.\n\nЖми ИГРАТЬ.',
+    reportDone='Отчёт о вылете сохранён:\n{0}\n\nПриложи его к issue на GitHub и опиши, что делал, когда игра вылетела.',
     reportFail='Не удалось создать отчёт: ',
     crashAsk='\n\nСоздать отчёт о вылете (zip на рабочем столе), чтобы отправить автору?',
-    author='by {0}', video='YouTube-канал', support='Поддержать автора', supportTitle='Поддержать автора',
-    supportText='Если сборка зашла, можно отблагодарить автора. Спасибо!', copy='Копировать', copied='Скопировано', close='Закрыть',
-    notInstalled='Игра не установлена - сначала ./nhl24-linux.py install', gameLine='{0}  ·  версия {1}',
-    edition='PC EDITION  ·  V3.2  ·  LINUX',
-    msgNotInstalled='Игра не установлена. Выполни:\n./nhl24-linux.py install BASE.pkg UPDATE.pkg',
-    msgNoEmu='Рядом с лаунчером нет эмулятора nhl24-linux.',
+    author='by {0}', video='Репозиторий проекта', support='Поддержать автора', supportTitle='Поддержать автора',
+    supportText='Если нравится проект, можно поддержать его автора. Спасибо!', copy='Копировать', copied='Скопировано', close='Закрыть',
+    notInstalled='Игра не установлена - нажми «Установить PKG»', gameLine='{0}  ·  версия {1}',
+    edition='NHL24 PC  ·  v{0}  ·  LINUX',
+    msgNotInstalled='Игра не установлена. Нажми «Установить PKG» и выбери PKG базовой игры.',
+    msgNoEmu='Нативный Linux-эмулятор не найден. Сначала собери его или используй Linux-пакет.',
     msgRunning='Игра уже запущена.', msgFail='Не удалось запустить игру: ',
     tStart='Запуск NHL 24...', tCompile='Сборка новых шейдеров: {0}  (в кэше {1})    {2}:{3:02d}',
     tLoad='Загрузка...  шейдеров в кэше: {0}    {1}:{2:02d}',
@@ -172,8 +154,6 @@ T = {
 
 RES_KEYS = ['720', '1080', '1200', '1440', '1600', '2160']
 FPS_VALS = [60, 90, 120, 144]
-SHARP_KEYS = ['off', 'light', 'strong']
-
 KBD_ACTIONS = ['cross', 'circle', 'square', 'triangle', 'l1', 'r1', 'l2', 'r2', 'l3', 'r3', 'options', 'touchpad_center',
                'pad_up', 'pad_down', 'pad_left', 'pad_right',
                'axis_left_y_minus', 'axis_left_y_plus', 'axis_left_x_minus', 'axis_left_x_plus',
@@ -182,7 +162,7 @@ KBD_DEFAULTS = dict(cross='n', circle='b', square='v', triangle='c', l1='q', r1=
                     options='enter', touchpad_center='space', pad_up='up', pad_down='down', pad_left='left', pad_right='right',
                     axis_left_y_minus='w', axis_left_y_plus='s', axis_left_x_minus='a', axis_left_x_plus='d',
                     axis_right_y_minus='i', axis_right_y_plus='k', axis_right_x_minus='j', axis_right_x_plus='l')
-KBD_INI = os.path.join(ROOT, 'user', 'input_config', 'default.ini')
+KBD_INI = os.path.join(core.USER, 'input_config', 'default.ini')
 
 # Tk keysym -> shadPS4 key name (input_handler.h). Cyrillic keysyms map to the same physical key (ЙЦУКЕН).
 _KEYSYMS = {'space': 'space', 'return': 'enter', 'backspace': 'backspace', 'tab': 'tab', 'up': 'up', 'down': 'down',
@@ -673,7 +653,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk(className='nhl24-launcher')
         self.root.withdraw()
-        self.root.title('NHL 24 PC  V3.2')
+        self.root.title('NHL 24 PC v' + core.PORT_VERSION)
         self.root.configure(bg=hx(BG))
         self.root.resizable(False, False)
         self.root.update_idletasks()
@@ -688,7 +668,6 @@ class App:
         self.eboot = core.eboot_path()
         self.sfo = core.sfo_file(os.path.join(os.path.dirname(self.eboot), 'sce_sys', 'param.sfo'))
         self.has_update = os.path.isfile(os.path.join(core.UPDATE, 'eboot.bin')) or self.sfo.get('APP_VER') == '01.60'
-        self.pascal = core.test_pascal()
         self.proc = None
         icon = next((p for p in (os.path.join(core.UPDATE, 'sce_sys', 'icon0.png'),
                                  os.path.join(core.GAME, 'sce_sys', 'icon0.png')) if os.path.isfile(p)), None)
@@ -801,8 +780,9 @@ class App:
         self.btn_play = sf.add(Button(P(28), P(448), P(328), P(66), '', F.play, BG, P(10), self.on_play,
                                       fill=mix(RED, WHITE, 0.08), fill2=RED_DK, hover=mix(RED, WHITE, 0.22),
                                       hover2=mix(RED_DK, WHITE, 0.12), border=None, color=WHITE, shine=True))
-        self.btn_guide = sf.add(Button(P(28), P(524), P(160), P(36), '', F.btn, BG, P(8), self.on_guide))
-        self.btn_logs = sf.add(Button(P(196), P(524), P(160), P(36), '', F.btn, BG, P(8), self.on_report))
+        self.btn_install = sf.add(Button(P(28), P(524), P(104), P(36), '', F.small, BG, P(8), self.on_install))
+        self.btn_guide = sf.add(Button(P(140), P(524), P(104), P(36), '', F.small, BG, P(8), self.on_guide))
+        self.btn_logs = sf.add(Button(P(252), P(524), P(104), P(36), '', F.small, BG, P(8), self.on_report))
 
         cA, cB, cW, y0 = 404, 744, 316, 56
         iw = cW - 32
@@ -841,23 +821,18 @@ class App:
         self.btn_kbd = cbtn(c, cW - 16 - 120, 10, 120, 28, self.on_keyboard)
         self.l_fps = clab(c, 16, 46, iw, 18, F.label, MUTED)
         self.cb_fps = combo(c, 16, 66, iw)
-        self.chk_menu = toggle(c, 16, 112, iw, 30)
-        self.chk_vsync = toggle(c, 16, 142, iw, 30)
+        self.chk_vsync = toggle(c, 16, 124, iw, 30)
         # GRAPHICS
         c = card(cB, y0, cW, 236)
         self.h_q = clab(c, 18, 14, 120, 22, F.head, ACCENT)
         self.btn_weak = cbtn(c, cW - 16 - 160, 10, 160, 28, self.on_weak, color=WARN)
-        self.chk_pro = toggle(c, 16, 48, iw, 30)
-        self.chk_aniso = toggle(c, 16, 80, iw, 30)
-        self.chk_fsr = toggle(c, 16, 112, iw, 30)
-        self.l_sharp = clab(c, 16, 150, iw, 18, F.label, MUTED)
-        self.cb_sharp = combo(c, 16, 170, iw)
+        self.chk_pro = toggle(c, 16, 64, iw, 30)
+        self.chk_fsr = toggle(c, 16, 116, iw, 30)
         # STABILITY
         c = card(cB, y0 + 248, cW, 244)
         self.h_s = clab(c, 18, 14, 200, 22, F.head, ACCENT)
-        self.chk_stable = toggle(c, 16, 46, iw, 44)
-        self.chk_gpu = toggle(c, 16, 94, iw, 44, on_change=self.on_gpu_toggle)
-        self.chk_diag = toggle(c, 16, 142, iw, 30)
+        self.chk_stable = toggle(c, 16, 58, iw, 44)
+        self.chk_diag = toggle(c, 16, 122, iw, 30)
 
         # footer
         yF = P(564)
@@ -877,18 +852,14 @@ class App:
         self.cb_win.index = 0 if s['fullscreen'] else 1
         self.cb_hdr.index = 1 if s.get('hdr') == 'on' else 0
         self.cb_fps.index = FPS_VALS.index(int(s['fps'])) if int(s['fps']) in FPS_VALS else 2
-        self.cb_sharp.index = SHARP_KEYS.index(s['sharpness']) if s['sharpness'] in SHARP_KEYS else 1
         self.chk_ru.checked = self.has_update and bool(s['ru_text'])
         self.chk_ru.enabled = self.has_update
         self.chk_vsync.checked = bool(s['vsync'])
-        self.chk_menu.checked = bool(s['menu_full_fps'])
         self.chk_pro.checked = False
         self.chk_pro.enabled = False          # PS4 Pro (neo) mode crashes the Linux build
-        self.chk_aniso.checked = bool(s['aniso16'])
         self.chk_fsr.checked = bool(s['fsr'])
         self.chk_diag.checked = bool(s['diag'])
         self.chk_stable.checked = bool(s['stable'])
-        self.chk_gpu.checked = (s.get('gpu10_fix', True) is not False) if self.pascal else bool(s.get('gpu10_other'))
         self.apply_language()
 
         self.root.bind('<Return>', lambda e: self.on_play())
@@ -899,7 +870,7 @@ class App:
     def play_time(self):
         sec = 0
         try:
-            for line in open(os.path.join(ROOT, 'user', 'play_time.txt'), encoding='utf-8', errors='replace'):
+            for line in open(os.path.join(core.USER, 'play_time.txt'), encoding='utf-8', errors='replace'):
                 m = re.match(r'^\S+\s+(\d+):(\d+):(\d+)', line)
                 if m:
                     sec += int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
@@ -910,20 +881,20 @@ class App:
     def apply_language(self):
         L = self.L
         sets = [(self.h_screen, 'display'), (self.l_res, 'resolution'), (self.l_mode, 'mode'), (self.l_hdr, 'hdr'),
-                (self.h_fps, 'frames'), (self.l_fps, 'fpscap'), (self.h_q, 'quality'), (self.l_sharp, 'sharp'),
-                (self.h_s, 'stability'), (self.chk_menu, 'menu'), (self.chk_vsync, 'vsync'), (self.chk_pro, 'pro'),
-                (self.chk_aniso, 'aniso'), (self.chk_fsr, 'fsr'), (self.chk_diag, 'diag'), (self.chk_stable, 'stable'),
-                (self.btn_play, 'play'), (self.btn_guide, 'guide'), (self.btn_logs, 'logs'), (self.btn_weak, 'weak'),
-                (self.lbl_edition, 'edition')]
+                (self.h_fps, 'frames'), (self.l_fps, 'fpscap'), (self.h_q, 'quality'),
+                (self.h_s, 'stability'), (self.chk_vsync, 'vsync'), (self.chk_pro, 'pro'),
+                (self.chk_fsr, 'fsr'), (self.chk_diag, 'diag'), (self.chk_stable, 'stable'),
+                (self.btn_play, 'play'), (self.btn_install, 'install'), (self.btn_guide, 'guide'),
+                (self.btn_logs, 'logs'), (self.btn_weak, 'weak')]
         for w, k in sets:
             w.text = L(k)
+        self.lbl_edition.text = L('edition').format(core.PORT_VERSION)
         self.cb_res.items, self.cb_win.items, self.cb_hdr.items = L('res'), L('modes'), L('hdrs')
-        self.cb_fps.items, self.cb_sharp.items = L('fps'), L('sharps')
+        self.cb_fps.items = L('fps')
         self.chk_ru.text = L('rutext') if self.has_update else L('rutextNeed')
-        self.chk_gpu.text = L('gpu10') if self.pascal else L('gpu10No')
-        for w, k in ((self.chk_ru, 'rutextTip'), (self.chk_menu, 'menuTip'), (self.chk_pro, 'proTip'),
-                     (self.chk_aniso, 'anisoTip'), (self.chk_fsr, 'fsrTip'), (self.chk_diag, 'diagTip'),
-                     (self.chk_stable, 'stableTip'), (self.chk_gpu, 'gpu10Tip')):
+        for w, k in ((self.chk_ru, 'rutextTip'), (self.chk_pro, 'proTip'),
+                     (self.chk_fsr, 'fsrTip'), (self.chk_diag, 'diagTip'),
+                     (self.chk_stable, 'stableTip')):
             w.tip = L(k)
         self.btn_kbd.text = '\u2328  ' + L('kbd')
         self.lbl_time.text = self.play_time()
@@ -997,35 +968,72 @@ class App:
         return result[0]
 
     # ----- handlers -----
-    def on_gpu_toggle(self, t):
-        if self.pascal and not t.checked:
-            if self.msg(self.L('gpu10Warn'), buttons=('yes', 'no')) != 'yes':
-                t.set(True)
-        elif not self.pascal and t.checked:
-            if self.msg(self.L('gpu10Other'), buttons=('yes', 'no')) != 'yes':
-                t.set(False)
-
     def on_weak(self):
         v = core.vram_gb()
         self.cb_res.select(0 if 0 < v <= 4 else 1)
         self.cb_fps.select(0)
-        self.chk_menu.set(False)
-        self.chk_aniso.set(False)
-        self.cb_sharp.select(0)
+        self.chk_fsr.set(True)
         self.chk_diag.set(False)
         self.chk_stable.set(True)
         self.msg(self.L('weakDone'))
 
+    def on_install(self):
+        if not self.btn_install.enabled:
+            return
+        core.refresh_runtime_paths()
+        if not os.access(core.EMU, os.X_OK):
+            self.msg(self.L('msgNoEmu'))
+            return
+        pkg = filedialog.askopenfilename(parent=self.root, title=self.L('installTitle'),
+                                         filetypes=[('PS4 package', '*.pkg'), ('All files', '*')])
+        if not pkg:
+            return
+        self.btn_install.enabled = False
+        self.btn_install.text = self.L('installing')
+        self.btn_install.redraw()
+        os.makedirs(os.path.join(core.USER, 'log'), exist_ok=True)
+        log_path = os.path.join(core.USER, 'log', 'install-gui.log')
+
+        def install():
+            with open(log_path, 'w', encoding='utf-8') as log:
+                result = subprocess.run([sys.executable, os.path.join(SCRIPT_ROOT, 'nhl24-linux.py'),
+                                         'install', pkg], cwd=core.DATA_ROOT, stdout=log,
+                                        stderr=subprocess.STDOUT)
+            self.root.after(0, lambda: finished(result.returncode))
+
+        def finished(code):
+            self.btn_install.enabled = True
+            self.eboot = core.eboot_path()
+            self.sfo = core.sfo_file(os.path.join(os.path.dirname(self.eboot), 'sce_sys', 'param.sfo'))
+            self.has_update = (os.path.isfile(os.path.join(core.UPDATE, 'eboot.bin')) or
+                               self.sfo.get('APP_VER') == '01.60')
+            self.chk_ru.enabled = self.has_update
+            self.apply_language()
+            if code == 0:
+                self.msg(self.L('installDone'))
+                return
+            try:
+                with open(log_path, encoding='utf-8', errors='replace') as log:
+                    detail = log.read()[-6000:].strip()
+            except OSError as e:
+                detail = str(e)
+            self.msg(self.L('installFail').format(detail or 'exit code %d' % code))
+
+        threading.Thread(target=install, daemon=True).start()
+
     def on_guide(self):
         ru = self.set['lang'] == 'ru'
         names = [self.L('readme'), 'LINUX_RU.md' if ru else 'LINUX.md', 'LINUX.md' if ru else 'LINUX_RU.md']
+        resource_root = os.environ.get('NHL24_RESOURCE_ROOT')
         for n in names:
-            for d in (ROOT, os.path.join(ROOT, 'docs', 'linux')):
+            for d in (SCRIPT_ROOT, resource_root, os.path.join(core.REPO_ROOT, 'docs', 'linux')):
+                if not d:
+                    continue
                 g = os.path.join(d, n)
                 if os.path.isfile(g):
                     open_path(g)
                     return
-        self.msg(self.L('noGuide').format(os.path.join(ROOT, names[0])))
+        self.msg(self.L('noGuide').format(os.path.join(SCRIPT_ROOT, names[0])))
 
     def on_support(self):
         P, F = self.P, self.F
@@ -1164,7 +1172,8 @@ class App:
                 'Game: %s v%s' % (self.sfo.get('TITLE_ID'), self.sfo.get('APP_VER'))]
         try:
             st = os.stat(core.EMU)
-            info.append('Emulator: nhl24-linux %s %d' % (time.strftime('%Y-%m-%d %H:%M', time.localtime(st.st_mtime)), st.st_size))
+            info.append('Emulator: %s %s %d' % (os.path.basename(core.EMU),
+                        time.strftime('%Y-%m-%d %H:%M', time.localtime(st.st_mtime)), st.st_size))
         except OSError:
             pass
         try:
@@ -1187,10 +1196,10 @@ class App:
         vk = run('vulkaninfo', '--summary')
         if vk:
             info += ['', '--- vulkaninfo --summary ---', vk]
-        info.append('Install path: ' + ROOT)
+        info.append('Install path: ' + core.DATA_ROOT)
         with zipfile.ZipFile(z, 'w', zipfile.ZIP_DEFLATED) as zf:
             for f in files:
-                p = os.path.join(ROOT, f)
+                p = os.path.join(core.DATA_ROOT, f)
                 if os.path.isfile(p):
                     try:
                         zf.write(p, os.path.basename(p))
@@ -1215,19 +1224,10 @@ class App:
         s['hdr'] = ['off', 'on'][max(0, self.cb_hdr.index)]
         s['vsync'] = self.chk_vsync.checked
         s['fps'] = FPS_VALS[max(0, self.cb_fps.index)]
-        s['menu_full_fps'] = self.chk_menu.checked
-        s['ps4pro'] = False
-        s['aniso16'] = self.chk_aniso.checked
         s['fsr'] = self.chk_fsr.checked
-        s['sharpness'] = SHARP_KEYS[max(0, self.cb_sharp.index)]
         s['diag'] = self.chk_diag.checked
         s['stable'] = self.chk_stable.checked
-        s['redzone'] = False
         s['ru_text'] = self.chk_ru.checked
-        if self.pascal:
-            s['gpu10_fix'] = self.chk_gpu.checked
-        else:
-            s['gpu10_other'] = self.chk_gpu.checked
         core.save_settings(s)
 
     def on_play(self):
@@ -1244,10 +1244,11 @@ class App:
             return
         try:
             self.collect()
-            env = core.prepare_launch(self.set, pascal=self.pascal)
-            os.makedirs(os.path.join(ROOT, 'user', 'log'), exist_ok=True)
-            log = open(os.path.join(ROOT, 'user', 'log', 'linux_run.log'), 'w')
-            self.proc = subprocess.Popen([core.EMU], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+            env = core.prepare_launch(self.set)
+            os.makedirs(os.path.join(core.USER, 'log'), exist_ok=True)
+            log = open(os.path.join(core.USER, 'log', 'linux_run.log'), 'w')
+            self.proc = subprocess.Popen(core.emulator_launch_args(), cwd=core.DATA_ROOT, env=env,
+                                         stdout=log, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL)
         except Exception as e:
             self.msg(self.L('msgFail') + str(e))
@@ -1256,7 +1257,7 @@ class App:
         self.toast()
 
     def shader_count(self):
-        d = os.path.join(ROOT, 'user', 'cache', self.sfo.get('TITLE_ID') or 'CUSA37934')
+        d = os.path.join(core.USER, 'cache', self.sfo.get('TITLE_ID') or 'CUSA37934')
         try:
             return sum(1 for f in os.listdir(d) if f.endswith('.spv'))
         except OSError:
@@ -1315,7 +1316,7 @@ class App:
 
     def after_game(self):
         code = self.proc.returncode
-        log = os.path.join(ROOT, 'user', 'log', 'shad_log.txt')
+        log = os.path.join(core.USER, 'log', 'shad_log.txt')
 
         def tail(n):
             try:

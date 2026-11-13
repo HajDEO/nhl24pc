@@ -117,7 +117,8 @@ public:
         for (auto& export_mod : exports) {
             for (auto& module : m_modules) {
                 const auto imports = module->GetImportModules();
-                if (std::ranges::contains(imports, export_mod.name, &ModuleInfo::name)) {
+                if (std::ranges::find(imports, export_mod.name, &ModuleInfo::name) !=
+                    imports.end()) {
                     Relocate(module.get());
                 }
             }

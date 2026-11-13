@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NHL 24 PC
+Comment=Play NHL 24 through the native Linux port
+Exec=nhl24-pc
+Icon=nhl24-pc
+Terminal=false
+Categories=Game;SportsGame;
+Keywords=nhl;hockey;sports;
+StartupWMClass=nhl24-launcher

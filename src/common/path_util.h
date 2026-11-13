@@ -58,6 +58,8 @@ constexpr auto LICENSES_DIR = "licenses";
 // Filenames
 constexpr auto LOG_FILE = "shad_log.txt";
 
+[[nodiscard]] std::filesystem::path GetExecutableDirectory();
+
 /**
  * Validates a given path.
  *

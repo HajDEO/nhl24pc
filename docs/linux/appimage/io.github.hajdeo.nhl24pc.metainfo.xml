@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hajdeo.nhl24pc</id>
+  <name>NHL 24 PC</name>
+  <summary>Native Linux port for NHL 24</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-2.0-or-later</project_license>
+  <developer id="io.github.hajdeo">
+    <name>HajDEO</name>
+  </developer>
+  <description>
+    <p>NHL 24 PC provides a native Linux launcher and emulator integration for installing and playing a legally dumped NHL 24 PlayStation 4 package.</p>
+  </description>
+  <launchable type="desktop-id">io.github.hajdeo.nhl24pc.desktop</launchable>
+  <url type="homepage">https://github.com/HajDEO/nhl24pc</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>nhl24-pc</binary>
+  </provides>
+</component>

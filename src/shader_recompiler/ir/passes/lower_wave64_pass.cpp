@@ -103,7 +103,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
             break;
         case Type::Loop: {
             const bool divergent =
-                std::ranges::contains(divergent_loops, node.data.loop.merge);
+                std::ranges::find(divergent_loops, node.data.loop.merge) != divergent_loops.end();
             loops.push_back({node.data.loop.merge, divergent});
             divergence_depth += static_cast<u32>(divergent);
             break;
@@ -162,7 +162,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     std::vector<IR::Inst*> worklist;
     const auto uniform_blocks = FindUniformBlocks(program);
     for (IR::Block* block : program.blocks) {
-        const bool is_uniform = std::ranges::contains(uniform_blocks, block);
+        const bool is_uniform = std::ranges::find(uniform_blocks, block) != uniform_blocks.end();
         const auto push_worklist = [&](IR::Inst& inst) {
             if (is_uniform) {
                 worklist.push_back(&inst);
@@ -183,8 +183,8 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
                 }
             } else if (inst.GetOpcode() == IR::Opcode::MaskedBitCount32) {
                 IR::Inst* const ballot = FindBallotForMaskedBitCount(inst);
-                if (ballot == nullptr ||
-                    std::ranges::contains(uniform_blocks, ballot->GetParent())) {
+                if (ballot == nullptr || std::ranges::find(uniform_blocks, ballot->GetParent()) !=
+                                             uniform_blocks.end()) {
                     worklist.push_back(&inst);
                 }
             }

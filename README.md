@@ -1,9 +1,9 @@
 # NHL24 PC
 
-**NHL 24 (PS4, CUSA37933 / CUSA37934) running natively on Windows** – a single-game fork of the
+**NHL 24 (PS4, CUSA37933 / CUSA37934) running natively on Windows and Linux x86-64** – a single-game fork of the
 [shadPS4](https://github.com/shadps4-emu/shadPS4) emulator, tuned and fixed for one title, with a launcher
 that extracts the game from your own PKG and starts it. No console, no CPU emulation: the game's x86-64
-code runs directly on your processor, the PS4 system libraries are replaced by native Windows
+code runs directly on your processor, the PS4 system libraries are replaced by native host
 implementations, and the GPU work goes through Vulkan.
 
 > Slovenská verzia je nižšie: [Slovensky](#slovensky). Video: https://youtu.be/eGo1-W3FaYw
@@ -11,9 +11,9 @@ implementations, and the GPU work goes through Vulkan.
 | | |
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
-| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
-| Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.2b** (2026-11-03), Windows 10/11 x64 |
+| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (Windows) or the AppImage/Ubuntu 24.04 x86-64 artifacts from the latest successful **Build** workflow |
+| Ready-to-run package | Windows: [`release/`](release). Linux: one-file AppImage or a portable native archive with CLI/Tk launchers |
+| Current build | **v0.9.2b** (2026-11-03), Windows 10/11 and Linux x86-64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -49,7 +49,7 @@ so this port **does not emulate a CPU**: the game code is loaded into the proces
 CPU directly, at native speed. What the emulator provides is everything around it:
 
 - **HLE of the PS4 operating system** – kernel calls, threads, memory, files, audio (AJM), pads, video
-  output, trophies, saves… are implemented as native Windows code (shadPS4's "libraries"). NHL 24 needs
+  output, trophies, saves… are implemented as native host code (shadPS4's "libraries"). NHL 24 needs
   about 91 % of its imports resolved by HLE; the rest comes from the game's own modules.
 - **GPU** – the PS4's GCN command streams are interpreted by a command-processor thread, the GCN
   shaders are recompiled to SPIR-V and executed through Vulkan, with a texture/buffer cache keeping guest
@@ -61,11 +61,10 @@ CPU directly, at native speed. What the emulator provides is everything around i
   fixes, wave64 lowering fixes, a GPU-thread idle backoff and pending-ops polling that halve the idle CPU
   load, a diagnostics suite (frame trace, draw log, image/buffer dumps, hotkey capture) compiled in but
   off by default, and memory patches (`game_patches/nhl24.xml`, loaded automatically from
-  `user\patches\`).
-- **Launcher** (`launcher/`, C# WinForms, needs only the .NET Framework 4 that ships with Windows):
-  extracts the base/update PKG with shadPS4's PKG/PFS code built into `nhl24.exe`
-  (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
-  fullscreen, vsync, sharpening, language, controls, the Windows red-zone protection) and starts the game.
+  `user/patches/`).
+- **Launchers**: Windows uses the C# WinForms launcher in `launcher/`; Linux uses the standard-library
+  CLI and optional Tk launcher in `docs/linux/`. Both call the PKG/PFS extractor built into the native
+  `nhl24` executable, manage the base game and update, expose supported settings and start the game.
 
 ## What's new in v0.9.2b
 
@@ -101,6 +100,8 @@ CPU directly, at native speed. What the emulator provides is everything around i
 
 ## Playing
 
+### Windows
+
 1. Download `NHL24-PC-v0.9.2b.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
@@ -118,17 +119,45 @@ First run: saves, the profile and the shader cache are created under `user\`. Th
 while the shaders compile; afterwards the game runs at 50–60 fps on a mid-range GPU (Ryzen 5 4500 +
 RTX 5060: 51 fps in play, 30 fps locked in menus and cutscenes, like the console).
 
-**Requirements**: Windows 10/11 x64; a Vulkan 1.3 GPU with current drivers (NVIDIA GTX 10xx/RTX,
-AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 GB free for the
-extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
-too.
+### Linux
+
+Use the `nhl24-pc-appimage-x86_64` artifact from the latest successful **Build** workflow, make the
+contained file executable, and run it:
+
+```bash
+chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
+./NHL24-PC-v0.9.2b-x86_64.AppImage
+```
+
+The AppImage stores its writable game data under `~/.local/share/nhl24pc`. The portable
+`nhl24-pc-ubuntu-24.04-x64` archive remains available; unpack it to a writable directory and run:
+
+```bash
+./nhl24-launcher.py
+```
+
+The Tk launcher can install your base and update PKGs and start the game. The command-line equivalent
+works without Tk:
+
+```bash
+./nhl24-linux.py install /path/to/base.pkg /path/to/update.pkg
+./nhl24-linux.py play
+```
+
+See [the native Linux guide](docs/linux/LINUX.md) for distro dependencies, desktop integration,
+Wayland/X11 notes and troubleshooting. Wine is not used.
+
+**Requirements**: Windows 10/11 x64 or a current x86-64 Linux distribution; an x86-64-v3 CPU (Intel
+Haswell or AMD Excavator and newer); a Vulkan 1.3 GPU with current drivers (NVIDIA GTX 10xx/RTX, AMD
+RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 GB free for the extracted
+game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works too.
 
 **Known issues** (v0.9.2b): on 8 GB graphics cards the video memory use can exceed the card's budget in
 long sessions (the driver then moves part of it to system RAM, which costs performance); rare "device
 lost" crashes. If the game
 crashes while a match loads (right after team selection, error 0xc0000005, issues #1/#3), turn on **Red zone
 protection (Windows)** in the launcher's quick settings (off by default, experimental; see `docs/DEVLOG.sk.md`,
-section "v0.8.3: ochrana red zone"). Windows SmartScreen may warn about the unsigned exe
+section "v0.8.3: ochrana red zone"). This option is Windows-only. Windows SmartScreen may warn about the unsigned exe
 (More info → Run anyway); some antivirus products dislike emulators that map large memory regions – add
 an exception if needed.
 
@@ -137,6 +166,7 @@ an exception if needed.
 ```
 release/        ready-to-run package (binaries + clean user template), rebuilt by tools\make_release.ps1
 launcher/       launcher sources (Launcher.cs), pictures, icon, build script (csc from .NET Framework)
+docs/linux/     native Linux CLI/Tk launchers, packaging script and user guides
 src/            emulator sources (shadPS4 fork; NHL-specific changes are marked "nhlport")
 externals/      third-party libraries as git submodules (clone with --recursive)
 game_patches/   nhl24.xml – memory patches applied by the emulator at start
@@ -147,7 +177,9 @@ documents/      shadPS4's own documentation and README
 
 ## Building
 
-Only needed to change the emulator or the launcher; players use `release/`.
+Only needed to change the emulator or launcher; players can use a release/workflow artifact.
+
+### Windows
 
 - Windows 10/11, [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
   (MSVC v143 + Windows SDK), [LLVM](https://github.com/llvm/llvm-project/releases) (clang-cl, lld),
@@ -157,6 +189,15 @@ Only needed to change the emulator or the launcher; players use `release/`.
 - `powershell -ExecutionPolicy Bypass -File launcher\build_launcher.ps1` → `build\launcher.exe`
 - `powershell -ExecutionPolicy Bypass -File tools\make_release.ps1` → refreshes `release\`
 
+### Linux
+
+- Install CMake 3.24+ and the compiler/development packages listed in [the Linux build guide](documents/building-linux.md).
+- `git clone --recursive https://github.com/HajDEO/nhl24pc.git`
+- `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`
+- `cmake --build build --parallel` → `build/nhl24`
+- `docs/linux/make-linux-repack.sh build/nhl24` → a redistributable Linux archive
+- `docs/linux/make-linux-appimage.sh build/nhl24` → a self-contained x86-64 AppImage
+
 Development notes: `tools\run_nhl24.ps1` runs the build with the diagnostics log enabled
 (`NHLPORT_DIAG=1`; F1 captures a frame: draw log, image dumps, screenshot), `tools\measure_nhl24.ps1`
 scripts measurement runs, `tools\capture_report.py` summarises a capture. The version lives in
@@ -165,7 +206,7 @@ scripts measurement runs, `tools\capture_report.py` summarises a capture. The ve
 ## Contributing
 
 Issues and pull requests are welcome – performance, the open rendering issues above, DualSense
-features, Linux. Keep changes focused; NHL-specific code is marked `nhlport` in comments so it can be
+features and platform support. Keep changes focused; NHL-specific code is marked `nhlport` in comments so it can be
 told apart from upstream shadPS4. Please do not upload game files, PKGs, saves or shader caches.
 
 ## Legal
@@ -180,7 +221,7 @@ under the same license, see `LICENSE` and `LICENSES/`.
 
 ## Slovensky
 
-**NHL 24 (PS4) bežiace natívne na Windows.** Fork emulátora shadPS4 doladený pre jednu hru plus
+**NHL 24 (PS4) bežiace natívne na Windows a Linuxe x86-64.** Fork emulátora shadPS4 doladený pre jednu hru plus
 launcher, ktorý hru rozbalí z vášho PKG a spustí. Kód hry (x86-64) beží priamo na procesore bez emulácie
 CPU; systémové knižnice PS4 sú nahradené natívnou implementáciou (HLE) a grafika ide cez Vulkan
 s prekladom shaderov GCN → SPIR-V.
@@ -226,10 +267,13 @@ s prekladom shaderov GCN → SPIR-V.
 nainštalovať rovnako; od v0.9.0 port podporuje verziu hry 1.00 aj 1.60. Podporovaná je americká
 (CUSA37933) aj európska verzia (CUSA37934, od v0.9.0); update 1.60 je zatiaľ overený len na americkej.
 Uložené pozície, profil a shader cache vznikajú v `user\`; prvé minúty sa hra zasekáva (kompilácia
-shaderov), potom beží plynulo.
+shaderov), potom beží plynulo. Na Linuxe použite balík `nhl24-pc-ubuntu-24.04-x64` z úspešného
+**Build** workflow a `nhl24-launcher.py`; podrobný postup je v
+[`docs/linux/LINUX.md`](docs/linux/LINUX.md).
 
-**Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
-asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
+**Požiadavky:** Windows 10/11 x64 alebo aktuálny Linux x86-64, procesor x86-64-v3 (Intel Haswell alebo
+AMD Excavator a novší), GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM, asi 40 GB miesta
+na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
 **Známe problémy (v0.9.2b):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
 prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon), zriedkavé
@@ -237,6 +281,6 @@ pády „device lost“. Ak hra padá pri načítaní zápasu (hneď po
 výbere tímov, chyba 0xc0000005), zapnite v launcheri **Ochrana red zone (Windows)** (predvolene vypnuté,
 experimentálne; rozbor v `docs/DEVLOG.sk.md`, sekcia „v0.8.3: ochrana red zone“).
 
-**Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,
-skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Build: `tools\build_nhlport.ps1`,
-`launcher\build_launcher.ps1`, balík: `tools\make_release.ps1`.
+**Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launchery v `launcher/`
+a `docs/linux/`, skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Windows build:
+`tools\build_nhlport.ps1`; Linux build je opísaný v `documents/building-linux.md`.

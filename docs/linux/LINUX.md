@@ -1,173 +1,193 @@
-# NHL24 PC on Linux (native build)
+# NHL24 PC on Linux
 
-Status: **works** — the native Linux build of this fork runs NHL 24 (menus, matches, Russian
-text). Installing, patching, settings and launching are done by two Python scripts, with no
-Wine, PowerShell or .NET. The Windows build under Wine does **not** work (see "Wine" below).
+NHL24 PC runs as a native Linux application. Wine, PowerShell and the Windows launcher are not
+required. The Linux package contains the emulator, a Tk launcher, a command-line installer, a clean
+portable configuration and the current NHL 24 memory patch. You must supply your own legally dumped
+NHL 24 PKG.
 
-## Tested setup
+Supported game packages:
 
-| | |
-|---|---|
-| Distro | Gentoo Linux (systemd) |
-| CPU / GPU | Ryzen 7 9700X (iGPU present) / Radeon RX 9060 XT |
-| Driver | Mesa RADV 26.1.8, Vulkan 1.4 |
-| Compiler | clang 23.1, CMake 4.3, Ninja 1.13 |
-| Python | 3.14 with Tk 8.6 |
-| Game | CUSA37934, base 1.00 + update 1.60 |
-| Source | `main` as of 2026-11-01 |
+- CUSA37933 (US) and CUSA37934 (EU)
+- base game 01.00
+- update 01.60
 
-## 1. Build the emulator
+## Requirements
 
-Dependencies (Gentoo names; other distros: same as upstream shadPS4):
-`llvm-core/clang dev-build/cmake dev-build/ninja dev-vcs/git dev-util/vulkan-headers
-media-libs/vulkan-loader media-libs/alsa-lib media-video/pipewire dev-libs/openssl
-dev-libs/libevdev virtual/libudev x11-libs/libXext x11-libs/libXrandr media-libs/libpng
-sys-apps/util-linux`
+- x86-64 Linux on an x86-64-v3 CPU (Intel Haswell or AMD Excavator and newer)
+- a Vulkan 1.3-capable GPU with current drivers
+- 8 GB RAM minimum; 16 GB recommended
+- about 40 GB free for the extracted game
+- Python 3.8 or newer
+- Tk 8.6 for the graphical launcher (`python3-tk` on Debian/Ubuntu, `tk` on Arch)
+- CMake 3.24 or newer when building from source
+
+The emulator build dependencies are the same as upstream shadPS4. Common packages are shown below.
+
+Debian/Ubuntu:
+
+```bash
+sudo apt install build-essential clang clang-tools git cmake ninja-build libasound2-dev libpulse-dev \
+  libopenal-dev libssl-dev zlib1g-dev libedit-dev libudev-dev libevdev-dev libsdl2-dev \
+  libjack-dev libsndio-dev libvulkan-dev vulkan-validationlayers libpng-dev uuid-dev python3-tk
+```
+
+Ubuntu 22.04's repository contains CMake 3.22, which is too old. Install a current CMake release or
+build in a newer distro/container.
+
+Fedora:
+
+```bash
+sudo dnf install clang git cmake ninja-build alsa-lib-devel pipewire-jack-audio-connection-kit-devel \
+  openal-soft-devel openssl-devel libevdev-devel systemd-devel libXext-devel libXcursor-devel \
+  libXi-devel libXrandr-devel vulkan-devel vulkan-validation-layers libpng-devel libuuid-devel \
+  python3-tkinter
+```
+
+Arch Linux:
+
+```bash
+sudo pacman -S base-devel clang git cmake ninja sdl2 vulkan-validation-layers libpng util-linux python tk
+```
+
+## Build
+
+Clone all submodules, configure and build:
 
 ```bash
 git clone --recursive https://github.com/HajDEO/nhl24pc.git
 cd nhl24pc
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-cmake --build build -j$(nproc)
+cmake --build build --parallel "$(nproc)"
 ```
 
-Builds without changes; the result is `build/nhl24`.
+The native executable is `build/nhl24`. No additional patch is required: build the current branch
+directly.
 
-**Recommended: apply the repack's emulator changes.** The NHL24PC V3.2 repack ships its
-emulator changes as sources (`source_changes/`, 41 files on top of commit `bef79997`).
-`nhl24pc-v3.2-repack.patch` in this folder is the same changes as one patch. Without it the
-launcher's `NHLPORT_*` switches (anisotropy, LOD bias, menu frame rate, image pool, GTX 10xx fix,
-GPU checkpoints) do nothing, and the texture-cache overlap that crashes PS4 Pro mode is not handled.
+## Create a portable Linux package
+
+From the repository root, after building:
 
 ```bash
-git checkout bef7999707db27884cabe5780f301c4a5d2abdc8
-git apply /path/to/nhl24pc-v3.2-repack.patch
-cmake --build build -j$(nproc)
+./docs/linux/make-linux-repack.sh
 ```
 
-Not built on Linux yet: the patch keeps Windows-only parts under `#ifdef _WIN32`, but compile
-errors are possible.
-
-## 2. Install the game
-
-Put the scripts from this folder and the emulator into the game folder:
-
-```
-NHL24/
-  nhl24-linux          <- build/nhl24, copied/renamed
-  nhl24-linux.py       <- installer, patches, text-mode settings
-  nhl24-launcher.py    <- launcher window (optional)
-```
+The script creates `NHL24-PC-Linux-v<version>.tar.gz` in the current directory using only files from
+this repository. To use another binary or output path:
 
 ```bash
-cd NHL24
+./docs/linux/make-linux-repack.sh /path/to/nhl24 /path/to/NHL24-PC-Linux.tar.gz
+```
+
+Extract the archive somewhere writable. Keep its `nhl24`, Python scripts and `user/` directory
+together.
+
+The workflow's prebuilt artifact is named `nhl24-pc-ubuntu-24.04-x64-...` because Ubuntu 24.04 is its
+binary compatibility baseline. Build from source for older distributions. `BUILD-INFO.txt` inside the
+archive records the exact source commit and required glibc/libstdc++ symbol versions.
+
+## AppImage
+
+The workflow also produces `NHL24-PC-v<version>-x86_64.AppImage`. It contains the emulator, Python,
+Tk, launchers, configuration template and game patch in one executable file. GPU drivers remain
+provided by the host system.
+
+```bash
+chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
+./NHL24-PC-v0.9.2b-x86_64.AppImage
+```
+
+The AppImage is read-only, so installed games, saves, settings and logs are kept in
+`${XDG_DATA_HOME:-$HOME/.local/share}/nhl24pc`. Put that data on another drive by supplying an
+absolute path:
+
+```bash
+NHL24_DATA_ROOT=/mnt/games/NHL24-PC ./NHL24-PC-v0.9.2b-x86_64.AppImage
+```
+
+The same file exposes the command-line installer:
+
+```bash
+./NHL24-PC-v0.9.2b-x86_64.AppImage install /path/to/base.pkg /path/to/update.pkg
+./NHL24-PC-v0.9.2b-x86_64.AppImage play
+```
+
+To build an AppImage after compiling `build/nhl24`, install `python3-tk`, `curl` and
+`desktop-file-utils`, then run:
+
+```bash
+./docs/linux/make-linux-appimage.sh build/nhl24
+```
+
+The packager downloads pinned linuxdeploy, appimagetool and AppImage runtime releases and verifies
+their published SHA-256 hashes. Like the tar package, the workflow AppImage uses Ubuntu 24.04 as its
+binary compatibility baseline.
+
+## Install and play
+
+Graphical launcher:
+
+```bash
+./nhl24-launcher.py
+```
+
+Click **Install PKG** and select the base-game PKG. After it finishes, use the same button to install
+the 01.60 update. The installer checks the package type and region and extracts updates into the
+`game-UPDATE/` overlay. Click **PLAY** to start.
+
+Command-line equivalent:
+
+```bash
+./nhl24-linux.py install /path/to/base.pkg
+./nhl24-linux.py update /path/to/update.pkg
+./nhl24-linux.py play
+```
+
+The command-line installer can also install both packages in one operation:
+
+```bash
 ./nhl24-linux.py install /path/to/base.pkg /path/to/update.pkg
 ```
 
-This does what the Windows installer does:
+Other commands:
 
-* extracts both PKGs with the emulator's own extractor (`nhl24-linux --extract-pkg`)
-  into `game/` and `game-UPDATE/`, checking PKG type and region;
-* patches `eboot.bin` by byte signature (backup in `eboot.bin.orig`): freeze before the first
-  puck drop, dynamic resolution off, render resolution for your screen and VRAM;
-* writes `user/config.json` (from `tools/config_default.json` if present) with
-  `neo_mode: false` (see section 4);
-* adds "NHL 24" to the application menu and to the desktop.
+- `status` shows the installed version and patch state.
+- `settings` opens the text settings menu.
+- `remove-update` returns to the base game.
+- `desktop` recreates application-menu and desktop shortcuts.
+- `desktop --remove-wine` also removes obsolete Wine shortcuts created by older packages.
 
-Other commands: `status`, `settings` (text menu), `play`, `update UPDATE.pkg`,
-`remove-update`, `mod install|remove|status` (Russia / Belarus national teams, needs the
-repack's `tools/mods`), `desktop [--remove-wine]` (re-create shortcuts).
+The graphical launcher exposes settings implemented by the current source: render resolution,
+fullscreen/windowed mode, HDR, VSync, frame limit, FSR, safe readbacks, diagnostics, Russian game text
+and keyboard bindings. PS4 Pro mode remains disabled because it is not stable for this title.
 
-Fresh install from PKG with this script: implemented, not yet tested from scratch
-(my copy was first extracted with the Windows installer under Wine).
+The portable archive places the game under `game/`, the update under `game-UPDATE/`, and
+saves/configuration under `user/`. Those same folders live under the AppImage data directory described
+above. The first launch can stutter or remain black for several minutes while shaders compile.
 
-## 3. Launcher window
+Logs are stored in `user/log/`:
 
-`nhl24-launcher.py` is a Tkinter port of the repack's launcher: same layout and settings
-(resolution, display mode, FPS cap, FSR, anisotropy, sharpness, Russian text, stable mode,
-GTX 10xx fix, diagnostics, keyboard bindings, weak-PC preset, crash report). PLAY applies the
-settings to `eboot.bin` / `config.json`, sets the `NHLPORT_*` variables and starts
-`nhl24-linux`. "PS4 Pro mode" is shown but locked off.
+- `shad_log.txt` is the emulator log.
+- `linux_run.log` captures launcher output.
+- `extract.log` and `install-gui.log` cover package installation.
 
-Needs Tk for Python. Gentoo: `echo "dev-lang/python tk" >> /etc/portage/package.use/python`,
-then `emerge -av1 --changed-use dev-lang/python`. Debian/Ubuntu: `python3-tk`. Arch: `tk`.
-Pillow is optional (slightly sharper header art).
+## Running from a source checkout
 
-Russian text: enable it in the launcher, then pick **English** at the game's language screen.
-
-## 4. PS4 Pro mode must be off
-
-With `neo_mode: true` the game crashes on the first frames:
-
-```
-[Debug] <Critical> (shadPS4:GpuComm) texture_cache.cpp:585 ResolveOverlap: Unreachable code!
-Encountered unresolvable image overlap with equal memory address.
-```
-
-The overlap dump right before it shows two identical 2560-pitch images (tile mode 0xa,
-32 bpp) that differ only in `Alt tile` (`Same alt tile: false`). With Neo mode off the
-game runs. Both scripts force `neo_mode: false` before every start.
-
-## 5. Run
-
-From the application menu or the desktop ("NHL 24"), or:
+The scripts can be run directly from `docs/linux/`. They discover `build/nhl24` automatically and
+seed a clean configuration from `release/user/config.json`:
 
 ```bash
-./nhl24-launcher.py      # window
-./nhl24-linux.py play    # start directly with the saved settings
+./docs/linux/nhl24-launcher.py
 ```
 
-First start: black screen for several minutes while shaders compile.
-Log: `user/log/linux_run.log` (plus the emulator's own `user/log/shad_log.txt`).
+In this development layout, game data and portable settings are kept beside the executable as
+`build/game/`, `build/game-UPDATE/` and `build/user/`. This matches the emulator's executable-relative
+lookup. For normal play, the portable archive is recommended.
 
-Desktop shortcut on KDE Plasma: Plasma only starts `.desktop` files from the desktop when
-they are executable, otherwise it opens them in a text editor. `desktop` sets the bit; on the
-first double click Plasma asks once, answer "Execute". If the Windows installer ran under
-Wine, it left its own "NHL 24" shortcuts (they start the old launcher through Wine and no
-longer work): `./nhl24-linux.py desktop --remove-wine` removes them.
+## Notes
 
-Multi-GPU note: the emulator picked the discrete card correctly
-(`GPU_Model: AMD Radeon RX 9060 XT`, `GPU_Integrated: No`).
-
-## Wine (Windows build) — does not work
-
-`nhl24_new.exe` (v0.8.3, `bef79997-dirty`) under wine-staging 11.20 + DXVK 3.1.1,
-prefix set to both Windows 7 and Windows 10, always dies right after the
-`Content Mounter` thread starts:
-
-```
-[Kernel.Pthread] <Info> (Content Mounter) pthread.cpp:497 posix_pthread_rename_np: name = Content Mounter
-[Debug] <Critical> (Game:Main) mutex.cpp:13 lambda: Assertion Failed!
-```
-
-The native build does not hit this, so it looks like a Wine threading/sync difference
-rather than a bug in the emulator itself.
-
-## Building your own Linux archive
-
-`make-linux-repack.sh` builds `NHL24PC-Linux_<version>.tar.gz` from the Windows repack (takes
-`tools/config_default.json`, the national-teams mod `tools/mods/`, `user/input_config/`, the
-READMEs) and the built emulator, plus the scripts, guides and sources (patch, SOURCE.txt, LICENSE):
-
-```bash
-./make-linux-repack.sh NHL24PC_V3_2.zip ~/src/nhl24pc 3.2-linux1
-```
-
-No game files go in. The script prints the glibc version and libraries the emulator needs:
-a binary built on a recent distro will not start on an older one.
-
-## Legacy: repack launcher under Wine
-
-Before the native scripts existed, the playground.ru repack's PowerShell launcher
-(`tools/launcher.ps1`) was run under Wine for settings, and `nhl24.sh` started the native
-binary afterwards. `patch_launcher.sh` adds the assembly references PowerShell 7 needs
-(`System.ComponentModel.Primitives`, `System.ComponentModel.TypeConverter`,
-`System.Windows.Forms.Primitives`, `System.Drawing.Primitives`, `System.Collections`,
-`System.Drawing.Common`) and makes PLAY hand over to the native build. Kept for reference;
-`nhl24-launcher.py` replaces it.
-
-## Credits
-
-The patch signatures, settings and launcher design come from the NHL24PC repack by
-LEVASTAK; the emulator is HajDEO's nhl24pc fork of shadPS4.
+- On Wayland, install XWayland/`xrandr` if automatic display-size detection falls back to 1920x1080.
+- A binary built on a newer distribution may require newer glibc/libstdc++ versions. The packaging
+  script records both detected symbol-version requirements in `BUILD-INFO.txt` and prints its dynamic
+  libraries.
+- Do not upload or redistribute game files, PKGs, saves or shader caches.

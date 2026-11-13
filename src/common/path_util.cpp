@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <fstream>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
@@ -13,6 +16,9 @@
 #include <CoreFoundation/CFBundle.h>
 #include <dlfcn.h>
 #include <sys/param.h>
+#elif defined(__linux__)
+#include <pwd.h>
+#include <unistd.h>
 #endif
 
 #ifndef MAX_PATH
@@ -85,21 +91,66 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 }
 #endif
 
+fs::path GetExecutableDirectory() {
+#ifdef _WIN32
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;) {
+        const DWORD length =
+            GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            break;
+        }
+        if (length < buffer.size()) {
+            return fs::path{std::wstring_view{buffer.data(), length}}.parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+#elif defined(__linux__)
+    std::error_code ec;
+    const auto executable = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && !executable.empty()) {
+        return executable.parent_path();
+    }
+#elif defined(__APPLE__)
+    if (const auto bundle_dir = GetBundleParentDirectory()) {
+        return *bundle_dir;
+    }
+#endif
+    std::error_code current_ec;
+    const auto current = fs::current_path(current_ec);
+    return current_ec ? fs::path{"."} : current;
+}
+
 static auto UserPaths = [] {
     // Try the portable user directory first.
-    auto user_dir = std::filesystem::current_path() / PORTABLE_DIR;
-    if (!std::filesystem::exists(user_dir)) {
+    auto user_dir = GetExecutableDirectory() / PORTABLE_DIR;
+    std::error_code ec;
+    bool has_user_override = false;
+#ifdef __linux__
+    if (const char* override_dir = getenv("NHLPORT_USER_DIR");
+        override_dir && *override_dir && fs::path{override_dir}.is_absolute()) {
+        user_dir = fs::path{override_dir};
+        has_user_override = true;
+    }
+#endif
+    if (!has_user_override && !std::filesystem::is_directory(user_dir, ec)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__
-        user_dir =
-            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
+        if (const char* home = getenv("HOME"); home && *home) {
+            user_dir = fs::path(home) / "Library" / "Application Support" / "shadPS4";
+        }
 #elif defined(__linux__)
         const char* xdg_data_home = getenv("XDG_DATA_HOME");
-        if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
-            user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
+        if (xdg_data_home && *xdg_data_home && fs::path{xdg_data_home}.is_absolute()) {
+            user_dir = fs::path(xdg_data_home) / "shadPS4";
+        } else if (const char* home = getenv("HOME"); home && *home) {
+            user_dir = fs::path(home) / ".local" / "share" / "shadPS4";
+        } else if (const passwd* user = getpwuid(getuid()); user && user->pw_dir && *user->pw_dir) {
+            user_dir = fs::path(user->pw_dir) / ".local" / "share" / "shadPS4";
         } else {
-            user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
+            const auto temp_dir = fs::temp_directory_path(ec);
+            user_dir = (ec ? GetExecutableDirectory() : temp_dir) / "shadPS4";
         }
 #elif _WIN32
         TCHAR appdata[MAX_PATH] = {0};
@@ -111,7 +162,13 @@ static auto UserPaths = [] {
     std::unordered_map<PathType, fs::path> paths;
 
     const auto create_path = [&](PathType shad_path, const fs::path& new_path) {
-        std::filesystem::create_directory(new_path);
+        std::error_code create_ec;
+        fs::create_directories(new_path, create_ec);
+        std::error_code status_ec;
+        if (create_ec && !fs::is_directory(new_path, status_ec)) {
+            std::fprintf(stderr, "Failed to create %s: %s\n", PathToUTF8String(new_path).c_str(),
+                         create_ec.message().c_str());
+        }
         paths.insert_or_assign(shad_path, new_path);
     };
 
