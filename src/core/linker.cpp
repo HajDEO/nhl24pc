@@ -425,8 +425,10 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
 
     // Check if it an exported function from one of our loaded libraries
     for (const auto& mod : m_modules) {
-        if (!std::ranges::contains(mod->GetExportLibs(), *library) ||
-            !std::ranges::contains(mod->GetExportModules(), *module)) {
+        const auto export_libs = mod->GetExportLibs();
+        const auto export_modules = mod->GetExportModules();
+        if (std::ranges::find(export_libs, *library) == export_libs.end() ||
+            std::ranges::find(export_modules, *module) == export_modules.end()) {
             continue;
         }
         if (mod->export_sym.GetSize() == 0) {

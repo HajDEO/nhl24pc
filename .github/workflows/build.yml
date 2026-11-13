@@ -1,26 +1,20 @@
 # SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# NHL24 PC: Windows-only build (the port targets Windows; the upstream macOS/Linux jobs, tests and
-# license/format checks were dropped). Produces nhl24.exe + launcher.exe as a workflow artifact so
-# contributors can try a change without a local toolchain. The ready-to-run package in release/ is
-# still assembled locally with tools\make_release.ps1.
+# NHL24 PC: native Windows and Linux builds. The Windows job produces nhl24.exe + launcher.exe;
+# the Linux job produces a ready-to-run archive with the native launcher and user template.
 
-name: Build (Windows)
+name: Build
 
 on:
   push:
     paths-ignore:
       - "documents/**"
-      - "docs/**"
       - "**/*.md"
-      - "release/**"
   pull_request:
     paths-ignore:
       - "documents/**"
-      - "docs/**"
       - "**/*.md"
-      - "release/**"
   workflow_dispatch:
 
 concurrency:
@@ -31,6 +25,89 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Get date and git hash
+      id: vars
+      run: |
+        echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+        echo "shorthash=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+    - name: Check Linux launcher syntax
+      run: |
+        python3 -m py_compile docs/linux/nhl24-linux.py docs/linux/nhl24-launcher.py
+        bash -n docs/linux/make-linux-repack.sh docs/linux/nhl24.sh docs/linux/patch_launcher.sh
+
+    - name: Add LLVM repository
+      run: |
+        sudo install -d -m 0755 /etc/apt/keyrings
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc > /dev/null
+        echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | sudo tee /etc/apt/sources.list.d/llvm-19.list
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang-19 clang-tools-19 cmake mold ninja-build uuid-dev \
+          libasound2-dev libdecor-0-dev libgles2-mesa-dev libglfw3-dev \
+          libopenal-dev libpulse-dev libudev-dev libwayland-dev libx11-dev \
+          libxext-dev libxcursor-dev libxfixes-dev libxi-dev libxkbcommon-dev \
+          libxrandr-dev libxss-dev libxtst-dev
+
+    - name: Cache CMake build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+        cache-name: ${{ runner.os }}-nhl24-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Configure CMake
+      run: >-
+        cmake --fresh -G Ninja -B "${{ github.workspace }}/build"
+        -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+        -DCMAKE_C_COMPILER=clang-19
+        -DCMAKE_CXX_COMPILER=clang++-19
+        -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=mold
+        -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=mold
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build nhl24
+      run: cmake --build "${{ github.workspace }}/build" --config "${{ env.BUILD_TYPE }}" --parallel "$(nproc)"
+
+    - name: Package Linux archive
+      id: package
+      run: |
+        version=$(sed -n 's/^#define NHLPORT_VERSION "\([^"]*\)"/\1/p' src/common/port_version.h)
+        archive="${{ github.workspace }}/NHL24-PC-Linux-v${version}.tar.gz"
+        NHL24_SOURCE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+          ./docs/linux/make-linux-repack.sh "${{ github.workspace }}/build/nhl24" "$archive"
+        package_dir=$(mktemp -d)
+        trap 'rm -rf "$package_dir"' EXIT
+        tar -C "$package_dir" -xzf "$archive"
+        package="$package_dir/NHL24-PC-Linux-v${version}"
+        test -x "$package/nhl24"
+        test -f "$package/VERSION"
+        test -f "$package/BUILD-INFO.txt"
+        test -f "$package/config_default.json"
+        test -f "$package/user/config.json"
+        test -f "$package/user/patches/nhl24.xml"
+        "$package/nhl24" --help > /dev/null
+        echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: nhl24-pc-ubuntu-24.04-x64-${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.shorthash }}
+        path: ${{ steps.package.outputs.archive }}
+
   windows:
     runs-on: windows-2025-vs2026
     steps:

@@ -59,6 +59,10 @@ else()
     message(FATAL_ERROR "Unsupported CPU architecture: ${BASE_ARCHITECTURE}")
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ARCHITECTURE STREQUAL "x86_64")
+    message(FATAL_ERROR "NHL24 PC requires x86-64 Linux because the PS4 game code executes directly on the host CPU")
+endif()
+
 if (ARCHITECTURE STREQUAL "x86_64")
     # Target x86-64-v3 CPU architecture as this is a good balance between supporting performance critical
     # instructions like AVX2 and maintaining support for older CPUs.

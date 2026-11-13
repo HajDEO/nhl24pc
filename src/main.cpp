@@ -123,18 +123,24 @@ int main(int argc, char* argv[]) {
 
     // ---- No-args behavior: nhlport launches NHL 24 directly ----
     // The game is looked up next to the executable (game/eboot.bin, ../GAME_FILE/uroot/eboot.bin,
-    // ../../GAME_FILE/uroot/eboot.bin) or at the path stored in user/game_path.txt; the
-    // memory patch user/patches/nhl24.xml is applied when present.
+    // ../../GAME_FILE/uroot/eboot.bin) or at the path stored in the user's game_path.txt; the
+    // memory patch patches/nhl24.xml is applied when present.
     std::string default_game_path;
     std::string default_patch_file;
     if (argc == 1) {
         std::error_code ec;
-        const auto exe_dir = std::filesystem::current_path(ec);
+        const auto exe_dir = Common::FS::GetExecutableDirectory();
+        const auto& user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
         std::vector<std::filesystem::path> candidates;
-        if (std::ifstream in{exe_dir / "user" / "game_path.txt"}; in) {
+        if (std::ifstream in{user_dir / "game_path.txt"}; in) {
             std::string line;
             if (std::getline(in, line) && !line.empty()) {
-                candidates.emplace_back(line);
+                if (line.ends_with('\r')) {
+                    line.pop_back();
+                }
+                std::filesystem::path configured_path{line};
+                candidates.push_back(configured_path.is_absolute() ? std::move(configured_path)
+                                                                   : exe_dir / configured_path);
             }
         }
         candidates.push_back(exe_dir / "game" / "eboot.bin");
@@ -149,13 +155,15 @@ int main(int argc, char* argv[]) {
         if (default_game_path.empty()) {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, NHLPORT_TITLE,
                                      "NHL 24 game files were not found.\n\nPut the game dump into "
-                                     "the 'game' folder next to this program (game\\eboot.bin) or "
-                                     "write the full path of eboot.bin into user\\game_path.txt.",
+                                     "the 'game' folder next to this program (game/eboot.bin) or "
+                                     "write the full path of eboot.bin into user/game_path.txt.",
                                      nullptr);
             return -1;
         }
-        if (std::filesystem::is_regular_file(exe_dir / "user" / "patches" / "nhl24.xml", ec)) {
-            default_patch_file = "nhl24.xml";
+        const auto bundled_patch =
+            Common::FS::GetUserPath(Common::FS::PathType::PatchesDir) / "nhl24.xml";
+        if (std::filesystem::is_regular_file(bundled_patch, ec)) {
+            default_patch_file = Common::FS::PathToUTF8String(bundled_patch);
         }
     }
 
@@ -189,10 +197,10 @@ int main(int argc, char* argv[]) {
     Common::Log::Setup("shadps4.log");
 
     if (extractPkg) {
+        const auto extract_dir = extractTo ? std::filesystem::path(*extractTo)
+                                           : Common::FS::GetExecutableDirectory() / "game";
         return PkgExtract::Run(std::filesystem::path(*extractPkg),
-                               extractTo ? std::optional<std::filesystem::path>(*extractTo)
-                                         : std::nullopt,
-                               pkgInfo);
+                               std::optional<std::filesystem::path>{extract_dir}, pkgInfo);
     }
 
     LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), " "));

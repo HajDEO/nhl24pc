@@ -19,12 +19,20 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#include <unistd.h>
+#endif
 
 #include "common/diag_log.h"
 #include "common/logging/log.h"
@@ -340,6 +348,27 @@ constexpr const char* FramesHeader =
     "flip_pending,file_reads,file_kb,audio_out,audio_wait_ms,cpu_ms,gpu_thr_ms,present_ms,sim_ms,"
     "render_ms,jobs_ms,page_faults,cs_meta_clear,cs_image_copy,cs_image_clear,cs_hle,flags";
 
+u8 SlotFor(std::string_view name, bool& is_key) {
+    is_key = true;
+    if (name == "shadPS4:GpuCommandProcessor" || name == "shadPS4:GpuComm") {
+        return SlotGpu;
+    }
+    if (name == "shadPS4:PresentThread" || name == "shadPS4:Present") {
+        return SlotPresent;
+    }
+    if (name == "GameSimulationLoop" || name == "GameSimulationL") {
+        return SlotSim;
+    }
+    if (name == "RenderLoop") {
+        return SlotRender;
+    }
+    if (name.starts_with("Job") && name.size() <= 5) {
+        return SlotJobs;
+    }
+    is_key = false;
+    return 0;
+}
+
 #ifdef _WIN32
 u64 FileTimeTo100ns(const FILETIME& ft) {
     return (u64(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
@@ -373,27 +402,6 @@ std::string ThreadDescription(HANDLE h) {
         LocalFree(desc);
     }
     return name;
-}
-
-u8 SlotFor(std::string_view name, bool& is_key) {
-    is_key = true;
-    if (name == "shadPS4:GpuCommandProcessor") {
-        return SlotGpu;
-    }
-    if (name == "shadPS4:PresentThread") {
-        return SlotPresent;
-    }
-    if (name == "GameSimulationLoop") {
-        return SlotSim;
-    }
-    if (name == "RenderLoop") {
-        return SlotRender;
-    }
-    if (name.starts_with("Job") && name.size() <= 5) {
-        return SlotJobs;
-    }
-    is_key = false;
-    return 0;
 }
 
 /// Refreshes the thread list and the per-thread CPU percentages (sampler thread).
@@ -536,6 +544,194 @@ std::string SystemSummary() {
     GetSystemInfo(&si);
     return fmt::format("logical cpus {}, physical RAM {} MB ({} MB free at start)",
                        si.dwNumberOfProcessors, ms.ullTotalPhys >> 20, ms.ullAvailPhys >> 20);
+}
+#elif defined(__linux__)
+struct LinuxProcStat {
+    u64 cpu_ticks = 0;
+    u64 page_faults = 0;
+};
+
+std::optional<LinuxProcStat> ReadLinuxProcStat(const std::filesystem::path& path) {
+    std::ifstream file{path};
+    std::string line;
+    if (!std::getline(file, line)) {
+        return std::nullopt;
+    }
+    const auto name_end = line.rfind(')');
+    if (name_end == std::string::npos || name_end + 2 >= line.size()) {
+        return std::nullopt;
+    }
+
+    char state;
+    s64 ppid, pgrp, session, tty, foreground_group;
+    u64 flags, minor_faults, child_minor_faults, major_faults, child_major_faults, user_ticks,
+        system_ticks;
+    std::istringstream fields{line.substr(name_end + 2)};
+    if (!(fields >> state >> ppid >> pgrp >> session >> tty >> foreground_group >> flags >>
+          minor_faults >> child_minor_faults >> major_faults >> child_major_faults >> user_ticks >>
+          system_ticks)) {
+        return std::nullopt;
+    }
+    return LinuxProcStat{
+        .cpu_ticks = user_ticks + system_ticks,
+        .page_faults = minor_faults + major_faults,
+    };
+}
+
+u64 LinuxTicksTo100ns(u64 ticks) {
+    static const u64 ticks_per_second = [] {
+        const long value = sysconf(_SC_CLK_TCK);
+        return value > 0 ? static_cast<u64>(value) : 100u;
+    }();
+    return ticks * 10'000'000 / ticks_per_second;
+}
+
+u64 ThreadCpu100ns(u32 tid) {
+    const auto stat =
+        ReadLinuxProcStat(std::filesystem::path{"/proc/self/task"} / std::to_string(tid) / "stat");
+    return stat ? LinuxTicksTo100ns(stat->cpu_ticks) : 0;
+}
+
+u64 ProcessCpu100ns() {
+    timespec cpu_time{};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_time) != 0) {
+        return 0;
+    }
+    return u64(cpu_time.tv_sec) * 10'000'000 + u64(cpu_time.tv_nsec) / 100;
+}
+
+std::string LinuxThreadName(u32 tid) {
+    std::ifstream file{std::filesystem::path{"/proc/self/task"} / std::to_string(tid) / "comm"};
+    std::string name;
+    std::getline(file, name);
+    return name.empty() ? fmt::format("tid {}", tid) : name;
+}
+
+void SampleThreads(State& s) {
+    const auto now = Clock::now();
+    const double interval = s.last_thread_sample == Clock::time_point{}
+                                ? 0.0
+                                : std::chrono::duration<double>(now - s.last_thread_sample).count();
+    s.last_thread_sample = now;
+
+    for (auto& thread : s.thread_samples) {
+        thread.alive = false;
+        thread.pct = 0;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path task_dir{"/proc/self/task"};
+    for (std::filesystem::directory_iterator it{task_dir, ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        const std::string filename = it->path().filename().string();
+        char* parse_end = nullptr;
+        const unsigned long parsed_tid = std::strtoul(filename.c_str(), &parse_end, 10);
+        if (!parse_end || *parse_end != '\0' || parsed_tid > std::numeric_limits<u32>::max()) {
+            continue;
+        }
+        const u32 tid = static_cast<u32>(parsed_tid);
+        const u64 cpu = ThreadCpu100ns(tid);
+        auto existing =
+            std::find_if(s.thread_samples.begin(), s.thread_samples.end(),
+                         [tid](const ThreadSample& thread) { return thread.tid == tid; });
+        if (existing == s.thread_samples.end()) {
+            ThreadSample thread{};
+            thread.tid = tid;
+            thread.name = LinuxThreadName(tid);
+            thread.generic_name = thread.name.starts_with("tid ");
+            thread.cpu_100ns = cpu;
+            s.thread_samples.push_back(std::move(thread));
+            continue;
+        }
+        existing->alive = true;
+        if (existing->generic_name) {
+            existing->name = LinuxThreadName(tid);
+            existing->generic_name = existing->name.starts_with("tid ");
+        }
+        existing->pct = interval > 0 && cpu >= existing->cpu_100ns
+                            ? double(cpu - existing->cpu_100ns) / (interval * 1e7) * 100.0
+                            : 0.0;
+        existing->cpu_100ns = cpu;
+    }
+
+    std::vector<KeyThread> keys;
+    for (const auto& thread : s.thread_samples) {
+        if (!thread.alive) {
+            continue;
+        }
+        bool is_key = false;
+        const u8 slot = SlotFor(thread.name, is_key);
+        if (is_key) {
+            keys.push_back(KeyThread{.tid = thread.tid, .slot = slot});
+        }
+    }
+    {
+        std::scoped_lock lock{s.kt_mutex};
+        for (auto& key : keys) {
+            const auto previous =
+                std::find_if(s.key_threads.begin(), s.key_threads.end(),
+                             [&](const KeyThread& old) { return old.tid == key.tid; });
+            key.last_100ns =
+                previous != s.key_threads.end() ? previous->last_100ns : ThreadCpu100ns(key.tid);
+        }
+        s.key_threads = std::move(keys);
+    }
+}
+
+void SampleKeyThreads(State& s, double out_ms[SlotCount]) {
+    for (u32 i = 0; i < SlotCount; ++i) {
+        out_ms[i] = 0;
+    }
+    std::scoped_lock lock{s.kt_mutex};
+    for (auto& key : s.key_threads) {
+        const u64 cpu = ThreadCpu100ns(key.tid);
+        if (cpu > key.last_100ns) {
+            out_ms[key.slot] += double(cpu - key.last_100ns) / 1e4;
+        }
+        key.last_100ns = cpu;
+    }
+}
+
+struct ProcMem {
+    u64 working_set = 0;
+    u64 private_bytes = 0;
+    u64 page_faults = 0;
+};
+
+ProcMem ProcessMemory() {
+    ProcMem memory{};
+    std::ifstream status{"/proc/self/status"};
+    std::string line;
+    while (std::getline(status, line)) {
+        const auto read_kb = [&](std::string_view prefix, u64& value) {
+            if (!line.starts_with(prefix)) {
+                return;
+            }
+            std::istringstream number{line.substr(prefix.size())};
+            u64 kb = 0;
+            if (number >> kb) {
+                value += kb << 10;
+            }
+        };
+        read_kb("VmRSS:", memory.working_set);
+        read_kb("RssAnon:", memory.private_bytes);
+        read_kb("VmSwap:", memory.private_bytes);
+    }
+    if (const auto stat = ReadLinuxProcStat("/proc/self/stat")) {
+        memory.page_faults = stat->page_faults;
+    }
+    return memory;
+}
+
+std::string SystemSummary() {
+    struct sysinfo info{};
+    if (sysinfo(&info) != 0) {
+        return fmt::format("logical cpus {}", std::thread::hardware_concurrency());
+    }
+    const u64 total = u64(info.totalram) * info.mem_unit;
+    const u64 available = u64(info.freeram + info.bufferram) * info.mem_unit;
+    return fmt::format("logical cpus {}, physical RAM {} MB ({} MB free at start)",
+                       std::thread::hardware_concurrency(), total >> 20, available >> 20);
 }
 #else
 void SampleThreads(State&) {}
