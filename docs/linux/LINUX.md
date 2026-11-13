@@ -86,6 +86,43 @@ The workflow's prebuilt artifact is named `nhl24-pc-ubuntu-24.04-x64-...` becaus
 binary compatibility baseline. Build from source for older distributions. `BUILD-INFO.txt` inside the
 archive records the exact source commit and required glibc/libstdc++ symbol versions.
 
+## AppImage
+
+The workflow also produces `NHL24-PC-v<version>-x86_64.AppImage`. It contains the emulator, Python,
+Tk, launchers, configuration template and game patch in one executable file. GPU drivers remain
+provided by the host system.
+
+```bash
+chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
+./NHL24-PC-v0.9.2b-x86_64.AppImage
+```
+
+The AppImage is read-only, so installed games, saves, settings and logs are kept in
+`${XDG_DATA_HOME:-$HOME/.local/share}/nhl24pc`. Put that data on another drive by supplying an
+absolute path:
+
+```bash
+NHL24_DATA_ROOT=/mnt/games/NHL24-PC ./NHL24-PC-v0.9.2b-x86_64.AppImage
+```
+
+The same file exposes the command-line installer:
+
+```bash
+./NHL24-PC-v0.9.2b-x86_64.AppImage install /path/to/base.pkg /path/to/update.pkg
+./NHL24-PC-v0.9.2b-x86_64.AppImage play
+```
+
+To build an AppImage after compiling `build/nhl24`, install `python3-tk`, `curl` and
+`desktop-file-utils`, then run:
+
+```bash
+./docs/linux/make-linux-appimage.sh build/nhl24
+```
+
+The packager downloads pinned linuxdeploy, appimagetool and AppImage runtime releases and verifies
+their published SHA-256 hashes. Like the tar package, the workflow AppImage uses Ubuntu 24.04 as its
+binary compatibility baseline.
+
 ## Install and play
 
 Graphical launcher:
@@ -124,8 +161,9 @@ The graphical launcher exposes settings implemented by the current source: rende
 fullscreen/windowed mode, HDR, VSync, frame limit, FSR, safe readbacks, diagnostics, Russian game text
 and keyboard bindings. PS4 Pro mode remains disabled because it is not stable for this title.
 
-The installer places the game under `game/`, the update under `game-UPDATE/`, and saves/configuration
-under `user/`. The first launch can stutter or remain black for several minutes while shaders compile.
+The portable archive places the game under `game/`, the update under `game-UPDATE/`, and
+saves/configuration under `user/`. Those same folders live under the AppImage data directory described
+above. The first launch can stutter or remain black for several minutes while shaders compile.
 
 Logs are stored in `user/log/`:
 

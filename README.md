@@ -11,8 +11,8 @@ implementations, and the GPU work goes through Vulkan.
 | | |
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
-| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (Windows) or the Ubuntu 24.04 x86-64 artifact from the latest successful **Build** workflow |
-| Ready-to-run package | Windows: [`release/`](release). Linux: native binary, Python CLI/Tk launcher and clean `user/` template in the Ubuntu 24.04 workflow artifact |
+| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (Windows) or the AppImage/Ubuntu 24.04 x86-64 artifacts from the latest successful **Build** workflow |
+| Ready-to-run package | Windows: [`release/`](release). Linux: one-file AppImage or a portable native archive with CLI/Tk launchers |
 | Current build | **v0.9.2b** (2026-11-03), Windows 10/11 and Linux x86-64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
@@ -121,8 +121,16 @@ RTX 5060: 51 fps in play, 30 fps locked in menus and cutscenes, like the console
 
 ### Linux
 
-Use the `nhl24-pc-ubuntu-24.04-x64` artifact from the latest successful **Build** workflow, or build
-the repository as described below. Unpack it to a writable directory, then run:
+Use the `nhl24-pc-appimage-x86_64` artifact from the latest successful **Build** workflow, make the
+contained file executable, and run it:
+
+```bash
+chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
+./NHL24-PC-v0.9.2b-x86_64.AppImage
+```
+
+The AppImage stores its writable game data under `~/.local/share/nhl24pc`. The portable
+`nhl24-pc-ubuntu-24.04-x64` archive remains available; unpack it to a writable directory and run:
 
 ```bash
 ./nhl24-launcher.py
@@ -188,6 +196,7 @@ Only needed to change the emulator or launcher; players can use a release/workfl
 - `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`
 - `cmake --build build --parallel` → `build/nhl24`
 - `docs/linux/make-linux-repack.sh build/nhl24` → a redistributable Linux archive
+- `docs/linux/make-linux-appimage.sh build/nhl24` → a self-contained x86-64 AppImage
 
 Development notes: `tools\run_nhl24.ps1` runs the build with the diagnostics log enabled
 (`NHLPORT_DIAG=1`; F1 captures a frame: draw log, image dumps, screenshot), `tools\measure_nhl24.ps1`
