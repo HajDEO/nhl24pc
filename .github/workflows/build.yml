@@ -138,8 +138,9 @@ jobs:
         test -x squashfs-root/AppRun
         test -x squashfs-root/usr/bin/nhl24
         test -x squashfs-root/usr/bin/python3
-        desktop-file-validate squashfs-root/nhl24-pc.desktop
-        appstreamcli validate --no-net squashfs-root/usr/share/metainfo/nhl24-pc.appdata.xml
+        desktop-file-validate squashfs-root/io.github.hajdeo.nhl24pc.desktop
+        appstreamcli validate --no-net \
+          squashfs-root/usr/share/metainfo/io.github.hajdeo.nhl24pc.metainfo.xml
         LD_LIBRARY_PATH="$scratch/squashfs-root/usr/lib" \
           ldd squashfs-root/usr/bin/nhl24 > "$scratch/nhl24-ldd.txt"
         ! grep -q 'not found' "$scratch/nhl24-ldd.txt"
