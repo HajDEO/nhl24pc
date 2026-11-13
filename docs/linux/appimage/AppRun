@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+APPDIR=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+
+if [ -z "${NHL24_DATA_ROOT:-}" ]; then
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        case $XDG_DATA_HOME in
+            /*) data_home=$XDG_DATA_HOME ;;
+            *) data_home=${HOME:?HOME is not set}/.local/share ;;
+        esac
+    else
+        data_home=${HOME:?HOME is not set}/.local/share
+    fi
+    NHL24_DATA_ROOT=$data_home/nhl24pc
+fi
+
+case $NHL24_DATA_ROOT in
+    /*) ;;
+    *)
+        echo "NHL24_DATA_ROOT must be an absolute path" >&2
+        exit 2
+        ;;
+esac
+
+resource_dir=$APPDIR/usr/share/nhl24pc
+user_dir=$NHL24_DATA_ROOT/user
+mkdir -p "$user_dir/input_config" "$user_dir/patches"
+
+seed_file() {
+    source_file=$1
+    target_file=$2
+    if [ ! -e "$target_file" ]; then
+        cp "$source_file" "$target_file"
+    fi
+}
+
+seed_file "$resource_dir/config_default.json" "$user_dir/config.json"
+seed_file "$resource_dir/input_config/default.ini" "$user_dir/input_config/default.ini"
+seed_file "$resource_dir/input_config/global.ini" "$user_dir/input_config/global.ini"
+seed_file "$resource_dir/nhl24.xml" "$user_dir/patches/nhl24.xml"
+seed_file "$resource_dir/nhl24-pc.png" "$user_dir/nhl24-pc.png"
+
+export NHL24_DATA_ROOT
+export NHL24_EMULATOR=$APPDIR/usr/bin/nhl24
+export NHLPORT_USER_DIR=$user_dir
+export NHL24_RESOURCE_ROOT=$resource_dir
+if [ -n "${APPIMAGE:-}" ]; then
+    export NHL24_APPIMAGE=$APPIMAGE
+fi
+export PATH=$APPDIR/usr/bin:${PATH:-/usr/bin:/bin}
+export LD_LIBRARY_PATH=$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export PYTHONHOME=$APPDIR/usr
+export PYTHONNOUSERSITE=1
+export TCL_LIBRARY=$APPDIR/usr/share/tcltk/tcl
+export TK_LIBRARY=$APPDIR/usr/share/tcltk/tk
+unset PYTHONPATH PYTHONUSERBASE
+
+python=$APPDIR/usr/bin/python3
+launcher=$APPDIR/usr/lib/nhl24pc/nhl24-launcher.py
+cli=$APPDIR/usr/lib/nhl24pc/nhl24-linux.py
+
+if [ "${1:-}" = "--appimage-smoke-test" ]; then
+    "$python" -c 'import _tkinter, tkinter, zlib; assert tkinter.Tcl().eval("info patchlevel")'
+    "$NHL24_EMULATOR" --help >/dev/null
+    test -f "$user_dir/config.json"
+    test -f "$user_dir/patches/nhl24.xml"
+    echo "NHL 24 PC AppImage smoke test passed"
+    exit 0
+fi
+
+if [ "${1:-}" = "--emulator" ]; then
+    shift
+    exec "$NHL24_EMULATOR" "$@"
+fi
+
+if [ "$#" -eq 0 ]; then
+    exec "$python" "$launcher"
+fi
+
+exec "$python" "$cli" "$@"

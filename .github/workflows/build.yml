@@ -41,7 +41,8 @@ jobs:
     - name: Check Linux launcher syntax
       run: |
         python3 -m py_compile docs/linux/nhl24-linux.py docs/linux/nhl24-launcher.py
-        bash -n docs/linux/make-linux-repack.sh docs/linux/nhl24.sh docs/linux/patch_launcher.sh
+        bash -n docs/linux/make-linux-repack.sh docs/linux/make-linux-appimage.sh \
+          docs/linux/nhl24.sh docs/linux/patch_launcher.sh docs/linux/appimage/AppRun
 
     - name: Add LLVM repository
       run: |
@@ -57,7 +58,7 @@ jobs:
           libasound2-dev libdecor-0-dev libgles2-mesa-dev libglfw3-dev \
           libopenal-dev libpulse-dev libudev-dev libwayland-dev libx11-dev \
           libxext-dev libxcursor-dev libxfixes-dev libxi-dev libxkbcommon-dev \
-          libxrandr-dev libxss-dev libxtst-dev
+          libxrandr-dev libxss-dev libxtst-dev python3-tk desktop-file-utils appstream curl
 
     - name: Cache CMake build
       uses: hendrikmuhs/ccache-action@v1.2.21
@@ -107,6 +108,54 @@ jobs:
       with:
         name: nhl24-pc-ubuntu-24.04-x64-${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.shorthash }}
         path: ${{ steps.package.outputs.archive }}
+
+    - name: Package AppImage
+      id: appimage
+      run: |
+        version=$(sed -n 's/^#define NHLPORT_VERSION "\([^"]*\)"/\1/p' src/common/port_version.h)
+        image="${{ github.workspace }}/NHL24-PC-v${version}-x86_64.AppImage"
+        NHL24_SOURCE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+          ./docs/linux/make-linux-appimage.sh "${{ github.workspace }}/build/nhl24" "$image"
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+
+    - name: Smoke-test AppImage
+      run: |
+        image="${{ steps.appimage.outputs.image }}"
+        scratch=$(mktemp -d)
+        trap 'rm -rf "$scratch"' EXIT
+        mkdir -p "$scratch/home"
+        HOME="$scratch/home" NHL24_DATA_ROOT="$scratch/data" APPIMAGE_EXTRACT_AND_RUN=1 \
+          "$image" --appimage-smoke-test
+        test -f "$scratch/data/user/config.json"
+        test -f "$scratch/data/user/input_config/default.ini"
+        test -f "$scratch/data/user/patches/nhl24.xml"
+        printf 'keep-me\n' > "$scratch/data/user/config.json"
+        HOME="$scratch/home" NHL24_DATA_ROOT="$scratch/data" APPIMAGE_EXTRACT_AND_RUN=1 \
+          "$image" --appimage-smoke-test
+        grep -qx 'keep-me' "$scratch/data/user/config.json"
+        cd "$scratch"
+        "$image" --appimage-extract >/dev/null
+        test -x squashfs-root/AppRun
+        test -x squashfs-root/usr/bin/nhl24
+        test -x squashfs-root/usr/bin/python3
+        desktop-file-validate squashfs-root/nhl24-pc.desktop
+        appstreamcli validate --no-net squashfs-root/usr/share/metainfo/nhl24-pc.appdata.xml
+        LD_LIBRARY_PATH="$scratch/squashfs-root/usr/lib" \
+          ldd squashfs-root/usr/bin/nhl24 > "$scratch/nhl24-ldd.txt"
+        ! grep -q 'not found' "$scratch/nhl24-ldd.txt"
+        LD_LIBRARY_PATH="$scratch/squashfs-root/usr/lib" \
+          ldd squashfs-root/usr/bin/python3 > "$scratch/python-ldd.txt"
+        ! grep -q 'not found' "$scratch/python-ldd.txt"
+        tkinter=$(find squashfs-root/usr/lib -type f -name '_tkinter*.so' -print -quit)
+        test -n "$tkinter"
+        LD_LIBRARY_PATH="$scratch/squashfs-root/usr/lib" ldd "$tkinter" > "$scratch/tkinter-ldd.txt"
+        ! grep -q 'not found' "$scratch/tkinter-ldd.txt"
+
+    - name: Upload AppImage artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: nhl24-pc-appimage-x86_64-${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.shorthash }}
+        path: ${{ steps.appimage.outputs.image }}
 
   windows:
     runs-on: windows-2025-vs2026

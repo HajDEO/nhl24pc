@@ -134,6 +134,16 @@ Now run the emulator to get the list of options:
 ```
 
 For the native installer, launcher, and expected game directory layout, see `docs/linux/LINUX.md`.
+
+To package the build as an AppImage, install `python3-tk`, `curl`, and `desktop-file-utils`, then run:
+
+```bash
+./docs/linux/make-linux-appimage.sh build/nhl24
+```
+
+This produces `NHL24-PC-v<version>-x86_64.AppImage`. The packaging script bundles Python/Tk and
+verifies pinned AppImage tools before using them.
+
 #### Option 2: Configuring with cmake-gui
 
 `cmake-gui` should be installed by default alongside `cmake`, if not search for the package in your package manager and install it.

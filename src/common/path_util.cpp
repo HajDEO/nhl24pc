@@ -125,7 +125,15 @@ static auto UserPaths = [] {
     // Try the portable user directory first.
     auto user_dir = GetExecutableDirectory() / PORTABLE_DIR;
     std::error_code ec;
-    if (!std::filesystem::is_directory(user_dir, ec)) {
+    bool has_user_override = false;
+#ifdef __linux__
+    if (const char* override_dir = getenv("NHLPORT_USER_DIR");
+        override_dir && *override_dir && fs::path{override_dir}.is_absolute()) {
+        user_dir = fs::path{override_dir};
+        has_user_override = true;
+    }
+#endif
+    if (!has_user_override && !std::filesystem::is_directory(user_dir, ec)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__

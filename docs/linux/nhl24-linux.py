@@ -19,8 +19,9 @@ import json, os, re, shutil, struct, subprocess, sys
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
 REPO_ROOT = os.path.realpath(os.path.join(ROOT, '..', '..'))
-EMU_CANDIDATES = [os.path.join(ROOT, 'nhl24-linux'), os.path.join(ROOT, 'nhl24'),
-                  os.path.join(REPO_ROOT, 'build', 'nhl24')]
+EMU_CANDIDATES = [p for p in (os.environ.get('NHL24_EMULATOR'),
+                              os.path.join(ROOT, 'nhl24-linux'), os.path.join(ROOT, 'nhl24'),
+                              os.path.join(REPO_ROOT, 'build', 'nhl24')) if p]
 
 
 def find_emulator():
@@ -57,7 +58,14 @@ def refresh_runtime_paths():
     global EMU, DATA_ROOT, GAME, UPDATE, USER, CONFIG, SETTINGS, OFFSET_CACHE, LOC_CACHE
     EMU = find_emulator()
     emulator_dir = os.path.dirname(os.path.realpath(EMU))
-    DATA_ROOT = ROOT if emulator_dir == os.path.realpath(ROOT) else emulator_dir
+    data_root = os.environ.get('NHL24_DATA_ROOT')
+    if data_root:
+        data_root = os.path.expanduser(data_root)
+        if not os.path.isabs(data_root):
+            raise RuntimeError('NHL24_DATA_ROOT must be an absolute path')
+        DATA_ROOT = os.path.realpath(data_root)
+    else:
+        DATA_ROOT = ROOT if emulator_dir == os.path.realpath(ROOT) else emulator_dir
     GAME = os.path.join(DATA_ROOT, 'game')
     UPDATE = os.path.join(DATA_ROOT, 'game-UPDATE')
     USER = os.path.join(DATA_ROOT, 'user')
@@ -67,7 +75,11 @@ def refresh_runtime_paths():
     LOC_CACHE = os.path.join(USER, 'loc_offset.json')
 
 
-refresh_runtime_paths()
+try:
+    refresh_runtime_paths()
+except RuntimeError as error:
+    print('ERROR: %s' % error, file=sys.stderr)
+    raise SystemExit(2)
 
 
 def config_templates():
@@ -76,6 +88,22 @@ def config_templates():
             os.path.join(ROOT, 'release', 'user', 'config.json'),
             os.path.join(ROOT, 'tools', 'config_default.json'),
             os.path.join(REPO_ROOT, 'release', 'user', 'config.json')]
+
+
+def emulator_environment():
+    env = dict(os.environ)
+    env['NHL24_DATA_ROOT'] = DATA_ROOT
+    env['NHLPORT_USER_DIR'] = USER
+    return env
+
+
+def emulator_launch_args():
+    args = [EMU]
+    patch = os.path.join(USER, 'patches', 'nhl24.xml')
+    if os.path.isfile(patch):
+        args.extend(['--patch', patch])
+    args.append(eboot_path())
+    return args
 
 
 KNOWN_TITLES = ('CUSA37933', 'CUSA37934')
@@ -488,7 +516,8 @@ def extract(pkg, target_dir):
     os.makedirs(os.path.join(USER, 'log'), exist_ok=True)
     log = open(os.path.join(USER, 'log', 'extract.log'), 'w')
     p = subprocess.Popen([EMU, '--extract-pkg', pkg, '--extract-to', GAME], cwd=DATA_ROOT,
-                         stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
+                         env=emulator_environment(), stdout=subprocess.PIPE, stderr=log,
+                         text=True, bufsize=1)
     last_err = ''
     try:
         for line in p.stdout:
@@ -614,15 +643,31 @@ def write_desktop_entries(on_desktop=True, remove_wine=False):
     apps = os.path.expanduser('~/.local/share/applications')
     os.makedirs(apps, exist_ok=True)
     icon = next((p for p in (os.path.join(UPDATE, 'sce_sys', 'icon0.png'),
-                             os.path.join(GAME, 'sce_sys', 'icon0.png')) if os.path.isfile(p)), 'applications-games')
+                             os.path.join(GAME, 'sce_sys', 'icon0.png'),
+                             os.path.join(USER, 'nhl24-pc.png')) if os.path.isfile(p)),
+                'applications-games')
     me = os.path.realpath(__file__)
     gui = os.path.join(ROOT, 'nhl24-launcher.py')
-    main = ('python3 "%s"' % gui) if os.path.isfile(gui) else ('python3 "%s" play' % me)
+    appimage = os.environ.get('APPIMAGE') or os.environ.get('NHL24_APPIMAGE')
+
+    def desktop_arg(value):
+        value = value.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`')
+        value = value.replace('$', '\\$').replace('%', '%%')
+        return '"%s"' % value
+
+    if appimage:
+        main = 'env %s %s' % (desktop_arg('NHL24_DATA_ROOT=' + DATA_ROOT),
+                              desktop_arg(os.path.abspath(appimage)))
+        settings = main + ' settings'
+    else:
+        main = ('python3 %s' % desktop_arg(gui)) if os.path.isfile(gui) else (
+            'python3 %s play' % desktop_arg(me))
+        settings = 'python3 %s settings' % desktop_arg(me)
     language = (load_settings().get('lang') or
                 ('ru' if os.environ.get('LANG', '').startswith('ru') else 'en'))
     settings_name = 'NHL 24 - настройки' if language == 'ru' else 'NHL 24 - Settings'
     entries = (('nhl24.desktop', 'NHL 24', main, 'false', 'StartupWMClass=nhl24-launcher\n'),
-               ('nhl24-settings.desktop', settings_name, 'python3 "%s" settings' % me, 'true', ''))
+               ('nhl24-settings.desktop', settings_name, settings, 'true', ''))
     for fname, name, cmd, term, extra in entries:
         path = os.path.join(apps, fname)
         with open(path, 'w') as f:
@@ -824,7 +869,7 @@ def prepare_launch(s):
         'fsr_enabled': bool(s['fsr']), 'rcas_enabled': bool(s['fsr']),
     })
 
-    env = dict(os.environ)
+    env = emulator_environment()
     for key, on, val in (('NHLPORT_DIAG', s['diag'], '1'),
                          ('NHLPORT_READBACK_DRAIN', s['stable'], '1')):
         if on:
@@ -846,7 +891,7 @@ def cmd_play(_):
     os.chdir(DATA_ROOT)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    os.execve(EMU, [EMU], env)
+    os.execve(EMU, emulator_launch_args(), env)
 
 
 # ---------------- national teams mod (port of mods.ps1) ----------------

@@ -1024,8 +1024,11 @@ class App:
     def on_guide(self):
         ru = self.set['lang'] == 'ru'
         names = [self.L('readme'), 'LINUX_RU.md' if ru else 'LINUX.md', 'LINUX.md' if ru else 'LINUX_RU.md']
+        resource_root = os.environ.get('NHL24_RESOURCE_ROOT')
         for n in names:
-            for d in (SCRIPT_ROOT, os.path.join(core.REPO_ROOT, 'docs', 'linux')):
+            for d in (SCRIPT_ROOT, resource_root, os.path.join(core.REPO_ROOT, 'docs', 'linux')):
+                if not d:
+                    continue
                 g = os.path.join(d, n)
                 if os.path.isfile(g):
                     open_path(g)
@@ -1244,8 +1247,8 @@ class App:
             env = core.prepare_launch(self.set)
             os.makedirs(os.path.join(core.USER, 'log'), exist_ok=True)
             log = open(os.path.join(core.USER, 'log', 'linux_run.log'), 'w')
-            self.proc = subprocess.Popen([core.EMU], cwd=core.DATA_ROOT, env=env, stdout=log,
-                                         stderr=subprocess.STDOUT,
+            self.proc = subprocess.Popen(core.emulator_launch_args(), cwd=core.DATA_ROOT, env=env,
+                                         stdout=log, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL)
         except Exception as e:
             self.msg(self.L('msgFail') + str(e))
