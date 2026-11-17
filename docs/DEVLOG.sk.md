@@ -1,5 +1,28 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.3a: 60 fps v menu a prestrihoch (2026-11-17, issue #22)
+
+Hra si sama prepína `sceVideoOutSetFlipRate`: 1 (30 Hz) v menu a prestrihoch, 0 (60 Hz) v zápase.
+Nové nastavenie `GPU.ignore_flip_rate` (predvolene `true`; `false` = správanie konzoly, v launcheri
+nie je) spôsobí, že `PresentThread` berie flip pri každom vblanku bez ohľadu na flip rate hry.
+Chýbajúci kľúč v staršom `config.json` znamená predvolenú hodnotu, takže aktualizácia stačí výmenou exe.
+
+Meranie (Ryzen 5 4500 + RTX 5060, `logs\fliprate-{off,on}*.{diag.log,frames.csv}`):
+
+| | flip rate hry | ignorovaný |
+|---|---|---|
+| titulná obrazovka / menu | 30,0 fps, 99 % 34,2 ms | 60,0 fps, 99 % 17,7–18,1 ms |
+| výber tímov (190–460 draws) | 30 fps | 59,6–60,2 fps |
+| predzápasový prestrih (1300–2100 draws) | 22–27 fps (staršie behy) | 23–26 fps |
+
+Rýchlosť hry sa nemení: animácia titulnej obrazovky má rovnakú časovú os v sekundách
+(zmeny počtu draw callov +2,9 / +4,2 / +6,3 / +8,0 / +9,4 s po prepnutí na flip rate 1 v oboch
+režimoch), len s dvojnásobným počtom snímok – hra počíta s reálnym časom, nie so snímkami.
+
+Ťažké prestrihy limit 30 fps nedosahujú ani dnes: brzdí ich vlákno `GpuCommandProcessor`
+(73–94 % jadra, GPU busy len ~27 %), počet render passov sa rovná počtu draw callov
+(1481 passov na 1487 draws). To je ďalší kandidát na optimalizáciu.
+
 ## v0.9.3: zmiznuté rostre, prázdny param.sfo po nečistom ukončení (2026-11-17, issue #29)
 
 **Vlastné rostre a tímy na druhý deň „zmizli“.** `SaveInstance::SetupAndMount`

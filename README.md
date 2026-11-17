@@ -13,7 +13,7 @@ implementations, and the GPU work goes through Vulkan.
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.3** (2026-11-17), Windows 10/11 x64 |
+| Current build | **v0.9.3a** (2026-11-17), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -67,6 +67,15 @@ CPU directly, at native speed. What the emulator provides is everything around i
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
   fullscreen, vsync, sharpening, language, controls, all controllers as player 1) and starts the game.
 
+## What's new in v0.9.3a
+
+- **Menus and cutscenes run at up to 60 fps** (issue #22). The game asks for a 30 fps output in menus
+  and cutscenes, like on the console, and 60 fps only during play. The emulator now ignores that
+  request and shows every frame the game renders. The speed of the game does not change, the
+  animations are just smoother. Menus and team selection hold 60 fps; the heaviest cutscenes are
+  limited by the emulator's GPU thread and stay at 20–30 fps for now. The old behaviour can be
+  restored with `"ignore_flip_rate": false` in the `GPU` section of `user\config.json`.
+
 ## What's new in v0.9.3
 
 - **Random crashes to the desktop during play fixed** (error 0xc0000005, issue #32; the same cause as
@@ -118,7 +127,7 @@ CPU directly, at native speed. What the emulator provides is everything around i
 
 ## Playing
 
-1. Download `NHL24-PC-v0.9.3.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+1. Download `NHL24-PC-v0.9.3a.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
@@ -133,14 +142,14 @@ CPU directly, at native speed. What the emulator provides is everything around i
 
 First run: saves, the profile and the shader cache are created under `user\`. The first minutes stutter
 while the shaders compile; afterwards the game runs at 50–60 fps on a mid-range GPU (Ryzen 5 4500 +
-RTX 5060: 51 fps in play, 30 fps locked in menus and cutscenes, like the console).
+RTX 5060: 51 fps in play, 60 fps in menus; the heaviest cutscenes run at 20–30 fps).
 
 **Requirements**: Windows 10/11 x64; a Vulkan 1.3 GPU with current drivers (NVIDIA GTX 10xx/RTX,
 AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 GB free for the
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.9.3): on 8 GB graphics cards the video memory use can exceed the card's budget in
+**Known issues** (v0.9.3a): on 8 GB graphics cards the video memory use can exceed the card's budget in
 long sessions (the driver then moves part of it to system RAM, which costs performance); rare "device
 lost" crashes. The Windows red-zone protection of the emulator is on by default and no longer a
 launcher setting: it prevents the 0xc0000005 crashes while a match loads and at random during play
@@ -204,6 +213,14 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
+**Novinky vo v0.9.3a:**
+
+- **Menu a prestrihy bežia až na 60 fps** (issue #22). Hra si v menu a prestrihoch žiada výstup 30 fps
+  ako na konzole a 60 fps len počas zápasu. Emulátor túto požiadavku teraz ignoruje a zobrazí každú
+  snímku, ktorú hra vykreslí. Rýchlosť hry sa nemení, animácie sú len plynulejšie. Menu a výber tímov
+  držia 60 fps; najťažšie prestrihy brzdí GPU vlákno emulátora a zatiaľ ostávajú na 20–30 fps. Pôvodné
+  správanie vráti `"ignore_flip_rate": false` v sekcii `GPU` súboru `user\config.json`.
+
 **Novinky vo v0.9.3:**
 
 - **Opravené náhodné pády na plochu počas hry** (chyba 0xc0000005, issue #32; rovnaká príčina ako pád
@@ -252,7 +269,7 @@ s prekladom shaderov GCN → SPIR-V.
 - Shader cache sa pri prvom spustení raz preloží nanovo (pár minút sekania).
 - Launcher: tlačidlo **♥ Podporte autora** (Ko-fi).
 
-**Hranie:** stiahnite `NHL24-PC-v0.9.3.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+**Hranie:** stiahnite `NHL24-PC-v0.9.3a.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
@@ -264,7 +281,7 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.3):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+**Známe problémy (v0.9.3a):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
 prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon), zriedkavé
 pády „device lost“. Ochrana red zone (Windows) je v emulátore predvolene zapnutá a už nie je
 nastavením v launcheri: bráni pádom 0xc0000005 pri načítaní zápasu aj náhodne počas hry (issues
