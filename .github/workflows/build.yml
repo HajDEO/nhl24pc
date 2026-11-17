@@ -72,3 +72,63 @@ jobs:
           ${{github.workspace}}/build/background.png
           ${{github.workspace}}/build/btn.png
           ${{github.workspace}}/build/ps4_pad.png
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Get date and git hash
+      id: vars
+      run: |
+        echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+        echo "shorthash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Add LLVM repository
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 mold build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev ninja-build
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-nhl24-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Configure CMake
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build nhl24
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc) -- -k 0
+
+    - name: Package AppImage
+      run: |
+        cd ${{github.workspace}}
+        wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+        wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-checkrt/releases/download/continuous/linuxdeploy-plugin-checkrt-x86_64.sh
+        chmod a+x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-checkrt-x86_64.sh
+        printf '[Desktop Entry]\nName=NHL24 PC\nExec=nhl24\nTerminal=false\nType=Application\nIcon=nhl24\nCategories=Game;\n' > nhl24.desktop
+        cp src/resources/nhl24.png nhl24.png
+        ./linuxdeploy-x86_64.AppImage --appdir AppDir
+        ./linuxdeploy-plugin-checkrt-x86_64.sh --appdir AppDir
+        ./linuxdeploy-x86_64.AppImage --appdir AppDir -d nhl24.desktop -e build/nhl24 -i nhl24.png --output appimage
+        mkdir -p pkg/nhl24-linux
+        mv "$(ls *-x86_64.AppImage | grep -v linuxdeploy)" pkg/nhl24-linux/nhl24.AppImage
+        cp -r release/user pkg/nhl24-linux/user
+        python3 -c "import json,sys; p=sys.argv[1]; j=json.load(open(p,encoding='utf-8-sig')); j['GPU']['full_screen']=True; json.dump(j,open(p,'w'),indent=4)" pkg/nhl24-linux/user/config.json
+        cp tools/linux/*.sh pkg/nhl24-linux/
+        chmod +x pkg/nhl24-linux/*.sh pkg/nhl24-linux/nhl24.AppImage
+        tar czf nhl24-linux.tar.gz -C pkg nhl24-linux
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: nhl24-pc-linux-${{ steps.vars.outputs.date }}-${{ steps.vars.outputs.shorthash }}
+        path: ${{github.workspace}}/nhl24-linux.tar.gz
