@@ -337,6 +337,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        .needs_shuffle_lowering = instance.GetDriverID() == vk::DriverId::eIntelProprietaryWindows,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
