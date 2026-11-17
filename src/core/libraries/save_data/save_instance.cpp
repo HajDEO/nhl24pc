@@ -6,6 +6,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
@@ -162,21 +163,23 @@ void SaveInstance::SetupAndMount(bool read_only, bool copy_icon, bool ignore_cor
         }
         exists = true;
     } else {
-        std::optional<fs::filesystem_error> err;
-        if (!ignore_corrupt && fs::exists(corrupt_file_path)) {
-            err = fs::filesystem_error("Corrupted save data", corrupt_file_path,
-                                       std::make_error_code(std::errc::illegal_byte_sequence));
-        } else if (!param_sfo.Open(param_sfo_path)) {
-            err = fs::filesystem_error("Failed to read param.sfo", param_sfo_path,
+        const bool flagged_corrupt = !ignore_corrupt && fs::exists(corrupt_file_path);
+        if (flagged_corrupt && dont_restore_backup) {
+            throw fs::filesystem_error("Corrupted save data", corrupt_file_path,
                                        std::make_error_code(std::errc::illegal_byte_sequence));
         }
-        if (err.has_value()) {
-            if (dont_restore_backup) {
-                throw err.value();
-            }
-            if (Backup::Restore(save_path)) {
-                return SetupAndMount(read_only, copy_icon, ignore_corrupt, true);
-            }
+        const bool readable = param_sfo.Open(param_sfo_path);
+        if ((flagged_corrupt || !readable) && !dont_restore_backup && Backup::Restore(save_path)) {
+            return SetupAndMount(read_only, copy_icon, ignore_corrupt, true);
+        }
+        // The flag only tells that the save was still mounted when the emulator went away. Without
+        // a backup its files are all there is, so they stay in use, and parameters that are
+        // missing are created again instead of being written back empty on unmount.
+        if (!readable || param_sfo.GetEntries().empty()) {
+            LOG_WARNING(Lib_SaveData, "Rebuilding the parameters of save {}", dir_name);
+            param_sfo = PSF();
+            SetupDefaultParamSFO(param_sfo, dir_name, game_serial);
+            param_sfo.AddBinary(std::string{SaveParams::SAVEDATA_BLOCKS}, max_blocks, true);
         }
     }
 

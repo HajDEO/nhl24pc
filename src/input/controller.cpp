@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -269,6 +269,26 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 
 static bool is_first_check = true;
 
+static void EnableMotionSensors(SDL_Gamepad* pad) {
+    if (!EmulatorSettings.IsMotionControlsEnabled()) {
+        return;
+    }
+    if (SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true)) {
+        const float poll_rate = SDL_GetGamepadSensorDataRate(pad, SDL_SENSOR_GYRO);
+        LOG_INFO(Input, "Gyro initialized, poll rate: {}", poll_rate);
+    } else {
+        LOG_ERROR(Input, "Failed to initialize gyro controls for gamepad {}",
+                  SDL_GetGamepadID(pad));
+    }
+    if (SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true)) {
+        const float poll_rate = SDL_GetGamepadSensorDataRate(pad, SDL_SENSOR_ACCEL);
+        LOG_INFO(Input, "Accel initialized, poll rate: {}", poll_rate);
+    } else {
+        LOG_ERROR(Input, "Failed to initialize accel controls for gamepad {}",
+                  SDL_GetGamepadID(pad));
+    }
+}
+
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
     int controller_count;
@@ -300,6 +320,28 @@ void GameControllers::TryOpenSDLControllers() {
         }
     }
 
+    std::erase_if(spare_gamepads, [&](SDL_Gamepad* pad) {
+        const SDL_JoystickID id = SDL_GetGamepadID(pad);
+        if (std::find(new_joysticks, new_joysticks + controller_count, id) !=
+            new_joysticks + controller_count) {
+            assigned_ids.insert(id);
+            return false;
+        }
+        SDL_CloseGamepad(pad);
+        return true;
+    });
+    if (!slot_taken[0] && !spare_gamepads.empty()) {
+        if (auto u = UserManagement.GetUserByPlayerIndex(1)) {
+            SDL_Gamepad* pad = spare_gamepads.front();
+            spare_gamepads.erase(spare_gamepads.begin());
+            LOG_INFO(Input, "Spare gamepad {} takes over slot 0", SDL_GetGamepadID(pad));
+            slot_taken[0] = true;
+            controllers[0]->user_id = u->user_id;
+            UserManagement.LoginUser(u, 1);
+            controllers[0]->ConnectController(pad);
+        }
+    }
+
     for (int j = 0; j < controller_count; j++) {
         SDL_JoystickID id = new_joysticks[j];
         if (assigned_ids.contains(id))
@@ -307,6 +349,13 @@ void GameControllers::TryOpenSDLControllers() {
 
         SDL_Gamepad* pad = SDL_OpenGamepad(id);
         if (!pad) {
+            continue;
+        }
+
+        if (EmulatorSettings.IsMergeControllersEnabled() && slot_taken[0]) {
+            LOG_INFO(Input, "Gamepad {} is a spare for slot 0", id);
+            EnableMotionSensors(pad);
+            spare_gamepads.push_back(pad);
             continue;
         }
 
@@ -325,24 +374,7 @@ void GameControllers::TryOpenSDLControllers() {
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
-                if (EmulatorSettings.IsMotionControlsEnabled()) {
-                    if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
-                        const float poll_rate =
-                            SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_GYRO);
-                        LOG_INFO(Input, "Gyro initialized, poll rate: {}", poll_rate);
-                    } else {
-                        LOG_ERROR(Input, "Failed to initialize gyro controls for gamepad {}",
-                                  c->user_id);
-                    }
-                    if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_ACCEL, true)) {
-                        const float poll_rate =
-                            SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_ACCEL);
-                        LOG_INFO(Input, "Accel initialized, poll rate: {}", poll_rate);
-                    } else {
-                        LOG_ERROR(Input, "Failed to initialize accel controls for gamepad {}",
-                                  c->user_id);
-                    }
-                }
+                EnableMotionSensors(pad);
                 break;
             }
         }
@@ -358,6 +390,26 @@ void GameControllers::TryOpenSDLControllers() {
     }
     SDL_free(new_joysticks);
 }
+
+bool GameControllers::RouteGamepadEvent(const SDL_Event& event) {
+    const auto spare = std::ranges::find(spare_gamepads, SDL_GetGamepadFromID(event.gdevice.which));
+    if (spare == spare_gamepads.end()) {
+        return true;
+    }
+    if (event.type != SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        return false;
+    }
+    SDL_Gamepad* const previous = controllers[0]->m_sdl_gamepad;
+    LOG_INFO(Input, "Spare gamepad {} takes over slot 0", event.gdevice.which);
+    controllers[0]->ConnectController(*spare);
+    if (previous) {
+        *spare = previous;
+    } else {
+        spare_gamepads.erase(spare);
+    }
+    return true;
+}
+
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
     ASSERT(g != nullptr);

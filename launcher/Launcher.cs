@@ -5,7 +5,8 @@
 //   Advanced – keyboard bindings over a DualShock 4 picture and the full display settings
 // Writes the port's own files:
 //   user\config.json              (GPU section: window size, fullscreen, present mode, FSR/RCAS;
-//                                  General section: redzone_patches (Windows red-zone protection);
+//                                  General section: a redzone_patches saved by an older launcher is removed;
+//                                  Input section: merge_controllers (all controllers control player 1);
 //                                  Launcher section: language)
 //   user\input_config\default.ini (keyboard bindings; controller bindings stay 1:1)
 //   user\game_path.txt            (eboot.bin of a game folder other than game\ next to the exe)
@@ -64,10 +65,9 @@ namespace NhlPort
             { "sharpness", new[] { "Zaostrenie", "Sharpness" } },
             { "vsync", new[] { "VSync", "VSync" } },
             { "vsync_desc", new[] { "Synchronizácia s obnovovacou frekvenciou (bez trhania, mierne vyššia odozva).", "Synchronises with the refresh rate (no tearing, slightly more input lag)." } },
-            { "redzone", new[] { "Ochrana red zone (Windows)", "Red zone protection (Windows)" } },
-            { "redzone_desc", new[] { "Experimentálna oprava pádu pri načítaní zápasu (chyba 0xc0000005 hneď po výbere tímov). Zapni, ak ti hra takto padá; môže mierne znížiť výkon. Platí od ďalšieho spustenia.",
-                                      "Experimental fix for the crash while a match loads (error 0xc0000005 right after team selection). Turn it on if the game crashes like that; may cost a little performance. Takes effect on the next start." } },
-            { "redzone_short", new[] { "Red zone ✓", "Red zone ✓" } },
+            { "merge", new[] { "Všetky ovládače ovládajú hráča 1", "All controllers control player 1" } },
+            { "merge_desc", new[] { "Zapni, ak striedaš ovládače (napr. keď sa jeden vybije): hru ovláda ten, na ktorom naposledy stlačíš tlačidlo, a profil ostáva rovnaký. Pre lokálny multiplayer nechaj vypnuté. Platí od ďalšieho spustenia.",
+                                    "Turn it on if you swap controllers (e.g. when one runs out of battery): the game follows the controller you last pressed a button on and keeps the same profile. Leave it off for local multiplayer. Takes effect on the next start." } },
             { "lang", new[] { "Jazyk launchera", "Launcher language" } },
             { "play", new[] { "HRAŤ", "PLAY" } },
             { "save", new[] { "Uložiť", "Save" } },
@@ -464,7 +464,7 @@ namespace NhlPort
     // ------------------------------------------------------------------ the form
     public class LauncherForm : Form
     {
-        const string FallbackVersion = "0.9.2b";
+        const string FallbackVersion = "0.9.3";
         string PortVersion = FallbackVersion; // taken from the version resource of nhl24.exe when present
         const string DefaultTitleId = "CUSA37933";
         static readonly string[] SupportedTitleIds = { "CUSA37933", "CUSA37934" };
@@ -491,7 +491,7 @@ namespace NhlPort
         GlassSlider sharpBar;
         TransparentLabel sharpValue, pkgReqLabel, summaryLabel, versionLabel, gameVersionLabel, statusLabel;
         CheckBox vsyncQuick;
-        CheckBox redzoneQuick;
+        CheckBox mergeQuick;
         ImageButton playButton;
         FlatButton simpleBtn, advancedBtn;
         // pkg progress
@@ -877,11 +877,14 @@ namespace NhlPort
                 config["Launcher"] = new Dictionary<string, object>();
             if (!config.ContainsKey("General") || !(config["General"] is Dictionary<string, object>))
                 config["General"] = new Dictionary<string, object>();
+            if (!config.ContainsKey("Input") || !(config["Input"] is Dictionary<string, object>))
+                config["Input"] = new Dictionary<string, object>();
         }
 
         Dictionary<string, object> Gpu { get { return (Dictionary<string, object>)config["GPU"]; } }
         Dictionary<string, object> Launcher { get { return (Dictionary<string, object>)config["Launcher"]; } }
         Dictionary<string, object> General { get { return (Dictionary<string, object>)config["General"]; } }
+        Dictionary<string, object> Input { get { return (Dictionary<string, object>)config["Input"]; } }
 
         object GpuValue(string key, object fallback)
         {
@@ -893,22 +896,6 @@ namespace NhlPort
         {
             object v;
             return Launcher.TryGetValue(key, out v) ? v : fallback;
-        }
-
-        // General section of the emulator: only redzone_patches is edited, the other keys are kept as they are
-        object GeneralValue(string key, object fallback)
-        {
-            object v;
-            return General.TryGetValue(key, out v) ? v : fallback;
-        }
-
-        static bool ToBool(object value, bool fallback)
-        {
-            if (value == null) return fallback;
-            if (value is bool) return (bool)value;
-            bool b;
-            if (bool.TryParse(Convert.ToString(value), out b)) return b;
-            return fallback;
         }
 
         void SaveConfig()
@@ -933,9 +920,10 @@ namespace NhlPort
             Gpu["rcas_attenuation"] = sharpnessBar.Value;
             Gpu["vblank_frequency"] = 60;
             Launcher["language"] = Loc.Lang;
-            // Windows static guest red-zone protection of the emulator (src/core/cpu_patches.cpp): fixes the
-            // crash while a match loads when a page-protection fault clobbers the red zone of a leaf function.
-            General["redzone_patches"] = redzoneQuick.Checked;
+            // The Windows red-zone protection (src/core/cpu_patches.cpp) is on by default and no longer a launcher
+            // setting, so a value saved by an older launcher is dropped and the emulator default applies.
+            General.Remove("redzone_patches");
+            Input["merge_controllers"] = mergeQuick.Checked;
             var ser = new JavaScriptSerializer();
             Directory.CreateDirectory(Path.GetDirectoryName(configPath));
             File.WriteAllText(configPath, PrettyJson(ser.Serialize(config)), new UTF8Encoding(false));
@@ -1111,11 +1099,11 @@ namespace NhlPort
             quickPanel.Controls.Add(vsyncQuick);
             quickPanel.Controls.Add(new TransparentLabel { Left = c2, Top = y + 28, Width = cw, Height = 40, Font = Theme.Small, ForeColor = Color.FromArgb(200, 210, 225), Text = Loc.T("vsync_desc") });
             y += 70;
-            redzoneQuick = new CheckBox { Left = c1, Top = y, Width = 600, Height = 24, Font = Theme.Body, ForeColor = Color.White, BackColor = Color.Transparent, Text = Loc.T("redzone"),
-                Checked = ToBool(GeneralValue("redzone_patches", false), false) };
-            quickPanel.Controls.Add(redzoneQuick);
-            quickPanel.Controls.Add(new TransparentLabel { Left = c1, Top = y + 26, Width = 600, Height = 44, Font = Theme.Small, ForeColor = Color.FromArgb(200, 210, 225), Text = Loc.T("redzone_desc") });
-            redzoneQuick.CheckedChanged += delegate { RefreshSummary(); };
+            object merge;
+            mergeQuick = new CheckBox { Left = c1, Top = y, Width = 600, Height = 24, Font = Theme.Body, ForeColor = Color.White, BackColor = Color.Transparent, Text = Loc.T("merge"),
+                Checked = Input.TryGetValue("merge_controllers", out merge) && merge is bool && (bool)merge };
+            quickPanel.Controls.Add(mergeQuick);
+            quickPanel.Controls.Add(new TransparentLabel { Left = c1, Top = y + 26, Width = 600, Height = 44, Font = Theme.Small, ForeColor = Color.FromArgb(200, 210, 225), Text = Loc.T("merge_desc") });
 
             // the quick controls mirror the advanced ones
             outputBox.TextChanged += delegate { resolutionBox.Text = outputBox.Text; RefreshSummary(); };
@@ -1295,7 +1283,6 @@ namespace NhlPort
             parts.Add(displayModeBox.SelectedIndex >= 0 ? (string)displayModeBox.Items[displayModeBox.SelectedIndex] : "");
             parts.Add(upscalerBox.SelectedIndex >= 0 ? (string)upscalerBox.Items[upscalerBox.SelectedIndex] : "");
             parts.Add(Loc.T("vsync") + (vsyncQuick.Checked ? " ✓" : " ✗"));
-            if (redzoneQuick != null && redzoneQuick.Checked) parts.Add(Loc.T("redzone_short"));
             summaryLabel.Text = string.Join("   •   ", parts.ToArray()).ToUpperInvariant();
         }
 

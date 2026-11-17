@@ -1,5 +1,103 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.3: zmiznuté rostre, prázdny param.sfo po nečistom ukončení (2026-11-17, issue #29)
+
+**Vlastné rostre a tímy na druhý deň „zmizli“.** `SaveInstance::SetupAndMount`
+(`src/core/libraries/save_data/save_instance.cpp`) pri pripojení savu na zápis vytvorí
+`sce_sys/corrupted` a `Umount` ho zmaže. Keď emulátor skončí, kým je save pripojený (pád, zabitý
+proces, zatvorenie okna počas ukladania), značka ostane. Pri ďalšom pripojení vetva „corrupted“
+preskočila `param_sfo.Open`, a keďže NHL 24 zálohy savov nepoužíva (`Backup::Restore` vráti
+`false`, v savoch nie je `sce_backup`), kód pokračoval s prázdnym `PSF` a `Umount` ním prepísal
+`sce_sys/param.sfo` (aj pri pripojení len na čítanie; hra pri vstupe do menu takto prejde všetky
+savy). Rovnako dopadol nečitateľný `param.sfo` bez zálohy.
+
+**Reprodukcia:** prázdny súbor `RosterCustom0\sce_sys\corrupted`, spustenie hry a vstup do menu
+(`Lib.SaveData:trace`): `sceSaveDataMount2 RosterCustom0, mode: 1` → `Restoring backup` →
+`Umount`; `param.sfo` má potom 20 bajtov (hlavička bez položiek) namiesto 1596, `DATA` ostáva.
+
+**Oprava.** Značka sama save nezahodí: ak záloha nie je, `param.sfo` sa načíta a save sa pripojí.
+Ak je `param.sfo` nečitateľný alebo bez položiek, parametre sa vytvoria znova
+(`SetupDefaultParamSFO` + `SAVEDATA_BLOCKS`), takže sa na disk už nezapíše prázdny súbor a savy
+poškodené staršou verziou sa pri najbližšom pripojení opravia. Obnova zo zálohy (ak existuje)
+a `BROKEN` pri značke po obnove ostali.
+
+**Overenie.** S poškodeným `param.sfo` (20 bajtov) hra po oprave zapíše nový s 8 položkami
+(1596 bajtov, log `Rebuilding the parameters of save RosterCustom0`) a dostane sa do hlavného menu.
+Obnovené parametre majú predvolený názov („Saved Data“ namiesto „Custom Roster 1“, prázdny
+podtitul a detail); či hra roster s takým názvom v zozname ukáže, overené nie je. Súbor `DATA`
+sa nemení.
+
+## v0.9.3: všetky ovládače ako hráč 1 (2026-11-17, issue #31)
+
+**Druhý ovládač vynútil nový profil („shadPS4-2“).** `GameControllers::TryOpenSDLControllers`
+(`src/input/controller.cpp`) dá každému pripojenému gamepadu ďalší slot a prihlási jeho používateľa
+(`UserManagement.LoginUser(u, i + 1)`), čo je správne pre lokálny multiplayer. Kto má dva ovládače
+a strieda ich (reportér: dva 8BitDo, jeden sa vybíja), zapne druhý ešte pri zapnutom prvom, ten
+dostane slot 1 a používateľa 2 a hra pýta profil. Upstream sa správa rovnako.
+
+**Riešenie.** Nové nastavenie `Input.merge_controllers` (`src/core/emulator_settings.h`, predvolene
+`false`, multiplayer bez zmeny). Keď je zapnuté, gamepad pripojený pri obsadenom slote 0 sa otvorí
+ako náhradný (`spare_gamepads`) a neprihlási ďalšieho používateľa. `RouteGamepadEvent` (volá ho
+`WindowSDL::OnGamepadEvent`) udalosti náhradných gamepadov zahadzuje, aby šum páčok nečinného
+ovládača neprepisoval vstup aktívneho; stlačenie tlačidla na náhradnom ho spraví gamepadom slotu 0
+a doterajší sa stane náhradným. Keď sa gamepad slotu 0 odpojí, slot prevezme prvý náhradný.
+Vibrácie, svetlo a pohybové senzory idú na aktívny gamepad. Launcher má v rýchlych nastaveniach
+prepínač **Všetky ovládače ovládajú hráča 1** (zapisuje `Input.merge_controllers`).
+
+**Overenie.** Build prešiel; so zapnutým nastavením a jedným gamepadom hra nabootovala, gamepad
+dostal slot 0 a CPU vs CPU zápas bežal do zatvorenia okna (283 s, bez `<Critical>`). Striedanie
+dvoch gamepadov ani odpojenie aktívneho sa lokálne overiť nedalo (jeden ovládač). Tlačidlo držané
+na pôvodnom gamepade v okamihu prevzatia ostane stlačené, kým sa na novom nestlačí a nepustí.
+
+## v0.9.3: ochrana red zone predvolene zapnutá a úplné pokrytie (2026-11-17, issue #32)
+
+**Náhodný pád počas hry (0xc0000005, čítanie z 0x0, v0.9.2b, hra v01.60).** Dva minidumpy z jedného
+večera (`crash_1794789268.dmp`, `crash_1794792677.dmp`, vlákno Job1) padajú na `eboot+0x666096a`,
+inštrukcia `mov rbx,[rbx]` s RBX=0 a RDX=0, RSP v oboch behoch 0x7ef8d3118. Je to tá istá listová
+funkcia ako v issues #1/#3 (vo v01.00 na `eboot+0x662f83f`, sekcia „v0.8.3: ochrana red zone“): pred
+pádom načíta `rbx` z `[rsp-0x28]`, `rsi` z `[rsp-0x18]` a `rdx` z `[rsp-0x20]`, epilóg má len `pop`,
+teda lokálne hodnoty žijú v red zone. Slučka pred tým číta bajty z haldy (`movzx edx,[r11+rbp]`,
+`movzx esi,[r10+rbx*2+1]`, `movzx edx,[rcx-2]`); pri `readbacks_mode = 1` buffer cache chráni
+stránky zmenené z GPU aj proti čítaniu, prvé čítanie vyvolá access violation a Windows pri dispatchi
+výnimky prepíše red zone. Preto pád nie je viazaný na jedno miesto v hre a príde po 15–60 minútach.
+
+**Riešenie.** Upstream ochrana (`General.redzone_patches`, `src/core/cpu_patches.cpp`) je v
+emulátore predvolene zapnutá (`src/core/emulator_settings.h`). Prepínač **Ochrana red zone
+(Windows)** z launchera zmizol (`launcher/Launcher.cs`): `SaveConfig` namiesto zápisu kľúč
+`General.redzone_patches` z configu odstráni, takže `false` uložené starším launcherom alebo zo
+šablóny `release/user/config.json` (nezmenená) prestane platiť pri prvom spustení hry z launchera.
+README a README.txt balíka prepínač ešte spomínajú.
+
+**Pokrytie patchera.** S pôvodným kódom ostalo v `eboot.bin` nechránených 246 inštrukcií
+(`1 stack-dependent, 2 control-flow, 243 unrelocatable`), z toho 229 vo funkciách s nepriamym
+skokom, ktorý patcher nerozlúštil (33 skokov v 22 funkciách); v takej funkcii nesmie presúvať
+susedné inštrukcie a krátke (< 5 bajtov) nemá čím nahradiť. Zmeny v `cpu_patches.cpp`:
+- `ResolveJumpTable` (predtým `ResolveBoundedJumpTable`): `movsxd` tabuľky môže byť až 16
+  inštrukcií pred `add` a `add` až 32 pred `jmp`; index sa sleduje cez kópie (`mov ebx, r8d`,
+  `movzx ecx, r10b`); hranicu dá aj maska `and index, imm`. Bez rozpoznanej hranice sa tabuľka číta
+  po prvú položku, ktorá nemôže byť cieľom v tejto funkcii (mimo funkcie alebo doprostred už
+  dekódovanej inštrukcie), a ak sa nenájde `lea` registra tabuľky, berú sa všetky tabuľky, ktorých
+  adresu funkcia berie. Ciele navyše len nechajú viac inštrukcií na mieste. Skoky sa riešia znova,
+  kým pribúdajú bloky.
+- `IsIndirectTailCall`: `jmp [mem]` alebo `mov reg,[mem]` + `jmp reg` so 64-bitovým ukazovateľom bez
+  indexu a s RSP na vstupnej hodnote je odchod z funkcie, nie skok dovnútra.
+- Živosť red zone sleduje aj ciele rozlúštených tabuliek. Predtým `jmp reg` nemal nasledovníkov, takže
+  red zone pred `switch` vyzerala mŕtva, hoci ju vetvy čítajú.
+- Relokácia: krátke podmienené skoky (rel8) sa v trampolíne kódujú ako rel32 (Zydis inak zlyhal na
+  dosahu), krátke miesto hneď za už presunutým úsekom sa doň priberie a `push [mem]` / `jmp [mem]`
+  idú rovnakou cestou ako `call [mem]` (hodnota sa načíta s RSP pod red zone).
+
+**Overenie (lokálne, RTX 5060, Ryzen 5 4500, hra v01.60).** `ReadProcessMemory` na
+`eboot+0x666096a-64`: s `redzone_patches = false` je 128 bajtov zhodných s dumpom reportéra, s
+`true` sú čítania z haldy aj `mov rbx,[rbx]` nahradené skokmi `e9` do trampolín (načítania z
+`[rsp-..]` ostávajú, tie výnimku nevyvolajú). Hlásenie `static patching ... is partial` po zmenách
+nevypíše žiadny modul (0 nechránených inštrukcií). CPU vs CPU zápas (klávesy n, n, n, c; zápas
+načítaný +115 s od prvého framu) bežal do zatvorenia okna: 385 s, 14287 snímok, žiadny `<Critical>`
+ani `Failed to patch`. Cena: analýza pri štarte, načítanie `eboot.bin` ~25 s namiesto ~4 s, rovnako
+pred zmenami patchera aj po nich. Pád sa nedá vyvolať na požiadanie, dlhé hranie overené nie je.
+Nepokryté ostávajú special user APC (`Pthread::WakeForSignal`, zrušenie vlákna), ktoré Windows
+doručí na ľubovoľnej inštrukcii. Zmeny rozlúštenia tabuliek platia aj pre statické CPU patche na
+Linuxe a macOS (`PatchCpuInstructionsStatically`), tam netestované.
 ## v0.9.2b: Create a Team z Franchise Mode (2026-11-03, issue #13)
 
 **Create a Team otvorené z franšízy s expanzným draftom stále padalo** na rovnaký assert

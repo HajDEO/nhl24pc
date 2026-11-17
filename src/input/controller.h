@@ -7,7 +7,9 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <vector>
 
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_gamepad.h>
 #include "SDL3/SDL_joystick.h"
 #include "common/assert.h"
@@ -129,6 +131,7 @@ private:
 
 class GameControllers {
     std::array<GameController*, 5> controllers;
+    std::vector<SDL_Gamepad*> spare_gamepads;
 
 public:
     GameControllers()
@@ -142,6 +145,9 @@ public:
         return controllers[i];
     }
     void TryOpenSDLControllers();
+    /// With merged controllers, every gamepad but the one of the first player is a spare: a button
+    /// press makes it that player's gamepad, its other events are to be dropped (returns false).
+    bool RouteGamepadEvent(const SDL_Event& event);
     u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);

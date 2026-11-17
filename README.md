@@ -13,7 +13,7 @@ implementations, and the GPU work goes through Vulkan.
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.2b** (2026-11-03), Windows 10/11 x64 |
+| Current build | **v0.9.3** (2026-11-17), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -65,10 +65,27 @@ CPU directly, at native speed. What the emulator provides is everything around i
 - **Launcher** (`launcher/`, C# WinForms, needs only the .NET Framework 4 that ships with Windows):
   extracts the base/update PKG with shadPS4's PKG/PFS code built into `nhl24.exe`
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
-  fullscreen, vsync, sharpening, language, controls, the Windows red-zone protection) and starts the game.
+  fullscreen, vsync, sharpening, language, controls, all controllers as player 1) and starts the game.
+
+## What's new in v0.9.3
+
+- **Random crashes to the desktop during play fixed** (error 0xc0000005, issue #32; the same cause as
+  the crash while a match loads, issues #1/#3). Some game functions keep local values in the "red
+  zone" below the stack pointer. When such a function touched memory the emulator had protected,
+  Windows wrote its exception data over those values and the game crashed a moment later. The
+  emulator's red-zone protection is now on by default and was extended to cover every affected
+  instruction of the game (246 were left unprotected before). It is no longer a launcher setting. The
+  game needs about 20 s longer to start, because its code is analysed first.
+- **Custom rosters and teams no longer disappear** (issue #29). If the game was closed or crashed
+  while a save was in use, the next start overwrote that save's description file (`param.sfo`) with
+  an empty one and the game stopped recognising the save. The file is no longer overwritten, and a
+  save damaged this way is repaired on the next start; the roster data itself was never deleted.
+- **Swapping controllers keeps your profile** (issue #31). A second controller used to become
+  player 2 with a new profile ("shadPS4-2"). The launcher has a new option **All controllers control
+  player 1** (off by default, so local multiplayer works as before): the game follows the controller
+  you last pressed a button on.
 
 ## What's new in v0.9.2b
-
 - **Create a Team crash fixed when opened from Franchise Mode** (issue #13). Starting a Franchise with
   an expansion draft and creating the new team still crashed in v0.9.2. That screen uses another shader
   with the same kind of jump table, and the shader recompiler misread the texture registers of an
@@ -101,7 +118,7 @@ CPU directly, at native speed. What the emulator provides is everything around i
 
 ## Playing
 
-1. Download `NHL24-PC-v0.9.2b.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+1. Download `NHL24-PC-v0.9.3.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
@@ -123,12 +140,12 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.9.2b): on 8 GB graphics cards the video memory use can exceed the card's budget in
+**Known issues** (v0.9.3): on 8 GB graphics cards the video memory use can exceed the card's budget in
 long sessions (the driver then moves part of it to system RAM, which costs performance); rare "device
-lost" crashes. If the game
-crashes while a match loads (right after team selection, error 0xc0000005, issues #1/#3), turn on **Red zone
-protection (Windows)** in the launcher's quick settings (off by default, experimental; see `docs/DEVLOG.sk.md`,
-section "v0.8.3: ochrana red zone"). Windows SmartScreen may warn about the unsigned exe
+lost" crashes. The Windows red-zone protection of the emulator is on by default and no longer a
+launcher setting: it prevents the 0xc0000005 crashes while a match loads and at random during play
+(issues #1/#3/#32, see `docs/DEVLOG.sk.md`) and adds about 20 s to the start of the game. Windows
+SmartScreen may warn about the unsigned exe
 (More info → Run anyway); some antivirus products dislike emulators that map large memory regions – add
 an exception if needed.
 
@@ -187,8 +204,24 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
-**Novinky vo v0.9.2b:**
+**Novinky vo v0.9.3:**
 
+- **Opravené náhodné pády na plochu počas hry** (chyba 0xc0000005, issue #32; rovnaká príčina ako pád
+  pri načítaní zápasu, issues #1/#3). Niektoré funkcie hry si držia lokálne hodnoty v „red zone“ pod
+  ukazovateľom zásobníka. Keď taká funkcia siahla na pamäť, ktorú si emulátor chránil, Windows tieto
+  hodnoty prepísal dátami výnimky a hra o chvíľu spadla. Ochrana red zone v emulátore je teraz
+  predvolene zapnutá a pokrýva všetky dotknuté inštrukcie hry (predtým ich 246 ostávalo nechránených).
+  V launcheri už nie je ako nastavenie. Hra štartuje asi o 20 s dlhšie, lebo sa najprv analyzuje jej kód.
+- **Vlastné rostre a tímy už nemiznú** (issue #29). Ak sa hra zavrela alebo spadla, kým sa používala
+  uložená pozícia, ďalší štart prepísal jej popisný súbor (`param.sfo`) prázdnym a hra pozíciu prestala
+  spoznávať. Súbor sa už neprepisuje a takto poškodená pozícia sa pri ďalšom štarte opraví; samotné
+  dáta rostrov sa nikdy nemazali.
+- **Striedanie ovládačov zachová profil** (issue #31). Druhý ovládač sa doteraz stal hráčom 2 s novým
+  profilom („shadPS4-2“). Launcher má nové nastavenie **Všetky ovládače ovládajú hráča 1** (predvolene
+  vypnuté, takže lokálny multiplayer funguje ako doteraz): hru ovláda ten ovládač, na ktorom ste
+  naposledy stlačili tlačidlo.
+
+**Novinky vo v0.9.2b:**
 - **Opravený pád pri Create a Team vo Franchise Mode** (issue #13). Franšíza s expanzným draftom a
   vytvorením nového tímu vo v0.9.2 stále zhodila hru. Táto obrazovka používa iný shader s rovnakým
   typom skokovej tabuľky a recompiler shaderov si registre textúry pri vzorkovaní obrázka pomýlil s
@@ -219,7 +252,7 @@ s prekladom shaderov GCN → SPIR-V.
 - Shader cache sa pri prvom spustení raz preloží nanovo (pár minút sekania).
 - Launcher: tlačidlo **♥ Podporte autora** (Ko-fi).
 
-**Hranie:** stiahnite `NHL24-PC-v0.9.2b.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+**Hranie:** stiahnite `NHL24-PC-v0.9.3.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
@@ -231,11 +264,11 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.2b):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+**Známe problémy (v0.9.3):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
 prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon), zriedkavé
-pády „device lost“. Ak hra padá pri načítaní zápasu (hneď po
-výbere tímov, chyba 0xc0000005), zapnite v launcheri **Ochrana red zone (Windows)** (predvolene vypnuté,
-experimentálne; rozbor v `docs/DEVLOG.sk.md`, sekcia „v0.8.3: ochrana red zone“).
+pády „device lost“. Ochrana red zone (Windows) je v emulátore predvolene zapnutá a už nie je
+nastavením v launcheri: bráni pádom 0xc0000005 pri načítaní zápasu aj náhodne počas hry (issues
+#1/#3/#32, rozbor v `docs/DEVLOG.sk.md`) a predlžuje štart hry asi o 20 s.
 
 **Vývoj:** zdrojáky emulátora v `src/` (zmeny pre NHL sú označené `nhlport`), launcher v `launcher/`,
 skripty v `tools/`, denník vývoja v `docs/DEVLOG.sk.md`. Build: `tools\build_nhlport.ps1`,

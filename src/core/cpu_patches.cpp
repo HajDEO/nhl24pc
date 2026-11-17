@@ -1171,6 +1171,7 @@ struct DecodedCodeInstruction {
 struct DecodedFunction {
     std::map<uintptr_t, DecodedCodeInstruction> instructions;
     std::set<uintptr_t> branch_targets;
+    std::map<uintptr_t, std::vector<uintptr_t>> indirect_branch_targets;
     bool uses_red_zone{};
     bool has_indirect_branch{};
     bool requires_conservative_red_zone_tracking{};
@@ -1337,7 +1338,7 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
                                });
 }
 
-std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
+std::optional<std::vector<uintptr_t>> ResolveJumpTable(
     const DecodedFunction& function, uintptr_t branch_address, uintptr_t function_start,
     uintptr_t function_end, uintptr_t segment_start, uintptr_t segment_end) {
     const auto branch = function.instructions.find(branch_address);
@@ -1358,7 +1359,7 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
                    : function.instructions.end();
     };
 
-    constexpr size_t MaxInterveningInstructions = 4;
+    constexpr size_t MaxInterveningInstructions = 32;
     auto add = function.instructions.end();
     auto pattern_cursor = branch;
     for (size_t count = 0; count <= MaxInterveningInstructions; ++count) {
@@ -1384,22 +1385,40 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
     }
     const ZydisRegister table_reg = add->second.operands[1].reg.value;
 
-    const auto load = previous_contiguous(add);
-    if (load == function.instructions.end() ||
-        load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
-        load->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        !IsSameRegister(load->second.operands[0].reg.value, target_reg) ||
-        load->second.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-        !IsSameRegister(load->second.operands[1].mem.base, table_reg) ||
-        load->second.operands[1].mem.index == ZYDIS_REGISTER_NONE ||
-        load->second.operands[1].mem.scale != sizeof(s32)) {
+    constexpr size_t MaxLoadDistance = 16;
+    auto load = function.instructions.end();
+    pattern_cursor = add;
+    for (size_t count = 0; count <= MaxLoadDistance; ++count) {
+        const auto candidate = previous_contiguous(pattern_cursor);
+        if (candidate == function.instructions.end()) {
+            break;
+        }
+        const auto& decoded = candidate->second;
+        if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOVSXD &&
+            decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            IsSameRegister(decoded.operands[0].reg.value, target_reg) &&
+            decoded.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            IsSameRegister(decoded.operands[1].mem.base, table_reg) &&
+            decoded.operands[1].mem.index != ZYDIS_REGISTER_NONE &&
+            decoded.operands[1].mem.scale == sizeof(s32)) {
+            load = candidate;
+            break;
+        }
+        if (WritesRegister(decoded, target_reg) || WritesRegister(decoded, table_reg) ||
+            IsControlFlowTerminator(decoded.instruction)) {
+            return std::nullopt;
+        }
+        pattern_cursor = candidate;
+    }
+    if (load == function.instructions.end()) {
         return std::nullopt;
     }
-    const ZydisRegister index_reg = load->second.operands[1].mem.index;
+    ZydisRegister index_reg = load->second.operands[1].mem.index;
 
+    // The table size comes from the bounds check of the switch. Without a recognizable one, the
+    // table is read up to its first entry that cannot be a jump target of this function.
     constexpr size_t MaxPatternInstructions = 64;
     std::optional<size_t> table_size;
-    std::optional<uintptr_t> guarded_path_start;
     auto cursor = load;
     for (size_t count = 0; count < MaxPatternInstructions; ++count) {
         cursor = previous_contiguous(cursor);
@@ -1413,36 +1432,51 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
             decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
             const uintptr_t next_address = decoded.address + decoded.instruction.length;
             const auto bounds_branch = function.instructions.find(next_address);
-            if (bounds_branch == function.instructions.end()) {
-                return std::nullopt;
-            }
             const s64 bound = decoded.operands[1].imm.is_signed
                                   ? decoded.operands[1].imm.value.s
                                   : static_cast<s64>(decoded.operands[1].imm.value.u);
-            if (bound < 0) {
-                return std::nullopt;
+            if (bounds_branch == function.instructions.end() || bound < 0) {
+                break;
+            }
+            const uintptr_t guarded_path_start =
+                next_address + bounds_branch->second.instruction.length;
+            if (std::ranges::any_of(function.branch_targets, [&](uintptr_t target) {
+                    return target >= guarded_path_start && target <= branch_address;
+                })) {
+                break;
             }
             if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNBE) {
                 table_size = static_cast<size_t>(bound) + 1;
             } else if (bounds_branch->second.instruction.mnemonic == ZYDIS_MNEMONIC_JNB) {
                 table_size = static_cast<size_t>(bound);
-            } else {
-                return std::nullopt;
             }
-            guarded_path_start = next_address + bounds_branch->second.instruction.length;
+            break;
+        }
+        if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_AND &&
+            decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            decoded.operands[0].size >= 32 &&
+            IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
+            decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            const s64 mask = decoded.operands[1].imm.is_signed
+                                 ? decoded.operands[1].imm.value.s
+                                 : static_cast<s64>(decoded.operands[1].imm.value.u);
+            if (mask >= 0) {
+                table_size = static_cast<size_t>(mask) + 1;
+            }
             break;
         }
         if (WritesRegister(decoded, index_reg)) {
-            return std::nullopt;
+            const bool copies_register = (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV ||
+                                          decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOVZX) &&
+                                         decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                                         decoded.operands[0].size >= 32 &&
+                                         IsSameRegister(decoded.operands[0].reg.value, index_reg) &&
+                                         decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
+            if (!copies_register) {
+                break;
+            }
+            index_reg = decoded.operands[1].reg.value;
         }
-    }
-    if (!table_size) {
-        return std::nullopt;
-    }
-    if (std::ranges::any_of(function.branch_targets, [&](uintptr_t target) {
-            return target >= *guarded_path_start && target <= branch_address;
-        })) {
-        return std::nullopt;
     }
 
     const auto decode_table_address =
@@ -1486,45 +1520,180 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
             }
         }
     }
-    constexpr size_t MaxJumpTableEntries = 4096;
-    if (*table_size == 0 || *table_size > MaxJumpTableEntries) {
-        return std::nullopt;
-    }
-
-    std::optional<std::vector<uintptr_t>> resolved_targets;
-    for (const uintptr_t table_address : table_candidates) {
-        if (table_address < segment_start || table_address > segment_end ||
-            *table_size > (segment_end - table_address) / sizeof(s32)) {
-            continue;
+    const auto splits_instruction = [&function](uintptr_t address) {
+        const auto next = function.instructions.upper_bound(address);
+        if (next == function.instructions.begin()) {
+            return false;
         }
+        const auto previous = std::prev(next);
+        return previous->first != address &&
+               previous->first + previous->second.instruction.length > address;
+    };
+
+    constexpr size_t MaxJumpTableEntries = 4096;
+    const auto read_table =
+        [&](uintptr_t table_address,
+            std::optional<size_t> size) -> std::optional<std::vector<uintptr_t>> {
+        if (table_address < segment_start || table_address >= segment_end) {
+            return std::nullopt;
+        }
+        const size_t available = (segment_end - table_address) / sizeof(s32);
+        if (size && *size > available) {
+            return std::nullopt;
+        }
+        const size_t limit = size.value_or(std::min(available, MaxJumpTableEntries));
 
         std::vector<uintptr_t> targets;
-        targets.reserve(*table_size);
-        bool valid = true;
-        for (size_t index = 0; index < *table_size; ++index) {
+        for (size_t index = 0; index < limit; ++index) {
             s32 offset;
             std::memcpy(&offset,
                         reinterpret_cast<const void*>(table_address + index * sizeof(offset)),
                         sizeof(offset));
             const s64 target = static_cast<s64>(table_address) + offset;
             if (target < static_cast<s64>(function_start) ||
-                target >= static_cast<s64>(function_end)) {
-                valid = false;
+                target >= static_cast<s64>(function_end) ||
+                splits_instruction(static_cast<uintptr_t>(target))) {
+                if (size) {
+                    return std::nullopt;
+                }
                 break;
             }
             targets.push_back(static_cast<uintptr_t>(target));
         }
-        if (!valid) {
-            continue;
+        if (targets.empty()) {
+            return std::nullopt;
         }
         std::ranges::sort(targets);
         targets.erase(std::ranges::unique(targets).begin(), targets.end());
-        if (resolved_targets) {
+        return targets;
+    };
+
+    if (table_size) {
+        if (*table_size == 0 || *table_size > MaxJumpTableEntries) {
             return std::nullopt;
         }
-        resolved_targets = std::move(targets);
+        std::optional<std::vector<uintptr_t>> resolved_targets;
+        for (const uintptr_t table_address : table_candidates) {
+            auto targets = read_table(table_address, table_size);
+            if (!targets) {
+                continue;
+            }
+            if (resolved_targets) {
+                return std::nullopt;
+            }
+            resolved_targets = std::move(targets);
+        }
+        return resolved_targets;
     }
-    return resolved_targets;
+
+    // The table register can be a copy or a reload, so any table this function takes the address
+    // of may be the one. Too many jump targets only keep more instructions in place.
+    if (table_candidates.empty()) {
+        for (const auto& [address, decoded] : function.instructions) {
+            if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEA ||
+                decoded.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+                continue;
+            }
+            ZyanU64 absolute_address{};
+            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &decoded.operands[1],
+                                                      decoded.address, &absolute_address))) {
+                table_candidates.insert(absolute_address);
+            }
+        }
+    }
+    std::vector<uintptr_t> merged_targets;
+    for (const uintptr_t table_address : table_candidates) {
+        if (const auto targets = read_table(table_address, std::nullopt)) {
+            merged_targets.insert(merged_targets.end(), targets->begin(), targets->end());
+        }
+    }
+    if (merged_targets.empty()) {
+        return std::nullopt;
+    }
+    std::ranges::sort(merged_targets);
+    merged_targets.erase(std::ranges::unique(merged_targets).begin(), merged_targets.end());
+    return merged_targets;
+}
+
+/// Tells whether an indirect jump leaves the function through a pointer loaded from memory, with
+/// the stack pointer back at its value on entry.
+bool IsIndirectTailCall(const DecodedFunction& function, uintptr_t function_start,
+                        uintptr_t branch_address) {
+    const auto branch = function.instructions.find(branch_address);
+    if (branch == function.instructions.end()) {
+        return false;
+    }
+    const auto is_pointer_load = [](const ZydisDecodedOperand& operand) {
+        return operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+               operand.size == sizeof(uintptr_t) * CHAR_BIT &&
+               operand.mem.index == ZYDIS_REGISTER_NONE &&
+               !IsStackPointerRegister(operand.mem.base);
+    };
+    const auto& target = branch->second.operands[0];
+    if (target.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        constexpr size_t MaxLoadDistance = 8;
+        bool loaded_from_memory = false;
+        auto cursor = branch;
+        for (size_t count = 0; count < MaxLoadDistance; ++count) {
+            if (cursor == function.instructions.begin()) {
+                break;
+            }
+            const auto previous = std::prev(cursor);
+            const auto& decoded = previous->second;
+            if (previous->first + decoded.instruction.length != cursor->first ||
+                IsControlFlowTerminator(decoded.instruction)) {
+                break;
+            }
+            if (WritesRegister(decoded, target.reg.value)) {
+                loaded_from_memory = decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                                     decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                                     decoded.operands[0].size == sizeof(uintptr_t) * CHAR_BIT &&
+                                     is_pointer_load(decoded.operands[1]);
+                break;
+            }
+            cursor = previous;
+        }
+        if (!loaded_from_memory) {
+            return false;
+        }
+    } else if (!is_pointer_load(target)) {
+        return false;
+    }
+
+    std::unordered_map<uintptr_t, s64> stack_depths{{function_start, 0}};
+    std::vector<uintptr_t> pending{function_start};
+    while (!pending.empty()) {
+        const uintptr_t address = pending.back();
+        pending.pop_back();
+        const auto instruction = function.instructions.find(address);
+        if (instruction == function.instructions.end()) {
+            continue;
+        }
+        const auto& decoded = instruction->second;
+        if (decoded.changes_stack_pointer && !decoded.stack_pointer_delta) {
+            continue;
+        }
+        const s64 depth = stack_depths.at(address) + decoded.stack_pointer_delta.value_or(0);
+        const auto visit = [&](uintptr_t successor) {
+            if (successor != 0 && stack_depths.emplace(successor, depth).second) {
+                pending.push_back(successor);
+            }
+        };
+        if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+            visit(address + decoded.instruction.length);
+            visit(GetRelativeTarget(decoded));
+        } else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+            visit(GetRelativeTarget(decoded));
+            if (const auto targets = function.indirect_branch_targets.find(address);
+                targets != function.indirect_branch_targets.end()) {
+                std::ranges::for_each(targets->second, visit);
+            }
+        } else if (!IsControlFlowTerminator(decoded.instruction)) {
+            visit(address + decoded.instruction.length);
+        }
+    }
+    const auto depth = stack_depths.find(branch_address);
+    return depth != stack_depths.end() && depth->second == 0;
 }
 
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
@@ -1533,7 +1702,6 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
     std::vector<uintptr_t> blocks{function_start};
     std::unordered_set<uintptr_t> visited;
     std::set<uintptr_t> indirect_branches;
-    std::set<uintptr_t> resolved_indirect_branches;
 
     while (true) {
         while (!blocks.empty()) {
@@ -1579,16 +1747,14 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
         }
 
         bool discovered_block = false;
+        // A table found through the addresses the function takes can grow as more of the function
+        // is decoded, so every jump is resolved again until no new block turns up.
         for (const uintptr_t branch_address : indirect_branches) {
-            if (resolved_indirect_branches.contains(branch_address)) {
-                continue;
-            }
-            const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-                                                         function_end, segment_start, segment_end);
+            auto targets = ResolveJumpTable(function, branch_address, function_start, function_end,
+                                            segment_start, segment_end);
             if (!targets) {
                 continue;
             }
-            resolved_indirect_branches.insert(branch_address);
             for (const uintptr_t target : *targets) {
                 function.branch_targets.insert(target);
                 if (!visited.contains(target)) {
@@ -1596,12 +1762,20 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
                     discovered_block = true;
                 }
             }
+            function.indirect_branch_targets[branch_address] = std::move(*targets);
         }
         if (!discovered_block) {
             break;
         }
     }
-    function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+    for (const uintptr_t branch_address : indirect_branches) {
+        if (!function.indirect_branch_targets.contains(branch_address) &&
+            IsIndirectTailCall(function, function_start, branch_address)) {
+            function.indirect_branch_targets.emplace(branch_address, std::vector<uintptr_t>{});
+        }
+    }
+    function.has_indirect_branch =
+        indirect_branches.size() != function.indirect_branch_targets.size();
     return function;
 }
 
@@ -1664,6 +1838,10 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
                 add_successor(branch_target);
             } else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
                 add_successor(branch_target);
+                if (const auto targets = function.indirect_branch_targets.find(decoded.address);
+                    targets != function.indirect_branch_targets.end()) {
+                    std::ranges::for_each(targets->second, add_successor);
+                }
             } else if (!IsControlFlowTerminator(decoded.instruction)) {
                 add_successor(next_address);
             }
@@ -1704,6 +1882,8 @@ bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
                 return false;
             }
             request.operands[index].imm.u = absolute_address;
+            request.branch_type = ZYDIS_BRANCH_TYPE_NONE;
+            request.branch_width = ZYDIS_BRANCH_WIDTH_NONE;
         } else if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
                    (operand.mem.base == ZYDIS_REGISTER_RIP ||
                     operand.mem.base == ZYDIS_REGISTER_EIP)) {
@@ -1729,7 +1909,6 @@ bool EncodeRelocatedInstruction(const DecodedCodeInstruction& decoded,
 
 bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
                                    Xbyak::CodeGenerator& generator) {
-    ASSERT(decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL);
     const auto& target = decoded.operands[0];
     ASSERT(target.type == ZYDIS_OPERAND_TYPE_MEMORY && target.size == sizeof(uintptr_t) * CHAR_BIT);
 
@@ -1774,7 +1953,14 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 
     generator.xchg(r11, ptr[rsp]);
     generator.lea(rsp, ptr[rsp + GuestRedZoneSize + sizeof(uintptr_t)]);
-    generator.call(ptr[rsp - GuestRedZoneSize - sizeof(uintptr_t)]);
+    const auto loaded_value = rsp - GuestRedZoneSize - sizeof(uintptr_t);
+    if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL) {
+        generator.call(ptr[loaded_value]);
+    } else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_JMP) {
+        generator.jmp(ptr[loaded_value]);
+    } else {
+        generator.push(qword[loaded_value]);
+    }
     return true;
 }
 
@@ -1884,7 +2070,9 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
                 if (decoded.instruction.length < NearJumpSize) {
                     ++result.short_memory_instruction_count;
                 }
-                if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
+                if ((decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
+                     decoded.instruction.mnemonic == ZYDIS_MNEMONIC_JMP ||
+                     decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSH) &&
                     decoded.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
                     decoded.operands[0].size == sizeof(uintptr_t) * CHAR_BIT &&
                     !IsStackPointerRegister(decoded.operands[0].mem.base) &&
@@ -2012,6 +2200,22 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
                 return span;
             };
 
+            // A short site right behind the span could not be relocated on its own anymore.
+            const auto absorb_following_sites = [&](RelocationSpan span) {
+                while (!IsControlFlowTerminator(span.instructions.back()->instruction) &&
+                       rewrite_sites.contains(span.continuation) &&
+                       !function.branch_targets.contains(span.continuation)) {
+                    const auto& decoded = function.instructions.at(span.continuation);
+                    if (decoded.instruction.length >= NearJumpSize) {
+                        break;
+                    }
+                    span.instructions.push_back(&decoded);
+                    span.patch_size += decoded.instruction.length;
+                    span.continuation += decoded.instruction.length;
+                }
+                return span;
+            };
+
             const auto collect_backward_span = [&]() -> std::optional<RelocationSpan> {
                 const auto site_instruction = function.instructions.find(site);
                 ASSERT(site_instruction != function.instructions.end());
@@ -2050,7 +2254,16 @@ static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_s
             const bool can_relocate_neighbors = !function.has_indirect_branch;
             if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
                 auto forward_span = collect_forward_span();
-                if (forward_span) {
+                if (forward_span && can_relocate_neighbors) {
+                    auto extended_span = absorb_following_sites(*forward_span);
+                    if (extended_span.patch_size != forward_span->patch_size) {
+                        trampoline_offset = emit_span(extended_span);
+                        if (trampoline_offset) {
+                            selected_span = std::move(extended_span);
+                        }
+                    }
+                }
+                if (forward_span && !selected_span) {
                     trampoline_offset = emit_span(*forward_span);
                     if (trampoline_offset) {
                         selected_span = std::move(forward_span);
