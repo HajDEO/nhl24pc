@@ -63,7 +63,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // nhlport: readback copies on a second queue (NHLPORT_READBACK_DRAIN=1 restores Finish()).
     {
         const char* env = std::getenv("NHLPORT_READBACK_DRAIN");
-        transfer_readbacks = instance.HasTransferQueue() && !(env && env[0] == '1');
+        transfer_readbacks = !(env && env[0] == '1');
         if (transfer_readbacks) {
             const vk::CommandPoolCreateInfo pool_ci = {
                 .flags = vk::CommandPoolCreateFlagBits::eTransient |
@@ -82,7 +82,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             const auto alloc_result =
                 instance.GetDevice().allocateCommandBuffers(&alloc_info, &transfer_cmdbuf);
             ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate transfer cmdbuf");
-            LOG_INFO(Render, "Readbacks use the transfer queue (per-range submission waits)");
+            LOG_INFO(Render, "Readbacks use {} (per-range submission waits)",
+                     instance.HasTransferQueue() ? "the transfer queue" : "the graphics queue");
         }
     }
     const vk::BufferCreateInfo probe_ci = {
