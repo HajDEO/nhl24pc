@@ -125,10 +125,14 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    const auto queue_families = instance.GetBufferQueueFamilies();
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = AllFlags,
-        .sharingMode = vk::SharingMode::eExclusive,
+        .sharingMode =
+            queue_families.size() > 1 ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = static_cast<u32>(queue_families.size()),
+        .pQueueFamilyIndices = queue_families.data(),
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);
