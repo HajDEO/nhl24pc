@@ -149,13 +149,15 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
 
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
-    if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
+    if (program.info.hw_stage != HwStage::Compute) {
         return;
     }
 
     const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
     const u32 num_threads = size_x * size_y * size_z;
-    if (num_threads <= 32) {
+    const bool lower_wave64 = profile.subgroup_size != 64 && num_threads > 32;
+    const bool lower_shuffles = profile.needs_shuffle_lowering && num_threads > 1;
+    if (!lower_wave64 && !lower_shuffles) {
         return;
     }
 
@@ -172,6 +174,15 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             }
         };
         for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::ShuffleXor) {
+                if (lower_shuffles) {
+                    push_worklist(inst);
+                }
+                continue;
+            }
+            if (!lower_wave64) {
+                continue;
+            }
             if (inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate()) {
                 push_worklist(inst);
             } else if (inst.GetOpcode() == IR::Opcode::Ballot) {
@@ -195,17 +206,31 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     }
 
     const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u64));
-    const u32 scratch_size =
+    const u32 ballot_scratch_size =
         (Common::AlignUp(num_threads, 64) / profile.subgroup_size) * sizeof(u32);
+    const u32 shuffle_base = Common::AlignUp(scratch_base + ballot_scratch_size, sizeof(u64));
+    const u32 shuffle_scratch_size =
+        lower_shuffles ? Common::AlignUp(num_threads, 64) * sizeof(u32) : 0;
     program.info.shared_memory_scratch_size =
-        scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size;
+        shuffle_base + shuffle_scratch_size - runtime_info.hw.cs.shared_memory_size;
 
     for (IR::Inst* inst : worklist) {
         LOG_INFO(Render_Recompiler, "Lowering {} instruction for wave64", inst->GetOpcode());
         IR::IREmitter ir{*inst->GetParent(), IR::Block::InstructionList::s_iterator_to(*inst)};
         const IR::U32 invocation_index = ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
         const IR::U32 subgroup_id = ir.ShiftRightLogical(invocation_index, ir.Imm32(5));
-        if (inst->GetOpcode() == IR::Opcode::Ballot) {
+        if (inst->GetOpcode() == IR::Opcode::ShuffleXor) {
+            const IR::U32 offset = ir.IAdd(ir.Imm32(shuffle_base),
+                                           ir.ShiftLeftLogical(invocation_index, ir.Imm32(2u)));
+            const IR::U32 partner = ir.BitwiseXor(invocation_index, IR::U32{inst->Arg(1)});
+            ir.WriteShared(32, IR::U32{inst->Arg(0)}, offset);
+            ir.Barrier();
+            const IR::U32 value = IR::U32{ir.LoadShared(
+                32, false,
+                ir.IAdd(ir.Imm32(shuffle_base), ir.ShiftLeftLogical(partner, ir.Imm32(2u))))};
+            ir.Barrier();
+            inst->ReplaceUsesWithAndRemove(value);
+        } else if (inst->GetOpcode() == IR::Opcode::Ballot) {
             const IR::U32 mask_low =
                 IR::U32{ir.CompositeExtract(ir.UnpackUint2x32(ir.Ballot(IR::U1{inst->Arg(0)})), 0)};
             const IR::U32 offset =
