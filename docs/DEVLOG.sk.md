@@ -1,5 +1,24 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.3b: uvoľnenie obrazov texture cache pri unmape v GPU vlákne (2026-11-18, PR #38)
+
+Komunitný pull request #38 (hooman-zamboni, súvisí s issue #19). `Rasterizer::UnmapMemory` beží vo
+vlákne hry, ktoré pamäť unmapuje alebo decommituje (`MemoryManager::UnmapMemory`, `PoolDecommit`,
+`Free`, ...). `TextureCache::UnmapMemory` tam volalo `FreeImage`, teda odregistrovanie z page table,
+mazanie metadát a odložené zmazanie, súbežne s GPU vláknom nad tými istými štruktúrami. Texture
+cache nemá globálny mutex (upstream #5219 ho odstránil). Následky: „Trying to unregister an already
+unregistered image“ a krátko chýbajúce textúry (čierne/biele štvorce). Unmap texture cache teraz
+ide cez `Liverpool::SendCommand<true>` a vlákno hry počká, rovnako ako readbacky buffer cache.
+
+Deadlock nehrozí: volajúci počas skorého GPU unmapu držia len `unmap_mutex` (nie `mutex`) a GPU
+vlákno `unmap_mutex` neberie; príkazy obsluhuje `ProcessCommands` aj medzi PM4 paketmi.
+
+Meranie (Ryzen 5 4500 + RTX 5060, celý zápas, 273 s, 4428 uvoľnení obrazov kvôli unmapu): bez pádu
+a bez varovaní. Scéna 1920x1080: 99 % 34,5 ms, > 50 ms 0,4 % (staršie behy v0.9.3 `logs\fliprate-on*`:
+99 % 50–67 ms, > 50 ms 1,1–1,4 %); 2048x1024: 99 % 100,6 ms (99–116 ms). Spomalenie unmapom sa
+neprejavilo. Pozor pri testoch: s argumentami (`-g ...`) sa nenačíta `user\patches\nhl24.xml`
+a hra s update 1.60 zamrzne pri prvom buly (issue #6); spúšťať bez argumentov z priečinka `build\`.
+
 ## v0.9.3a: 60 fps v menu a prestrihoch (2026-11-17, issue #22)
 
 Hra si sama prepína `sceVideoOutSetFlipRate`: 1 (30 Hz) v menu a prestrihoch, 0 (60 Hz) v zápase.
