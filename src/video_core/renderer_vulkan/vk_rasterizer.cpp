@@ -1788,7 +1788,12 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
-    texture_cache.UnmapMemory(addr, size);
+    if (std::this_thread::get_id() == GetGpuCommandProcessorThread()) {
+        texture_cache.UnmapMemory(addr, size);
+    } else {
+        // Freeing images mutates texture cache state owned by the GPU thread.
+        liverpool->SendCommand<true>([this, addr, size] { texture_cache.UnmapMemory(addr, size); });
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
