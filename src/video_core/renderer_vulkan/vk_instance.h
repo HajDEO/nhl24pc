@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <span>
 #include <unordered_map>
 
@@ -84,6 +85,18 @@ public:
 
     bool HasTransferQueue() const {
         return has_transfer_queue;
+    }
+
+    /// Queue family of GetTransferQueue(); differs from the graphics family when the readback
+    /// copies run on a separate copy or compute engine.
+    u32 GetTransferQueueFamilyIndex() const {
+        return transfer_queue_family_index;
+    }
+
+    /// Returns the queue families buffers must be shared between (one or two entries).
+    std::span<const u32> GetBufferQueueFamilies() const {
+        return {buffer_queue_families.data(),
+                transfer_queue_family_index != queue_family_index ? 2u : 1u};
     }
 
     TracyVkCtx GetProfilerContext() const {
@@ -242,6 +255,25 @@ public:
     /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported() const {
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+    }
+
+    /// Returns true if compute pipelines must pin their subgroup size to a fixed value
+    bool IsComputeSubgroupSizeControlNeeded() const {
+        return vk13_features.subgroupSizeControl &&
+               (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute) &&
+               (IsSubgroupSize64Supported() ||
+                vk13_props.minSubgroupSize != vk13_props.maxSubgroupSize);
+    }
+
+    /// Returns the subgroup size compute pipelines run with
+    u32 ComputeSubgroupSize() const {
+        if (IsSubgroupSize64Supported()) {
+            return 64;
+        }
+        if (IsComputeSubgroupSizeControlNeeded()) {
+            return vk13_props.maxSubgroupSize;
+        }
+        return vk11_props.subgroupSize;
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
@@ -524,6 +556,8 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 transfer_queue_family_index{0};
+    std::array<u32, 2> buffer_queue_families{};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};

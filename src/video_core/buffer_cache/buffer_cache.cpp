@@ -63,12 +63,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // nhlport: readback copies on a second queue (NHLPORT_READBACK_DRAIN=1 restores Finish()).
     {
         const char* env = std::getenv("NHLPORT_READBACK_DRAIN");
-        transfer_readbacks = instance.HasTransferQueue() && !(env && env[0] == '1');
+        transfer_readbacks = !(env && env[0] == '1');
         if (transfer_readbacks) {
             const vk::CommandPoolCreateInfo pool_ci = {
                 .flags = vk::CommandPoolCreateFlagBits::eTransient |
                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-                .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+                .queueFamilyIndex = instance.GetTransferQueueFamilyIndex(),
             };
             auto [pool_result, pool] = instance.GetDevice().createCommandPoolUnique(pool_ci);
             ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create transfer pool: {}",
@@ -82,15 +82,23 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             const auto alloc_result =
                 instance.GetDevice().allocateCommandBuffers(&alloc_info, &transfer_cmdbuf);
             ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate transfer cmdbuf");
-            LOG_INFO(Render, "Readbacks use the transfer queue (per-range submission waits)");
+            LOG_INFO(
+                Render, "Readbacks use {} (per-range submission waits)",
+                instance.GetTransferQueueFamilyIndex() != instance.GetGraphicsQueueFamilyIndex()
+                    ? "a separate copy/compute engine"
+                    : (instance.HasTransferQueue() ? "the transfer queue" : "the graphics queue"));
         }
     }
+    const auto queue_families = instance.GetBufferQueueFamilies();
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
         .size = ARENA_PAGE_SIZE,
         .usage = ARENA_USAGE,
-        .sharingMode = vk::SharingMode::eExclusive,
+        .sharingMode =
+            queue_families.size() > 1 ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = static_cast<u32>(queue_families.size()),
+        .pQueueFamilyIndices = queue_families.data(),
     };
     const vk::DeviceBufferMemoryRequirements req_info = {
         .pCreateInfo = &probe_ci,

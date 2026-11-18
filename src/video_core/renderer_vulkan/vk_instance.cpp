@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -223,7 +225,8 @@ bool Instance::CreateDevice() {
     vk12_props = properties_chain.get<vk::PhysicalDeviceVulkan12Properties>();
     vk13_props = properties_chain.get<vk::PhysicalDeviceVulkan13Properties>();
     push_descriptor_props = properties_chain.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>();
-    LOG_INFO(Render_Vulkan, "Physical device subgroup size {}", vk11_props.subgroupSize);
+    LOG_INFO(Render_Vulkan, "Physical device subgroup size {} (min {}, max {})",
+             vk11_props.subgroupSize, vk13_props.minSubgroupSize, vk13_props.maxSubgroupSize);
 
     if (available_extensions.empty()) {
         LOG_CRITICAL(Render_Vulkan, "No extensions supported by device.");
@@ -382,19 +385,52 @@ bool Instance::CreateDevice() {
     static constexpr std::array queue_priorities = {1.0f, 0.5f};
     const u32 num_queues =
         std::min<u32>(family_properties[queue_family_index].queueCount, queue_priorities.size());
-    const vk::DeviceQueueCreateInfo queue_info = {
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos = {{{
         .queueFamilyIndex = queue_family_index,
         .queueCount = num_queues,
         .pQueuePriorities = queue_priorities.data(),
-    };
+    }}};
+    u32 num_queue_infos = 1;
+
+    // With a single graphics queue (Intel, AMD), readback copies go to a dedicated copy engine,
+    // or failing that a compute engine, so they do not wait behind all queued graphics work.
+    transfer_queue_family_index = queue_family_index;
+    const char* no_copy_engine = std::getenv("NHLPORT_NO_COPY_ENGINE");
+    if (num_queues < 2 && !(no_copy_engine && no_copy_engine[0] == '1')) {
+        std::optional<u32> copy_family;
+        std::optional<u32> compute_family;
+        for (u32 i = 0; i < static_cast<u32>(family_properties.size()); i++) {
+            const auto flags = family_properties[i].queueFlags;
+            if (i == queue_family_index || family_properties[i].queueCount == 0 ||
+                (flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eVideoDecodeKHR |
+                          vk::QueueFlagBits::eVideoEncodeKHR))) {
+                continue;
+            }
+            if ((flags & vk::QueueFlagBits::eCompute) && !compute_family) {
+                compute_family = i;
+            } else if ((flags & vk::QueueFlagBits::eTransfer) &&
+                       !(flags & vk::QueueFlagBits::eCompute) && !copy_family) {
+                copy_family = i;
+            }
+        }
+        if (const auto family = copy_family ? copy_family : compute_family) {
+            transfer_queue_family_index = *family;
+            queue_infos[num_queue_infos++] = {
+                .queueFamilyIndex = *family,
+                .queueCount = 1,
+                .pQueuePriorities = queue_priorities.data(),
+            };
+        }
+    }
+    buffer_queue_families = {queue_family_index, transfer_queue_family_index};
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = num_queue_infos,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -596,11 +632,19 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
-    has_transfer_queue = num_queues >= 2;
-    transfer_queue = has_transfer_queue ? device->getQueue(queue_family_index, 1) : graphics_queue;
-    LOG_INFO(Render_Vulkan, "Graphics family {} queues: {} (readback transfer queue: {})",
+    if (transfer_queue_family_index != queue_family_index) {
+        has_transfer_queue = true;
+        transfer_queue = device->getQueue(transfer_queue_family_index, 0);
+    } else {
+        has_transfer_queue = num_queues >= 2;
+        transfer_queue =
+            has_transfer_queue ? device->getQueue(queue_family_index, 1) : graphics_queue;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Graphics family {} queues: {} (readback transfer queue: {}, family {} {})",
              queue_family_index, family_properties[queue_family_index].queueCount,
-             has_transfer_queue ? "yes" : "no");
+             has_transfer_queue ? "yes" : "no", transfer_queue_family_index,
+             vk::to_string(family_properties[transfer_queue_family_index].queueFlags));
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
