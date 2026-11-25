@@ -21,6 +21,7 @@ using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Management;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -122,6 +123,55 @@ namespace NhlPort
         }
     }
 
+    // ------------------------------------------------------------------ scaling
+    // The layout is written for 1180x885 at 96 DPI. It follows the display scale of Windows and
+    // shrinks further when the window would not fit on the screen.
+    public static class Ui
+    {
+        public const int BaseWidth = 1180, BaseHeight = 885;
+        public static readonly float Scale;
+        static readonly float fontScale;
+
+        [DllImport("user32.dll")]
+        static extern bool SetProcessDPIAware();
+
+        static Ui()
+        {
+            try { SetProcessDPIAware(); } catch (Exception) { }
+            float dpi;
+            using (var g = Graphics.FromHwnd(IntPtr.Zero)) dpi = g.DpiX / 96f;
+            var area = Screen.PrimaryScreen.WorkingArea;
+            float margin = 16 * dpi;
+            float fitWidth = (area.Width - margin) / BaseWidth;
+            float fitHeight = (area.Height - SystemInformation.CaptionHeight - margin) / BaseHeight;
+            Scale = Math.Max(0.5f, Math.Min(dpi, Math.Min(fitWidth, fitHeight)));
+            fontScale = Scale / dpi;
+        }
+
+        public static void Init() { }
+
+        public static int Px(float value)
+        {
+            return (int)Math.Round(value * Scale);
+        }
+
+        public static Font SegoeUi(float points, FontStyle style = FontStyle.Regular)
+        {
+            return new Font("Segoe UI", points * fontScale, style);
+        }
+
+        public static Font Resized(Font font)
+        {
+            return new Font(font.FontFamily, font.Size * fontScale, font.Style);
+        }
+
+        public static void ScaleLayout(Control.ControlCollection controls)
+        {
+            if (Scale == 1f) return;
+            foreach (Control c in controls) c.Scale(new SizeF(Scale, Scale));
+        }
+    }
+
     // ------------------------------------------------------------------ small controls
     public class GlassPanel : Panel
     {
@@ -141,7 +191,7 @@ namespace NhlPort
             base.OnPaintBackground(e); // parent's background (the arena picture) through the transparency
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var rect = new Rectangle(0, 0, Width - 1, Height - 1);
-            using (var path = Rounded(rect, Radius))
+            using (var path = Rounded(rect, Math.Max(1, Ui.Px(Radius))))
             using (var brush = new SolidBrush(Fill))
             using (var pen = new Pen(Border, 1f))
             {
@@ -191,12 +241,14 @@ namespace NhlPort
             using (var accent = new SolidBrush(Theme.Orange))
             {
                 var bar = new Point[] { new Point(6, 4), new Point(16, 4), new Point(10, 30), new Point(0, 30) };
+                e.Graphics.ScaleTransform(Ui.Scale, Ui.Scale);
                 e.Graphics.FillPolygon(accent, bar);
+                e.Graphics.ResetTransform();
             }
-            using (var font = new Font("Segoe UI", 19f, FontStyle.Bold | FontStyle.Italic))
-                TextRenderer.DrawText(e.Graphics, Text, font, new Point(26, 0), Color.White);
+            using (var font = Ui.SegoeUi(19f, FontStyle.Bold | FontStyle.Italic))
+                TextRenderer.DrawText(e.Graphics, Text, font, new Point(Ui.Px(26), 0), Color.White);
             using (var pen = new Pen(Color.FromArgb(90, 255, 255, 255)))
-                e.Graphics.DrawLine(pen, 0, Height - 4, Width, Height - 4);
+                e.Graphics.DrawLine(pen, 0, Height - Ui.Px(4), Width, Height - Ui.Px(4));
         }
     }
 
@@ -216,6 +268,7 @@ namespace NhlPort
         protected override void OnPaint(PaintEventArgs e)
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.ScaleTransform(Ui.Scale, Ui.Scale);
             var box = new Rectangle(4, 6, 22, 22);
             using (var brush = new SolidBrush(Ok ? Theme.Orange : Color.FromArgb(80, 90, 100)))
             using (var path = GlassPanel.Rounded(box, 4))
@@ -233,7 +286,8 @@ namespace NhlPort
                     e.Graphics.DrawLine(pen, 20, 12, 10, 22);
                 }
             }
-            var textRect = new Rectangle(36, 0, Width - 40, Height);
+            e.Graphics.ResetTransform();
+            var textRect = new Rectangle(Ui.Px(36), 0, Width - Ui.Px(40), Height);
             TextRenderer.DrawText(e.Graphics, Text, Font, textRect, Color.White,
                 TextFormatFlags.WordBreak | TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
         }
@@ -271,7 +325,7 @@ namespace NhlPort
             }
         }
 
-        const int Pad = 10;
+        static int Pad { get { return Ui.Px(10); } }
 
         float Fraction { get { return maximum > minimum ? (current - minimum) / (float)(maximum - minimum) : 0f; } }
 
@@ -327,27 +381,28 @@ namespace NhlPort
             int cy = Height / 2;
             int x0 = Pad, x1 = Width - Pad;
             int xv = x0 + (int)((x1 - x0) * Fraction);
+            int track = Math.Max(1, Ui.Px(3)), knob = Ui.Px(8);
             var trackColor = Enabled ? Color.FromArgb(90, 255, 255, 255) : Color.FromArgb(50, 255, 255, 255);
             var fillColor = Enabled ? Theme.Orange : Color.FromArgb(110, 110, 120);
             using (var brush = new SolidBrush(trackColor))
-            using (var path = GlassPanel.Rounded(new Rectangle(x0, cy - 3, x1 - x0, 6), 3))
+            using (var path = GlassPanel.Rounded(new Rectangle(x0, cy - track, x1 - x0, 2 * track), track))
                 e.Graphics.FillPath(brush, path);
-            if (xv - x0 > 6)
+            if (xv - x0 > 2 * track)
             {
                 using (var brush = new SolidBrush(fillColor))
-                using (var path = GlassPanel.Rounded(new Rectangle(x0, cy - 3, xv - x0, 6), 3))
+                using (var path = GlassPanel.Rounded(new Rectangle(x0, cy - track, xv - x0, 2 * track), track))
                     e.Graphics.FillPath(brush, path);
             }
             for (int i = 0; i <= 4; i++)
             {
                 int tx = x0 + (x1 - x0) * i / 4;
                 using (var pen = new Pen(Color.FromArgb(110, 255, 255, 255)))
-                    e.Graphics.DrawLine(pen, tx, cy + 7, tx, cy + 11);
+                    e.Graphics.DrawLine(pen, tx, cy + Ui.Px(7), tx, cy + Ui.Px(11));
             }
             using (var brush = new SolidBrush(Enabled ? Color.White : Color.FromArgb(170, 170, 180)))
-                e.Graphics.FillEllipse(brush, xv - 8, cy - 8, 16, 16);
+                e.Graphics.FillEllipse(brush, xv - knob, cy - knob, 2 * knob, 2 * knob);
             using (var pen = new Pen(fillColor, 2f))
-                e.Graphics.DrawEllipse(pen, xv - 8, cy - 8, 16, 16);
+                e.Graphics.DrawEllipse(pen, xv - knob, cy - knob, 2 * knob, 2 * knob);
         }
     }
 
@@ -364,7 +419,7 @@ namespace NhlPort
             FlatAppearance.MouseDownBackColor = Color.FromArgb(30, 38, 50);
             BackColor = Color.FromArgb(28, 36, 48);
             ForeColor = Color.White;
-            Font = new Font("Segoe UI", 10f);
+            Font = Ui.SegoeUi(10f);
             Cursor = Cursors.Hand;
             Height = 34;
         }
@@ -403,7 +458,7 @@ namespace NhlPort
             if (image == null)
             {
                 using (var brush = new SolidBrush(Theme.Orange)) e.Graphics.FillRectangle(brush, ClientRectangle);
-                TextRenderer.DrawText(e.Graphics, Text, new Font("Segoe UI", 24f, FontStyle.Bold | FontStyle.Italic), ClientRectangle, Color.White,
+                TextRenderer.DrawText(e.Graphics, Text, Ui.SegoeUi(24f, FontStyle.Bold | FontStyle.Italic), ClientRectangle, Color.White,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 return;
             }
@@ -428,9 +483,9 @@ namespace NhlPort
         public static readonly Color KoFi = Color.FromArgb(255, 94, 91);
         public static readonly Color Field = Color.FromArgb(22, 29, 40);
         public static readonly Color FieldText = Color.White;
-        public static readonly Font Body = new Font("Segoe UI", 10.5f);
-        public static readonly Font Small = new Font("Segoe UI", 9f);
-        public static readonly Font Label = new Font("Segoe UI", 9.5f);
+        public static readonly Font Body = Ui.SegoeUi(10.5f);
+        public static readonly Font Small = Ui.SegoeUi(9f);
+        public static readonly Font Label = Ui.SegoeUi(9.5f);
 
         public static void Style(ComboBox box)
         {
@@ -464,7 +519,7 @@ namespace NhlPort
     // ------------------------------------------------------------------ the form
     public class LauncherForm : Form
     {
-        const string FallbackVersion = "0.9.3b";
+        const string FallbackVersion = "0.9.3c";
         string PortVersion = FallbackVersion; // taken from the version resource of nhl24.exe when present
         const string DefaultTitleId = "CUSA37933";
         static readonly string[] SupportedTitleIds = { "CUSA37933", "CUSA37934" };
@@ -555,7 +610,8 @@ namespace NhlPort
             }
             catch (Exception) { }
             Text = "NHL24 PC v" + PortVersion;
-            ClientSize = new Size(1180, 885);
+            ClientSize = new Size(Ui.Px(Ui.BaseWidth), Ui.Px(Ui.BaseHeight));
+            Font = Ui.Resized(Font);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -994,7 +1050,7 @@ namespace NhlPort
             Controls.Add(simpleBtn);
             Controls.Add(advancedBtn);
 
-            var supportBtn = new FlatButton { Left = 752, Top = 30, Width = 196, Height = 34, Text = Loc.T("support"), Font = new Font("Segoe UI", 10f, FontStyle.Bold), BackColor = Theme.KoFi };
+            var supportBtn = new FlatButton { Left = 752, Top = 30, Width = 196, Height = 34, Text = Loc.T("support"), Font = Ui.SegoeUi(10f, FontStyle.Bold), BackColor = Theme.KoFi };
             supportBtn.FlatAppearance.BorderColor = Theme.KoFi;
             supportBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(255, 125, 122);
             supportBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(220, 70, 68);
@@ -1005,6 +1061,7 @@ namespace NhlPort
             BuildAdvancedView();
             BuildBottomBar();
             BuildProgressPanel();
+            Ui.ScaleLayout(Controls);
 
             ResumeLayout();
         }
@@ -1147,12 +1204,12 @@ namespace NhlPort
 
             bindList = new ListView { Left = 460, Top = 58, Width = 610, Height = 340, View = View.Details, FullRowSelect = true, HideSelection = false,
                 BackColor = Theme.Field, ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Font = Theme.Label };
-            bindList.Columns.Add(Loc.T("col_action"), 330);
-            bindList.Columns.Add(Loc.T("col_key"), 240);
+            bindList.Columns.Add(Loc.T("col_action"), Ui.Px(330));
+            bindList.Columns.Add(Loc.T("col_key"), Ui.Px(240));
             bindList.DoubleClick += delegate { if (bindList.SelectedItems.Count > 0) BeginCapture((PadAction)bindList.SelectedItems[0].Tag); };
             controlsTab.Controls.Add(bindList);
 
-            captureLabel = new Label { Left = 460, Top = 404, Width = 610, Height = 24, Font = new Font("Segoe UI", 10f, FontStyle.Bold), ForeColor = Theme.Orange, BackColor = Color.Transparent, Text = "" };
+            captureLabel = new Label { Left = 460, Top = 404, Width = 610, Height = 24, Font = Ui.SegoeUi(10f, FontStyle.Bold), ForeColor = Theme.Orange, BackColor = Color.Transparent, Text = "" };
             controlsTab.Controls.Add(captureLabel);
 
             var defaultsBtn = new FlatButton { Left = 460, Top = 428, Width = 180, Height = 30, Text = Loc.T("defaults") };
@@ -1217,7 +1274,7 @@ namespace NhlPort
         {
             var bar = new GlassPanel { Left = 0, Top = 770, Width = 1180, Height = 115, Radius = 1, Fill = Color.FromArgb(215, 6, 10, 18), Border = Color.FromArgb(80, 255, 255, 255) };
             Controls.Add(bar);
-            summaryLabel = new TransparentLabel { Left = 46, Top = 40, Width = 640, Height = 26, Font = new Font("Segoe UI", 11f, FontStyle.Bold), ForeColor = Color.FromArgb(230, 235, 245) };
+            summaryLabel = new TransparentLabel { Left = 46, Top = 40, Width = 640, Height = 26, Font = Ui.SegoeUi(11f, FontStyle.Bold), ForeColor = Color.FromArgb(230, 235, 245) };
             bar.Controls.Add(summaryLabel);
             statusLabel = new TransparentLabel { Left = 46, Top = 72, Width = 660, Height = 22, AutoEllipsis = true, Font = Theme.Small, ForeColor = Color.FromArgb(180, 190, 205) };
             bar.Controls.Add(statusLabel);
@@ -1536,25 +1593,26 @@ namespace NhlPort
                 e.Graphics.DrawString("ps4_pad.png ?", Font, Brushes.Red, 10, 10);
                 return;
             }
-            using (var font = new Font("Segoe UI", 8, FontStyle.Bold))
+            using (var font = Ui.SegoeUi(8, FontStyle.Bold))
             foreach (var a in actions)
             {
                 float bx, by;
                 if (!ImageToBox(a.X, a.Y, out bx, out by)) continue;
                 bool active = capturing == a;
                 var brush = active ? Brushes.Orange : Brushes.LightGreen;
-                e.Graphics.FillEllipse(brush, bx - 6, by - 6, 12, 12);
-                e.Graphics.DrawEllipse(Pens.Black, bx - 6, by - 6, 12, 12);
+                float r = Ui.Px(6);
+                e.Graphics.FillEllipse(brush, bx - r, by - r, 2 * r, 2 * r);
+                e.Graphics.DrawEllipse(Pens.Black, bx - r, by - r, 2 * r, 2 * r);
                 var text = bindings[a.Id];
                 var size = e.Graphics.MeasureString(text, font);
-                e.Graphics.FillRectangle(Brushes.White, bx + 7, by - size.Height / 2, size.Width + 2, size.Height);
-                e.Graphics.DrawString(text, font, Brushes.Black, bx + 8, by - size.Height / 2);
+                e.Graphics.FillRectangle(Brushes.White, bx + r + 1, by - size.Height / 2, size.Width + 2, size.Height);
+                e.Graphics.DrawString(text, font, Brushes.Black, bx + r + 2, by - size.Height / 2);
             }
         }
 
         void PadClick(object sender, MouseEventArgs e)
         {
-            PadAction best = null; float bestDist = 24f;
+            PadAction best = null; float bestDist = Ui.Px(24);
             foreach (var a in actions)
             {
                 float bx, by;
@@ -1674,6 +1732,7 @@ namespace NhlPort
         [STAThread]
         public static void Main(string[] args)
         {
+            Ui.Init();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new LauncherForm(Array.IndexOf(args, "--advanced") >= 0));

@@ -13,7 +13,7 @@ implementations, and the GPU work goes through Vulkan.
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.3b** (2026-11-18), Windows 10/11 x64 |
+| Current build | **v0.9.3c** (2026-11-25), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -67,6 +67,15 @@ CPU directly, at native speed. What the emulator provides is everything around i
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
   fullscreen, vsync, sharpening, language, controls, all controllers as player 1) and starts the game.
 
+## What's new in v0.9.3c
+
+- **The launcher follows the display scale of Windows** (issue #40). On a display scaled above 100 %
+  (for example a 4K screen at 200 %) the text grew while the window and its controls kept their size,
+  so labels were cut off and overlapped. The whole window, its texts and controls now scale together.
+  On a screen too small for the window (for example 1366x768, or 1920x1080 at 150 %) the launcher
+  shrinks to fit instead of running off the screen. `nhl24.exe` is unchanged apart from the version
+  number.
+
 ## What's new in v0.9.3b
 
 - **Fewer random crashes and flashing black or white squares** (related to issue #19; fix by
@@ -108,7 +117,7 @@ Older changes are listed in the [release notes](https://github.com/HajDEO/nhl24p
 
 ## Playing
 
-1. Download `NHL24-PC-v0.9.3b.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+1. Download `NHL24-PC-v0.9.3c.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
@@ -130,9 +139,9 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.9.3b): on 8 GB graphics cards the video memory use can exceed the card's budget in
-long sessions (the driver then moves part of it to system RAM, which costs performance); rare "device
-lost" crashes. The Windows red-zone protection of the emulator is on by default and no longer a
+**Known issues** (v0.9.3c): on 8 GB graphics cards the video memory use can exceed the card's budget in
+long sessions (the driver then moves part of it to system RAM, which costs performance); "device
+lost" crashes and freezes during a match, reported mostly in NHL Threes (issues #37, #41). The Windows red-zone protection of the emulator is on by default and no longer a
 launcher setting: it prevents the 0xc0000005 crashes while a match loads and at random during play
 (issues #1/#3/#32, see `docs/DEVLOG.sk.md`) and adds about 20 s to the start of the game. Windows
 SmartScreen may warn about the unsigned exe
@@ -194,6 +203,14 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
+**Novinky vo v0.9.3c:**
+
+- **Launcher sa riadi mierkou zobrazenia vo Windows** (issue #40). Na displeji s mierkou nad 100 %
+  (napríklad 4K pri 200 %) sa zväčšil text, ale okno a ovládacie prvky ostali rovnako veľké, takže
+  popisy boli orezané a prekrývali sa. Celé okno, texty aj ovládacie prvky sa teraz škálujú spolu.
+  Na obrazovke, na ktorú sa okno nezmestí (napríklad 1366x768 alebo 1920x1080 pri 150 %), sa launcher
+  zmenší, namiesto toho aby presahoval mimo obrazovku. `nhl24.exe` sa okrem čísla verzie nezmenil.
+
 **Novinky vo v0.9.3b:**
 
 - **Menej náhodných pádov a blikajúcich čiernych či bielych štvorcov** (súvisí s issue #19; opravu
@@ -231,7 +248,7 @@ s prekladom shaderov GCN → SPIR-V.
 
 Staršie zmeny sú v [poznámkach k vydaniam](https://github.com/HajDEO/nhl24pc/releases).
 
-**Hranie:** stiahnite `NHL24-PC-v0.9.3b.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+**Hranie:** stiahnite `NHL24-PC-v0.9.3c.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
@@ -243,9 +260,9 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.3b):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
-prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon), zriedkavé
-pády „device lost“. Ochrana red zone (Windows) je v emulátore predvolene zapnutá a už nie je
+**Známe problémy (v0.9.3c):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon); pády
+„device lost“ a zamrznutia počas zápasu, hlásené najmä v NHL Threes (issues #37, #41). Ochrana red zone (Windows) je v emulátore predvolene zapnutá a už nie je
 nastavením v launcheri: bráni pádom 0xc0000005 pri načítaní zápasu aj náhodne počas hry (issues
 #1/#3/#32, rozbor v `docs/DEVLOG.sk.md`) a predlžuje štart hry asi o 20 s.
 

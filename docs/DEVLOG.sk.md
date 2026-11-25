@@ -1,5 +1,28 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.3c: launcher sa škáluje podľa DPI (2026-11-25, issue #40)
+
+Launcher mal rozloženie v pixeloch pre 1180x885 pri 96 DPI a neoznamoval Windows žiadnu DPI
+podporu. Keď proces bežal ako DPI-aware (snímka v issue #40: 4K pri 200 %), písma zadané v bodoch
+narástli, ale okno a ovládacie prvky ostali v pôvodných pixeloch. Nová trieda `Ui`
+(`launcher/Launcher.cs`): `SetProcessDPIAware()` pred vytvorením okna, jeden faktor
+`Scale = min(DPI/96, čo sa zmestí na pracovnú plochu)` (najmenej 0,5), ktorým sa cez
+`Control.Scale` násobí rozloženie a cez `Ui.Px` vlastné kreslenie (nadpisy sekcií, zaškrtávacie
+riadky, posuvník, značky na obrázku ovládača, šírky stĺpcov). Písma sa tvoria cez `Ui.SegoeUi`
+s veľkosťou `body * Scale / (DPI/96)`, takže sedia s rozložením aj vtedy, keď sa okno kvôli malej
+obrazovke zmenší pod mierku systému. Pri 100 % a dostatočne veľkej obrazovke je faktor 1 a nič sa
+nemení.
+
+Overenie: zostavenie cez `launcheruild_launcher.ps1`; testovacie zostavenie s vynútenou mierkou
+dalo klientsku plochu 826x620 pri 0,7. Vizuálne pri mierke nad 100 % overené nebolo (Smart App
+Control na vývojovom PC blokoval ďalšie spustenia testovacích zostavení).
+
+Issues #37 a #41 (NHL Threes, pád `Readback submit failed: ErrorDeviceLost`, zamrznutia): podľa logu
+z #41 sa grafický submit nedokončil do 2 s (graphics tick 77239, known 77237), Windows zariadenie
+resetol (TDR) a readback je len prvé miesto, kde sa strata zariadenia prejaví. Varovania pred pádom
+(`SanitizeCopyLayers`, `depth-recreate`, `FindImageFromRange`) sú aj v behoch bez pádu. Príčina
+je otvorená; reprodukcia podľa hlásení: NHL Threes, posledná aréna (so snehuliakom), RTX 5060/5070 Ti.
+
 ## v0.9.3b: uvoľnenie obrazov texture cache pri unmape v GPU vlákne (2026-11-18, PR #38)
 
 Komunitný pull request #38 (hooman-zamboni, súvisí s issue #19). `Rasterizer::UnmapMemory` beží vo
