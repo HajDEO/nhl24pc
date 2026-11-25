@@ -58,7 +58,7 @@ jobs:
           libasound2-dev libdecor-0-dev libgles2-mesa-dev libglfw3-dev \
           libopenal-dev libpulse-dev libudev-dev libwayland-dev libx11-dev \
           libxext-dev libxcursor-dev libxfixes-dev libxi-dev libxkbcommon-dev \
-          libxrandr-dev libxss-dev libxtst-dev python3-tk desktop-file-utils appstream curl
+          libxrandr-dev libxss-dev libxtst-dev python3-tk desktop-file-utils appstream curl xvfb
 
     - name: Cache CMake build
       uses: hendrikmuhs/ccache-action@v1.2.21
@@ -101,6 +101,10 @@ jobs:
         test -f "$package/user/config.json"
         test -f "$package/user/patches/nhl24.xml"
         "$package/nhl24" --help > /dev/null
+        launcher_status=0
+        mkdir -p "$package_dir/home"
+        HOME="$package_dir/home" xvfb-run -a timeout 15 "$package/nhl24-launcher.py" || launcher_status=$?
+        test "$launcher_status" -eq 124
         echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
     - name: Upload Linux artifact
@@ -133,6 +137,9 @@ jobs:
         HOME="$scratch/home" NHL24_DATA_ROOT="$scratch/data" APPIMAGE_EXTRACT_AND_RUN=1 \
           "$image" --appimage-smoke-test
         grep -qx 'keep-me' "$scratch/data/user/config.json"
+        launcher_status=0
+        HOME="$scratch/home" NHL24_DATA_ROOT="$scratch/gui-data" APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a timeout 20 "$image" || launcher_status=$?
+        test "$launcher_status" -eq 124
         cd "$scratch"
         "$image" --appimage-extract >/dev/null
         test -x squashfs-root/AppRun

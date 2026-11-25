@@ -90,22 +90,22 @@ Workflow также создаёт `NHL24-PC-v<версия>-x86_64.AppImage`. �
 система.
 
 ```bash
-chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
-./NHL24-PC-v0.9.2b-x86_64.AppImage
+chmod +x NHL24-PC-v0.9.5-x86_64.AppImage
+./NHL24-PC-v0.9.5-x86_64.AppImage
 ```
 
 AppImage доступен только для чтения, поэтому игры, сохранения, настройки и логи хранятся в
 `${XDG_DATA_HOME:-$HOME/.local/share}/nhl24pc`. Для другого диска укажите абсолютный путь:
 
 ```bash
-NHL24_DATA_ROOT=/mnt/games/NHL24-PC ./NHL24-PC-v0.9.2b-x86_64.AppImage
+NHL24_DATA_ROOT=/mnt/games/NHL24-PC ./NHL24-PC-v0.9.5-x86_64.AppImage
 ```
 
 Консольный установщик доступен из того же файла:
 
 ```bash
-./NHL24-PC-v0.9.2b-x86_64.AppImage install /путь/к/base.pkg /путь/к/update.pkg
-./NHL24-PC-v0.9.2b-x86_64.AppImage play
+./NHL24-PC-v0.9.5-x86_64.AppImage install /путь/к/base.pkg /путь/к/update.pkg
+./NHL24-PC-v0.9.5-x86_64.AppImage play
 ```
 
 Чтобы создать AppImage после сборки `build/nhl24`, установите `python3-tk`, `curl` и

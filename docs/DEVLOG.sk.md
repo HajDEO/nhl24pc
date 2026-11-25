@@ -1,5 +1,32 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.5: natívny Linux build, AppImage a Linux launcher (2026-11-25, PR #27)
+
+Komunitný pull request #27 (lilrags16), prenesený na main cez rebase (konflikty len v README,
+vyriešené v prospech aktuálnych poznámok k vydaniam). PR #34 (hooman-zamboni, len CI job s AppImage
+a dva skripty) bol zavretý ako nahradený – oba pridávali job `linux` do toho istého workflow.
+
+- Emulátor: `Common::FS::GetExecutableDirectory()` (priečinok `user` a hra sa hľadajú vedľa exe, nie
+  v pracovnom priečinku; na Linuxe `NHLPORT_USER_DIR`), POSIX `AddressSpace::Unmap` bez zlučovania
+  voľných oblastí a s `MAP_NORESERVE`, časové pásmo/letný čas zo systému (`posix_gettimeofday`,
+  `sceKernelConvertUtcToLocaltime`, `sceRtc*`, `sceSystemServiceParamGetInt`) – tieto časti sa zhodujú
+  s aktuálnym upstream shadPS4. Diagnostika (`diag_log.cpp`) číta na Linuxe `/proc`. Náhrady
+  `std::ranges::contains`/`to` kvôli libstdc++.
+- Linux nástroje v `docs/linux/`: `nhl24-linux.py` (CLI: install, play, status), `nhl24-launcher.py`
+  (Tk, EN/RU), `make-linux-repack.sh` (tar.gz), `make-linux-appimage.sh` + `appimage/AppRun`
+  (AppImage s vlastným Pythonom/Tk; dáta v `~/.local/share/nhl24pc`, nástroje pripnuté na verzie
+  s kontrolou SHA-256).
+- CI (`.github/workflows/build.yml`): job `linux` (Ubuntu 24.04, Clang 19) vyrába archív aj AppImage
+  a testuje ich; pridané spustenie launchera z oboch balíkov pod Xvfb (musí bežať až do timeoutu).
+  Job `windows` používa clang-cl z Visual Studia: predinštalovaný LLVM 20 runnera odmietala
+  štandardná knižnica MSVC 14.52 (`STL1000: expected Clang 22 or newer`), job padal od v0.9.3b.
+- Linux balíky vo vydaní pochádzajú z CI behu nad release commitom, Windows balík z lokálneho buildu.
+
+Overenie: Windows build so zmenami štartuje a kreslí menu (RTX 5060, 12 behov; prvé dva behy
+čerstvo zostaveného exe za 75 s nevykreslili snímku, ďalších desať áno – príčina nezistená,
+podozrenie na kontrolu nového súboru vo Windows). Linux: build a testy balíkov v CI; hranie overil
+autor PR na Fedore, na tomto PC sa Linux verzia nespúšťala.
+
 ## v0.9.4: Intel Arc – pruhy v UI, readbacky na kopírovacom engine, prebudovanie cache (2026-11-25, PR #33)
 
 Komunitný pull request #33 (hooman-zamboni, testované na Arc B390 v OneXPlayer 3, ovládač 101.9150),

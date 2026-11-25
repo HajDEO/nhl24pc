@@ -93,8 +93,8 @@ Tk, launchers, configuration template and game patch in one executable file. GPU
 provided by the host system.
 
 ```bash
-chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
-./NHL24-PC-v0.9.2b-x86_64.AppImage
+chmod +x NHL24-PC-v0.9.5-x86_64.AppImage
+./NHL24-PC-v0.9.5-x86_64.AppImage
 ```
 
 The AppImage is read-only, so installed games, saves, settings and logs are kept in
@@ -102,14 +102,14 @@ The AppImage is read-only, so installed games, saves, settings and logs are kept
 absolute path:
 
 ```bash
-NHL24_DATA_ROOT=/mnt/games/NHL24-PC ./NHL24-PC-v0.9.2b-x86_64.AppImage
+NHL24_DATA_ROOT=/mnt/games/NHL24-PC ./NHL24-PC-v0.9.5-x86_64.AppImage
 ```
 
 The same file exposes the command-line installer:
 
 ```bash
-./NHL24-PC-v0.9.2b-x86_64.AppImage install /path/to/base.pkg /path/to/update.pkg
-./NHL24-PC-v0.9.2b-x86_64.AppImage play
+./NHL24-PC-v0.9.5-x86_64.AppImage install /path/to/base.pkg /path/to/update.pkg
+./NHL24-PC-v0.9.5-x86_64.AppImage play
 ```
 
 To build an AppImage after compiling `build/nhl24`, install `python3-tk`, `curl` and

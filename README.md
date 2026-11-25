@@ -11,9 +11,9 @@ implementations, and the GPU work goes through Vulkan.
 | | |
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
-| Download | Windows: [**latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder. Linux: the AppImage or Ubuntu 24.04 archive from the latest successful **Build** workflow |
-| Ready-to-run package | Windows: [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template. Linux: one-file AppImage or a portable archive with CLI/Tk launchers |
-| Current build | **v0.9.4** (2026-11-25), Windows 10/11 x64; Linux x86-64 builds come from the source after v0.9.4 |
+| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest): `NHL24-PC-v0.9.5.zip` for Windows, `NHL24-PC-v0.9.5-x86_64.AppImage` or `NHL24-PC-Linux-v0.9.5.tar.gz` for Linux |
+| Ready-to-run package | Windows: `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template (also in [`release/`](release)). Linux: a one-file AppImage with its own launcher, or a portable archive with the CLI/Tk launchers |
+| Current build | **v0.9.5** (2026-11-25), Windows 10/11 x64 and Linux x86-64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -68,6 +68,25 @@ CPU directly, at native speed. What the emulator provides is everything around i
   fullscreen, vsync, sharpening, language, controls, all controllers as player 1) and starts the game.
   Linux uses the Python CLI and optional Tk launcher in `docs/linux/`, which call the same extractor
   of the native `nhl24` executable.
+
+## What's new in v0.9.5
+
+- **NHL24 PC now runs natively on Linux.** The release has a Linux build next to the Windows one: a
+  one-file **AppImage** that carries the emulator, the launcher and everything they need, and a
+  portable **tar.gz** archive built on Ubuntu 24.04. No Wine and no Windows tools are involved; the
+  game's code runs directly on the processor, as on Windows. Contributed by
+  [lilrags16](https://github.com/lilrags16) in pull request #27, building on the Linux guide and
+  scripts by [0ktav1us](https://github.com/0ktav1us), with gameplay checked on Fedora.
+- **A launcher for Linux.** A graphical launcher (Python/Tk, bundled in the AppImage) installs the
+  base game and the 1.60 update from your PKG files, shows what is installed, changes the settings and
+  starts the game. The same steps work from the command line: `install`, `play`, `status`.
+- **Linux fixes in the emulator**: data and settings are found next to the program or under
+  `~/.local/share/nhl24pc` (AppImage), freed memory is returned to the system exactly as requested,
+  and the diagnostics log reports CPU, memory and thread use on Linux too.
+- **Time zone and daylight saving time come from your system** on both platforms (the same code as
+  current shadPS4); the game no longer assumes UTC+2 with summer time.
+- **The Windows package is unchanged for players**: same launcher, same settings; replacing
+  `nhl24.exe` and `launcher.exe` is enough.
 
 ## What's new in v0.9.4
 
@@ -146,7 +165,7 @@ Older changes are listed in the [release notes](https://github.com/HajDEO/nhl24p
 
 ### Windows
 
-1. Download `NHL24-PC-v0.9.4.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+1. Download `NHL24-PC-v0.9.5.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
@@ -165,16 +184,19 @@ RTX 5060: 51 fps in play, 60 fps in menus; the heaviest cutscenes run at 20–30
 
 ### Linux
 
-Use the `nhl24-pc-appimage-x86_64` artifact from the latest successful **Build** workflow, make the
-contained file executable, and run it:
+Download `NHL24-PC-v0.9.5-x86_64.AppImage` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest),
+make it executable and run it:
 
 ```bash
-chmod +x NHL24-PC-v0.9.4-x86_64.AppImage
-./NHL24-PC-v0.9.4-x86_64.AppImage
+chmod +x NHL24-PC-v0.9.5-x86_64.AppImage
+./NHL24-PC-v0.9.5-x86_64.AppImage
 ```
 
-The AppImage stores its writable game data under `~/.local/share/nhl24pc`. The portable
-`nhl24-pc-ubuntu-24.04-x64` archive remains available; unpack it to a writable directory and run:
+The launcher opens. Install your NHL 24 base game PKG (and optionally the 1.60 update) with it and
+press Play. The AppImage keeps the game, saves and settings under `~/.local/share/nhl24pc`.
+
+The portable archive `NHL24-PC-Linux-v0.9.5.tar.gz` from the same release is the alternative when
+you prefer plain files: unpack it to a writable directory and run:
 
 ```bash
 ./nhl24-launcher.py
@@ -196,9 +218,11 @@ Haswell or AMD Excavator and newer); a Vulkan 1.3 GPU with current drivers (NVID
 RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 GB free for the extracted
 game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works too.
 
-**Known issues** (v0.9.4): on 8 GB graphics cards the video memory use can exceed the card's budget in
+**Known issues** (v0.9.5): on 8 GB graphics cards the video memory use can exceed the card's budget in
 long sessions (the driver then moves part of it to system RAM, which costs performance); "device
-lost" crashes and freezes during a match, reported mostly in NHL Threes (issues #37, #41). The Windows red-zone protection of the emulator is on by default and no longer a
+lost" crashes and freezes during a match, reported mostly in NHL Threes (issues #37, #41). The Linux
+build is new: it was played on Fedora by its contributor, the prebuilt packages target Ubuntu 24.04
+and newer systems, and older distributions should build from source. The Windows red-zone protection of the emulator is on by default and no longer a
 launcher setting: it prevents the 0xc0000005 crashes while a match loads and at random during play
 (issues #1/#3/#32, see `docs/DEVLOG.sk.md`) and adds about 20 s to the start of the game. Windows
 SmartScreen may warn about the unsigned exe
@@ -221,7 +245,7 @@ documents/      shadPS4's own documentation and README
 
 ## Building
 
-Only needed to change the emulator or launcher; players can use a release/workflow artifact.
+Only needed to change the emulator or launcher; players use the release packages.
 
 ### Windows
 
@@ -271,6 +295,24 @@ CPU; systémové knižnice PS4 sú nahradené natívnou implementáciou (HLE) a 
 s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
+
+**Novinky vo v0.9.5:**
+
+- **NHL24 PC beží natívne aj na Linuxe.** Vydanie má popri Windows verzii aj Linux build: jednosúborový
+  **AppImage**, ktorý obsahuje emulátor, launcher a všetko potrebné, a prenosný archív **tar.gz**
+  zostavený na Ubuntu 24.04. Bez Wine a bez nástrojov z Windows; kód hry beží priamo na procesore
+  ako na Windows. Pripravil [lilrags16](https://github.com/lilrags16) v pull requeste #27, nadväzuje
+  na Linux návod a skripty od [0ktav1us](https://github.com/0ktav1us); hranie overené na Fedore.
+- **Launcher pre Linux.** Grafický launcher (Python/Tk, v AppImage je pribalený) nainštaluje základnú
+  hru a update 1.60 z vašich PKG súborov, ukáže, čo je nainštalované, zmení nastavenia a spustí hru.
+  To isté ide z príkazového riadka: `install`, `play`, `status`.
+- **Opravy emulátora pre Linux**: dáta a nastavenia sa hľadajú vedľa programu alebo
+  v `~/.local/share/nhl24pc` (AppImage), uvoľnená pamäť sa vracia systému presne podľa požiadavky
+  a diagnostický log uvádza využitie CPU, pamäte a vlákien aj na Linuxe.
+- **Časové pásmo a letný čas sa berú zo systému** na oboch platformách (rovnaký kód ako aktuálny
+  shadPS4); hra už nepredpokladá UTC+2 s letným časom.
+- **Balík pre Windows sa pre hráčov nemení**: rovnaký launcher, rovnaké nastavenia; stačí nahradiť
+  `nhl24.exe` a `launcher.exe`.
 
 **Novinky vo v0.9.4:**
 
@@ -342,22 +384,23 @@ handhelde s Intel Arc B390 (OneXPlayer 3).
 
 Staršie zmeny sú v [poznámkach k vydaniam](https://github.com/HajDEO/nhl24pc/releases).
 
-**Hranie:** stiahnite `NHL24-PC-v0.9.4.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+**Hranie:** stiahnite `NHL24-PC-v0.9.5.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
 nainštalovať rovnako; od v0.9.0 port podporuje verziu hry 1.00 aj 1.60. Podporovaná je americká
 (CUSA37933) aj európska verzia (CUSA37934, od v0.9.0); update 1.60 je zatiaľ overený len na americkej.
 Uložené pozície, profil a shader cache vznikajú v `user\`; prvé minúty sa hra zasekáva (kompilácia
-shaderov), potom beží plynulo. Na Linuxe použite balík `nhl24-pc-ubuntu-24.04-x64` z úspešného
-**Build** workflow a `nhl24-launcher.py`; podrobný postup je v
+shaderov), potom beží plynulo. Na Linuxe stiahnite z toho istého vydania
+`NHL24-PC-v0.9.5-x86_64.AppImage` (spustiteľný súbor s launcherom) alebo archív
+`NHL24-PC-Linux-v0.9.5.tar.gz` s `nhl24-launcher.py`; podrobný postup je v
 [`docs/linux/LINUX.md`](docs/linux/LINUX.md).
 
 **Požiadavky:** Windows 10/11 x64 alebo aktuálny Linux x86-64, procesor x86-64-v3 (Intel Haswell alebo
 AMD Excavator a novší), GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM, asi 40 GB miesta
 na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.4):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+**Známe problémy (v0.9.5):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
 prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon); pády
 „device lost“ a zamrznutia počas zápasu, hlásené najmä v NHL Threes (issues #37, #41). Ochrana red zone (Windows) je v emulátore predvolene zapnutá a už nie je
 nastavením v launcheri: bráni pádom 0xc0000005 pri načítaní zápasu aj náhodne počas hry (issues
