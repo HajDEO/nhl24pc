@@ -11,9 +11,9 @@ implementations, and the GPU work goes through Vulkan.
 | | |
 |---|---|
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
-| Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
-| Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.4** (2026-11-25), Windows 10/11 x64 |
+| Download | Windows: [**latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder. Linux: the AppImage or Ubuntu 24.04 archive from the latest successful **Build** workflow |
+| Ready-to-run package | Windows: [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template. Linux: one-file AppImage or a portable archive with CLI/Tk launchers |
+| Current build | **v0.9.4** (2026-11-25), Windows 10/11 x64; Linux x86-64 builds come from the source after v0.9.4 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -66,6 +66,8 @@ CPU directly, at native speed. What the emulator provides is everything around i
   extracts the base/update PKG with shadPS4's PKG/PFS code built into `nhl24.exe`
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
   fullscreen, vsync, sharpening, language, controls, all controllers as player 1) and starts the game.
+  Linux uses the Python CLI and optional Tk launcher in `docs/linux/`, which call the same extractor
+  of the native `nhl24` executable.
 
 ## What's new in v0.9.4
 
@@ -142,6 +144,8 @@ Older changes are listed in the [release notes](https://github.com/HajDEO/nhl24p
 
 ## Playing
 
+### Windows
+
 1. Download `NHL24-PC-v0.9.4.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
@@ -165,8 +169,8 @@ Use the `nhl24-pc-appimage-x86_64` artifact from the latest successful **Build**
 contained file executable, and run it:
 
 ```bash
-chmod +x NHL24-PC-v0.9.2b-x86_64.AppImage
-./NHL24-PC-v0.9.2b-x86_64.AppImage
+chmod +x NHL24-PC-v0.9.4-x86_64.AppImage
+./NHL24-PC-v0.9.4-x86_64.AppImage
 ```
 
 The AppImage stores its writable game data under `~/.local/share/nhl24pc`. The portable
