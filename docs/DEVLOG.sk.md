@@ -1,5 +1,33 @@
 # NHL_PC – natívny PC port NHL 24 (PS4, CUSA37933)
 
+## v0.9.4: Intel Arc – pruhy v UI, readbacky na kopírovacom engine, prebudovanie cache (2026-11-25, PR #33)
+
+Komunitný pull request #33 (hooman-zamboni, testované na Arc B390 v OneXPlayer 3, ovládač 101.9150),
+šesť commitov prenesených na main:
+
+- `LowerWave64BallotPass`: pri `Profile::needs_shuffle_lowering` (ovládač
+  `eIntelProprietaryWindows`) sa `ShuffleXor` v compute shaderoch nahrádza zápisom do zdieľanej pamäte,
+  bariérou a čítaním hodnoty partnera (`invocation_index ^ maska`). Maska pokrytia UI sa v hre skladá
+  xor redukciou cez 32 lanes a krok xor-16 ovládač Intel medzi polovicami nespojí – horná polovica
+  každého slova masky ostávala nulová (zvislé pruhy po 64 px).
+- `Instance::ComputeSubgroupSize` / `IsComputeSubgroupSizeControlNeeded`: compute pipeline dostane
+  `requiredSubgroupSize`, keď ovládač môže veľkosť subgroup meniť (min != max); profil shaderov
+  používa tú istú hodnotu.
+- `signals.cpp`: C++ výnimka (0xE06D7363) vo vektorovom handleri vracia `EXCEPTION_CONTINUE_SEARCH`,
+  takže výnimky, ktoré si host kód (ovládač Intel) sám zachytí, už nespustia `Emulator::Shutdown`.
+- Readbacky: cesta s vlastným submitom (čaká len na submit, ktorý dáta zapísal) platí aj bez druhého
+  radu v grafickej rodine; pri jednom rade sa kópie púšťajú na rodine radov len s transferom, prípadne
+  s compute (`transfer_queue_family_index`), buffery sú vtedy `eConcurrent` medzi oboma rodinami.
+  `NHLPORT_NO_COPY_ENGINE=1` vracia grafický rad, `NHLPORT_READBACK_DRAIN=1` pôvodný `Finish()`.
+- Cache pipeline: pri inom `Shader::Profile` (veľkosť alebo obsah) sa `DataBase::Reset()` zmaže a
+  založí nanovo; predtým sa cache zavrela a nič nové sa neukladalo. `ShaderBinaryVersion` 8 → 9,
+  takže každý používateľ si shadery po aktualizácii raz skompiluje znova.
+
+Na NVIDIA (dva rady v grafickej rodine, subgroup 32 pevne) sa cesty nemenia. Overenie na RTX 5060
+(110 s, úvod a titulná obrazovka, bez zápasu): 60,0 fps, 99 % 17,5 ms, žiadne varovania; stará cache
+(104 MB) sa pri prvom štarte zmazala a založila nová. AMD a samostatné karty Intel Arc testované
+neboli.
+
 ## v0.9.3c: launcher sa škáluje podľa DPI (2026-11-25, issue #40)
 
 Launcher mal rozloženie v pixeloch pre 1180x885 pri 96 DPI a neoznamoval Windows žiadnu DPI

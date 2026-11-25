@@ -13,7 +13,7 @@ implementations, and the GPU work goes through Vulkan.
 | Video | [NHL 24 running on PC – YouTube](https://youtu.be/eGo1-W3FaYw) |
 | Download | [**Latest release**](https://github.com/HajDEO/nhl24pc/releases/latest) (ZIP) or the [`release/`](release) folder |
 | Ready-to-run package | [`release/`](release) – `launcher.exe`, `nhl24.exe`, runtime DLLs, clean `user\` template |
-| Current build | **v0.9.3c** (2026-11-25), Windows 10/11 x64 |
+| Current build | **v0.9.4** (2026-11-25), Windows 10/11 x64 |
 | Needs | your own NHL 24 PKG – US (CUSA37933) or EU (CUSA37934), base v01.00, optionally the 1.60 update – and a Vulkan 1.3 GPU |
 | License | GPL-2.0-or-later (same as shadPS4) |
 
@@ -67,6 +67,31 @@ CPU directly, at native speed. What the emulator provides is everything around i
   (`nhl24.exe --extract-pkg`), shows the installed version, exposes the useful settings (resolution,
   fullscreen, vsync, sharpening, language, controls, all controllers as player 1) and starts the game.
 
+## What's new in v0.9.4
+
+Contributed by [hooman-zamboni](https://github.com/hooman-zamboni) in pull request #33, tested on an
+Intel Arc B390 handheld (OneXPlayer 3).
+
+- **Intel Arc: menus and the HUD no longer show vertical stripes.** Every second 64-pixel column of the
+  UI was missing, so the 3D scene showed through like through blinds. The game builds its UI mask in a
+  compute shader that exchanges values between 32 shader threads, and the Intel Windows driver does not
+  exchange them between the two halves of 16. On Intel the exchange now goes through shared memory, and
+  compute shaders get a fixed thread group size where the driver could vary it.
+- **Smoother play on graphics cards with a single graphics queue (Intel Arc, AMD).** Reading data back
+  from the GPU used to wait until the GPU had finished all queued work, about twice per frame. The
+  emulator now waits only for the work that wrote the data and runs the copy on the card's separate
+  copy engine. On the Arc B390 the wait went from 2.2 ms to 0.8 ms and the game mostly holds 60 fps.
+  NVIDIA cards already worked this way and are not affected. `NHLPORT_NO_COPY_ENGINE=1` in the
+  environment restores the old behaviour.
+- **Errors the graphics driver handles itself no longer stop the emulator.** The Intel driver raises and
+  catches C++ exceptions internally; the emulator treated them as a crash and shut its services down,
+  which also kept the shader cache from being saved.
+- **An outdated shader cache is rebuilt instead of ignored.** When the cache did not match the current
+  build or graphics card, the emulator ignored it and also stopped saving, so every session compiled
+  all shaders again until `user\cache` was deleted by hand. The old cache is now deleted and a new one
+  started. This happens once after updating to v0.9.4, so the first minutes stutter again while the
+  shaders compile.
+
 ## What's new in v0.9.3c
 
 - **The launcher follows the display scale of Windows** (issue #40). On a display scaled above 100 %
@@ -117,7 +142,7 @@ Older changes are listed in the [release notes](https://github.com/HajDEO/nhl24p
 
 ## Playing
 
-1. Download `NHL24-PC-v0.9.3c.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
+1. Download `NHL24-PC-v0.9.4.zip` from the [latest release](https://github.com/HajDEO/nhl24pc/releases/latest)
    (or the repository via **Code → Download ZIP** and open its `release` folder) and unpack it –
    everything you need is there (`launcher.exe`, `nhl24.exe`, runtime DLLs, `user\`). Keep the
    unpacked folder somewhere you can write to (not Program Files).
@@ -139,7 +164,7 @@ AMD RDNA; integrated GPUs are too slow); 8 GB RAM (16 GB recommended); about 40 
 extracted game; a gamepad (Xbox, DualShock 4, DualSense) is detected automatically, the keyboard works
 too.
 
-**Known issues** (v0.9.3c): on 8 GB graphics cards the video memory use can exceed the card's budget in
+**Known issues** (v0.9.4): on 8 GB graphics cards the video memory use can exceed the card's budget in
 long sessions (the driver then moves part of it to system RAM, which costs performance); "device
 lost" crashes and freezes during a match, reported mostly in NHL Threes (issues #37, #41). The Windows red-zone protection of the emulator is on by default and no longer a
 launcher setting: it prevents the 0xc0000005 crashes while a match loads and at random during play
@@ -203,6 +228,31 @@ s prekladom shaderov GCN → SPIR-V.
 
 **Video:** https://youtu.be/eGo1-W3FaYw
 
+**Novinky vo v0.9.4:**
+
+Pripravil [hooman-zamboni](https://github.com/hooman-zamboni) v pull requeste #33, testované na
+handhelde s Intel Arc B390 (OneXPlayer 3).
+
+- **Intel Arc: menu a HUD už nemajú zvislé pruhy.** Chýbal každý druhý 64-pixelový stĺpec UI, takže
+  cez ne presvitala 3D scéna ako cez žalúzie. Hra si masku UI počíta v compute shaderi, ktorý si
+  vymieňa hodnoty medzi 32 vláknami shadera, a ovládač Intel pre Windows ich nevymení medzi dvoma
+  polovicami po 16. Na Inteli ide výmena cez zdieľanú pamäť a compute shadery dostanú pevnú veľkosť
+  skupiny vlákien tam, kde ju ovládač môže meniť.
+- **Plynulejšia hra na kartách s jedným grafickým radom (Intel Arc, AMD).** Čítanie dát späť z GPU
+  čakalo, kým GPU dokončí všetku zaradenú prácu, asi dvakrát za snímku. Emulátor teraz čaká len na
+  prácu, ktorá dáta zapísala, a kópiu púšťa na samostatnom kopírovacom engine karty. Na Arc B390
+  kleslo čakanie z 2,2 ms na 0,8 ms a hra väčšinou drží 60 fps. Karty NVIDIA takto fungovali už
+  predtým a nič sa na nich nemení. Pôvodné správanie vráti premenná prostredia
+  `NHLPORT_NO_COPY_ENGINE=1`.
+- **Chyby, ktoré si grafický ovládač ošetrí sám, už nezastavia emulátor.** Ovládač Intel vnútorne
+  vyhadzuje a zachytáva C++ výnimky; emulátor ich bral ako pád a vypol svoje služby, čo zároveň
+  bránilo uloženiu shader cache.
+- **Zastaraná shader cache sa prebuduje, namiesto toho aby sa ignorovala.** Keď cache nesedela
+  s aktuálnou verziou alebo grafickou kartou, emulátor ju ignoroval a prestal aj ukladať, takže sa
+  pri každom spustení kompilovali všetky shadery znova, kým niekto ručne nezmazal `user\cache`.
+  Stará cache sa teraz zmaže a začne sa nová. Stane sa to raz po prechode na v0.9.4, takže prvé
+  minúty sa hra znova zasekáva, kým sa shadery skompilujú.
+
 **Novinky vo v0.9.3c:**
 
 - **Launcher sa riadi mierkou zobrazenia vo Windows** (issue #40). Na displeji s mierkou nad 100 %
@@ -248,7 +298,7 @@ s prekladom shaderov GCN → SPIR-V.
 
 Staršie zmeny sú v [poznámkach k vydaniam](https://github.com/HajDEO/nhl24pc/releases).
 
-**Hranie:** stiahnite `NHL24-PC-v0.9.3c.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
+**Hranie:** stiahnite `NHL24-PC-v0.9.4.zip` z [posledného vydania](https://github.com/HajDEO/nhl24pc/releases/latest)
 (alebo repozitár cez Code → Download ZIP a prejdite do priečinka `release`), rozbaľte ho
 (všetko potrebné je tam); spustite `launcher.exe`, cez **Install PKG** vyberte PKG **základnej hry** (v01.00)
 – hra sa rozbalí do `game\` vedľa launchera – a stlačte **PLAY**. Update 1.60 môžete potom
@@ -260,7 +310,7 @@ shaderov), potom beží plynulo.
 **Požiadavky:** Windows 10/11 x64, GPU s Vulkan 1.3 (NVIDIA GTX 10xx/RTX, AMD RDNA), 8–16 GB RAM,
 asi 40 GB miesta na rozbalenú hru. Gamepad funguje automaticky, klávesnica tiež.
 
-**Známe problémy (v0.9.3c):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
+**Známe problémy (v0.9.4):** na 8 GB grafických kartách môže využitie videopamäte pri dlhom hraní
 prekročiť rozpočet karty (driver potom časť presunie do systémovej RAM, čo stojí výkon); pády
 „device lost“ a zamrznutia počas zápasu, hlásené najmä v NHL Threes (issues #37, #41). Ochrana red zone (Windows) je v emulátore predvolene zapnutá a už nie je
 nastavením v launcheri: bráni pádom 0xc0000005 pri načítaní zápasu aj náhodne počas hry (issues
