@@ -166,7 +166,7 @@ jobs:
         path: ${{ steps.appimage.outputs.image }}
 
   windows:
-    runs-on: windows-2025
+    runs-on: windows-2022
     steps:
     - uses: actions/checkout@v6
       with:
