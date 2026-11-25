@@ -166,7 +166,7 @@ jobs:
         path: ${{ steps.appimage.outputs.image }}
 
   windows:
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2025
     steps:
     - uses: actions/checkout@v6
       with:
@@ -187,8 +187,9 @@ jobs:
         append-timestamp: false
         key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
 
-    # The LLVM preinstalled on the runner can be older than the MSVC STL accepts (error STL1000);
-    # the clang-cl shipped with Visual Studio always matches its STL.
+    # Same toolchain as the release builds: Visual Studio 2022 with its own clang-cl. The LLVM
+    # preinstalled on a runner can be older than its MSVC STL accepts (error STL1000), and the
+    # Visual Studio 2026 image needs Clang 22, which the pinned openal-soft does not build with.
     - name: Use Visual Studio's own clang-cl
       shell: pwsh
       run: |
